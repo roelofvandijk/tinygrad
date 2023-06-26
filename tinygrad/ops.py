@@ -30,7 +30,10 @@ class LazyOp(NamedTuple):
 
 
 # Any == Union[LazyBuffer, DeviceBuffer]
-def get_buffers(op:LazyOp) -> List[Any]: return reduce(add, tuple([get_buffers(x) if x.__class__ is LazyOp else [x] for x in op.src]), [])
+def get_buffers(op: Any) -> List[Any]:
+  if op.__class__ is not LazyOp: return [op]
+  return [l for sub_list in (get_buffers(y) if y.__class__ is LazyOp else [y] for y in op.src if y) for l in sub_list]
+
 def get_lazyops(op:LazyOp) -> List[LazyOp]: return reduce(add, tuple([get_lazyops(x) for x in op.src if x.__class__ is LazyOp]), [op])
 def map_buffers(real_srcs:Dict[Any, Any], x:Any) -> LazyOp:
   if x in real_srcs: return map_buffers(real_srcs, real_srcs[x]) if real_srcs[x].__class__ is LazyOp else real_srcs[x]
