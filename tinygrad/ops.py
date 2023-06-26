@@ -1,5 +1,7 @@
 from __future__ import annotations
-import functools, operator, time
+import time
+from functools import reduce, partial
+from operator import add
 from enum import Enum, auto
 from typing import Union, Type, NamedTuple, Tuple, Any, List, Optional, Dict, Callable
 from tinygrad.helpers import prod, DEBUG, getenv, GlobalCounters, DType, colored, ansilen
@@ -26,12 +28,13 @@ class LazyOp(NamedTuple):
   arg: Any = None
   # TODO: add dest to support multiple outputs. on second thought, multiple outputs will have multiple LazyOps.
 
+
 # Any == Union[LazyBuffer, DeviceBuffer]
-def get_buffers(op:LazyOp) -> List[Any]: return functools.reduce(operator.add, [get_buffers(x) if isinstance(x, LazyOp) else [x] for x in op.src], [])
-def get_lazyops(op:LazyOp) -> List[LazyOp]: return functools.reduce(operator.add, [get_lazyops(x) for x in op.src if isinstance(x, LazyOp)], [op])
+def get_buffers(op:LazyOp) -> List[Any]: return reduce(add, tuple([get_buffers(x) if x.__class__ is LazyOp else [x] for x in op.src]), [])
+def get_lazyops(op:LazyOp) -> List[LazyOp]: return reduce(add, tuple([get_lazyops(x) for x in op.src if x.__class__ is LazyOp]), [op])
 def map_buffers(real_srcs:Dict[Any, Any], x:Any) -> LazyOp:
-  if len(real_srcs) and x in real_srcs: return map_buffers(real_srcs, real_srcs[x]) if isinstance(real_srcs[x], LazyOp) else real_srcs[x]
-  return LazyOp(x.op, tuple((map_buffers(real_srcs, y) if isinstance(y, LazyOp) else real_srcs[y]) for y in x.src), x.arg)
+  if x in real_srcs: return map_buffers(real_srcs, real_srcs[x]) if real_srcs[x].__class__ is LazyOp else real_srcs[x]
+  return LazyOp(x.op, tuple([(map_buffers(real_srcs, y) if y.__class__ is LazyOp else real_srcs[y]) for y in x.src]), x.arg)
 
 # **************** for Interpreted Buffers ****************
 
@@ -74,7 +77,7 @@ shape_fxn_for_op: Dict[Op, Callable] = {
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
   **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
-  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker(self.shape).movement_op(mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps}}
+  **{op:partial(lambda mop,self,arg: (ShapeTracker(self.shape).movement_op(mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps}}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: FlopCounter((x.shape, x.dtype, 0)), lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
 
