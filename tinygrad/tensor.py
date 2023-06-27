@@ -54,10 +54,9 @@ class Tensor:
     # None (the default) will be updated to True if it's put in an optimizer
     self.requires_grad: Optional[bool] = requires_grad
 
-    # internal variables used for autograd graph construction
+    # internal variables used for autograd graph constructionf
     self._ctx: Optional[Function] = None
-    if data.__class__ is LazyBuffer:
-      data = cast(LazyBuffer, data) # NOTE: this is a noop, it makes mypy happy
+    if isinstance(data, LazyBuffer):
       assert dtype is None or dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
       return
@@ -69,8 +68,7 @@ class Tensor:
     if data.__class__ is list:
       data = np.array(data, dtype=(dtype or Tensor.default_type).np)
 
-    if data.__class__ is np.ndarray:
-      data = cast(np.ndarray, data)
+    if isinstance(data, np.ndarray):
       data = LazyBuffer.fromCPU(data)
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
       return
@@ -537,7 +535,7 @@ class Tensor:
   def _broadcasted(self, fxn:Type[Function], other:Union[Tensor, float], reverse:bool=False) -> Tensor:
     dtype = self.dtype if self.dtype != dtypes.bool and self.dtype.__class__ is not ImageDType else dtypes.float32
     x: Tensor = self
-    y: Tensor = Tensor(cast(float, other), device=self.device, requires_grad=False, dtype=dtype) if other.__class__ is not Tensor else cast(Tensor, other)
+    y: Tensor = Tensor(other, device=self.device, requires_grad=False, dtype=dtype) if not isinstance(other, Tensor) else other
     if reverse: x, y = y, x
     if x.shape == y.shape: return fxn.apply(x, y)
 
