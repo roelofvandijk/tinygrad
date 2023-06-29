@@ -97,7 +97,7 @@ class LazyBuffer:
       from tinygrad.graph import log_op
       log_op(self, self.op, phantom=True)
 
-    self._device_extra_args = {"device": self.split_device} if ":" in self.device else {}
+    self._device_extra_args = {"device": device.split(":", 1)[1]} if ":" in self.device else {}
 
   def __repr__(self): return f"<LB {self.shape} {self.dtype} op={self.op.op if not self.realized else self.realized} st={self.st}>"
   @property
