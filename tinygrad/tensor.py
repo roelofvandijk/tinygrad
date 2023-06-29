@@ -529,16 +529,16 @@ class Tensor:
     if x.shape == y.shape: return fxn.apply(x, y)
 
     len_x_shape, len_y_shape = len(x.shape), len(y.shape)
-
     if len_y_shape != len_x_shape:
       if len_y_shape > len_x_shape: x = x.reshape((1,) * (len_y_shape - len_x_shape) + x.shape)
       else: y = y.reshape((1,) * (len_x_shape - len_y_shape) + y.shape)
 
     shape_ret = tuple([max(x, y) for x, y in zip(x.shape, y.shape)])
     if x.shape != shape_ret: x = x.expand(shape_ret)
-    elif y.shape != shape_ret: y = y.expand(shape_ret)
+    if y.shape != shape_ret: y = y.expand(shape_ret)
 
     return fxn.apply(x, y)
+
 
   def add(self, x:Union[Tensor, float], reverse=False) -> Tensor: return self._broadcasted(mlops.Add, x, reverse) if x.__class__ is Tensor or x else self
   def sub(self, x:Union[Tensor, float], reverse=False) -> Tensor: return self._broadcasted(mlops.Sub, x, reverse) if x.__class__ is Tensor or x or reverse else self
