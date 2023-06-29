@@ -531,7 +531,7 @@ class Tensor:
   def softsign(self): return self / (1 + self.abs())
 
   # ***** broadcasted binary mlops *****
-
+  @profile
   def _broadcasted(self, fxn:Type[Function], other:Union[Tensor, float], reverse:bool=False) -> Tensor:
     dtype = self.dtype if self.dtype != dtypes.bool and self.dtype.__class__ is not ImageDType else dtypes.float32
     x: Tensor = self
@@ -541,8 +541,9 @@ class Tensor:
 
     len_x_shape, len_y_shape = len(x.shape), len(y.shape)
 
-    if len_y_shape > len_x_shape: x = x.reshape((1,) * (len_y_shape - len_x_shape) + x.shape)
-    else: y = y.reshape((1,) * (len_x_shape - len_y_shape) + y.shape)
+    if len_y_shape != len_x_shape:
+      if len_y_shape > len_x_shape: x = x.reshape((1,) * (len_y_shape - len_x_shape) + x.shape)
+      else: y = y.reshape((1,) * (len_x_shape - len_y_shape) + y.shape)
 
     shape_ret = tuple([max(x, y) for x, y in zip(x.shape, y.shape)])
     if x.shape != shape_ret: x = x.expand(shape_ret)
