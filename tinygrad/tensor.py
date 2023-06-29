@@ -15,7 +15,7 @@ from tinygrad.ops import LoadOps
 class Function:
 
   def __init__(self, device:str, *tensors:Tensor):
-    self.device, self.parents, self.needs_input_grad = device, tensors, [tensors[0].requires_grad] if len(tensors) == 1 else [tensors[0].requires_grad, tensors[1].requires_grad] if len(tensors) == 1 else [t.requires_grad for t in tensors]
+    self.device, self.parents, self.needs_input_grad = device, tensors, [tensors[0].requires_grad] if len(tensors) == 1 else [tensors[0].requires_grad, tensors[1].requires_grad] if len(tensors) == 2 else [t.requires_grad for t in tensors]
     self.requires_grad = True if True in self.needs_input_grad else None if None in self.needs_input_grad else False
 
   def forward(self, *args, **kwargs): raise NotImplementedError(f"forward not implemented for {type(self)}")
