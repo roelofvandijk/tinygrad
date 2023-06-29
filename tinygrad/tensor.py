@@ -56,8 +56,9 @@ class Tensor:
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
     elif isinstance(data, (int, float)):
       self.lazydata = LazyBuffer.loadop(LoadOps.CONST, tuple(), dtype or Tensor.default_type, device, data)
-    elif isinstance(data, (np.ndarray, list)):
+    elif data.__class__ in (np.ndarray, list):
       if data.__class__ is list: data = np.array(data, dtype=(dtype or Tensor.default_type).np)
+      assert isinstance(data, np.ndarray)
       data = LazyBuffer.fromCPU(data)
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
     else:
