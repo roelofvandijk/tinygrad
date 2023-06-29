@@ -85,7 +85,7 @@ class Tensor:
   def device(self) -> str: return self.lazydata.device
 
   @property
-  def shape(self) -> Tuple[int, ...]: return self.lazydata.shape
+  def shape(self) -> Tuple[int, ...]: return self.lazydata.st.views[-1].shape
 
   @property
   def dtype(self) -> DType: return self.lazydata.dtype
@@ -269,8 +269,8 @@ class Tensor:
     def normalize_int(e, i, dim_sz):
       if -dim_sz <= e < dim_sz: return e if e != -1 else dim_sz-1
       raise IndexError(f"index {e} is out of bounds for dimension {i} with size {self.shape[i]}")
-    val = list(val) if isinstance(val, tuple) else [val]
-    if (num_slices := sum(isinstance(v, (slice, int)) for v in val)) > len(self.shape):
+    val = list(val) if val.__class__ is tuple else [val]
+    if (num_slices := len([v for v in val if v.__class__ in (slice, int)])) > len(self.shape):
       raise IndexError(f"too many indices for tensor of dimension {len(self.shape)}")
     orig_slices = list(val)
     ellipses_found = [i for i, v in enumerate(val) if v is Ellipsis]
@@ -281,8 +281,8 @@ class Tensor:
       orig_slices[ellipsis_idx:ellipsis_idx+1] = [slice(None)] * (len(self.shape) - num_slices)
     else:
       orig_slices += [slice(None)] * (len(self.shape) - num_slices)
-    valid_slices = list(filterfalse(lambda x: x is None, orig_slices))
-    valid_slices = [v if isinstance(v, slice) else slice(y := normalize_int(v, i, dim_sz), y+1) for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape))]
+    valid_slices = [x for x in orig_slices if x is not None]
+    valid_slices = [v if v.__class__ is slice else slice(y := normalize_int(v, i, dim_sz), y+1) for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape))]
     start, stop, strides = zip(*y) if (y := [s.indices(dim_sz) for s, dim_sz in zip(valid_slices, self.shape)]) else ((), (), ())
     new_slice = tuple((s, e)  if st > 0 else (e+1, s+1) for s, e, st in zip(start, stop, strides))
     new_shape = tuple(e - s for s, e in new_slice)
@@ -308,9 +308,9 @@ class Tensor:
     final_shape = []
     it_shape = iter(new_shape)
     for i in orig_slices:
-      if isinstance(i, (int, slice)):
+      if i.__class__ in (int, slice):
         dim_shape = next(it_shape)
-        if isinstance(i, slice): final_shape.append(dim_shape)
+        if i.__class__ is slice: final_shape.append(dim_shape)
       else: # i is None
         final_shape.append(1)
     return sliced_tensor.reshape(tuple(final_shape))  # Reshape
@@ -324,7 +324,7 @@ class Tensor:
     slc = [[(0, s) for s in self.shape] for _ in catargs]
     for s,k in zip(slc, shape_cumsum):
       s[dim] = (-k, shape_cumsum[-1]-k)
-    return reduce(Tensor.__add__, [arg.slice(s) for arg,s in zip(catargs, slc)])
+    return sum([arg.slice(s) for arg,s in zip(catargs, slc)])
 
   @staticmethod
   def stack(tensors, dim=0):
