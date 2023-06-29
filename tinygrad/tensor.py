@@ -1,8 +1,8 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
 from __future__ import annotations
 import time
-from functools import partialmethod, reduce
-from itertools import accumulate, filterfalse
+from functools import partialmethod, reduce, cached_property
+from itertools import accumulate
 import operator
 import numpy as np
 from typing import List, Tuple, Callable, Optional, ClassVar, Type, Union, Sequence, cast
@@ -54,21 +54,14 @@ class Tensor:
     if isinstance(data, LazyBuffer):
       assert dtype is None or dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
-      return
-
-    if isinstance(data, (int, float)):
+    elif isinstance(data, (int, float)):
       self.lazydata = LazyBuffer.loadop(LoadOps.CONST, tuple(), dtype or Tensor.default_type, device, data)
-      return
-
-    if data.__class__ is list:
-      data = np.array(data, dtype=(dtype or Tensor.default_type).np)
-
-    if isinstance(data, np.ndarray):
+    elif isinstance(data, (np.ndarray, list)):
+      if data.__class__ is list: data = np.array(data, dtype=(dtype or Tensor.default_type).np)
       data = LazyBuffer.fromCPU(data)
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
-      return
-
-    raise RuntimeError(f"can't create Tensor from {data}")
+    else:
+      raise RuntimeError(f"can't create Tensor from {data}")
 
   def __repr__(self):
     return f"<Tensor {self.lazydata!r} on {self.device} with grad {(self.grad.lazydata if self.grad else None)!r}>"
