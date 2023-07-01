@@ -521,6 +521,24 @@ class Tensor:
 
   # ***** broadcasted binary mlops *****
 
+  @staticmethod
+  @lru_cache(None)
+  def consolidate_shapes(x_shape, y_shape):
+    reshape_x, reshape_y = (),()
+
+    new_x_shape = x_shape
+    new_y_shape = y_shape
+
+    d = len(y_shape) - len(x_shape)
+    if d > 0: new_x_shape = reshape_x = (1,) * d + x_shape
+    if d < 0: new_y_shape = reshape_y = (1,) * -d + y_shape
+
+    shape_ret = tuple([max(x, y) for x, y in zip(new_x_shape, new_y_shape)])
+    expand_x = shape_ret if new_x_shape != shape_ret else ()
+    expand_y = shape_ret if new_y_shape != shape_ret else ()
+    
+    return reshape_x, reshape_y, expand_x, expand_y
+
   def _broadcasted(self, fxn:Type[Function], other:Union[Tensor, float], reverse:bool=False) -> Tensor:
     dtype = self.dtype if self.dtype != dtypes.bool and self.dtype.__class__ is not ImageDType else dtypes.float32
     x: Tensor = self
@@ -528,14 +546,11 @@ class Tensor:
     if reverse: x, y = y, x
     if x.shape == y.shape: return fxn.apply(x, y)
 
-    len_x_shape, len_y_shape = len(x.shape), len(y.shape)
-    if len_y_shape != len_x_shape:
-      if len_y_shape > len_x_shape: x = x.reshape((1,) * (len_y_shape - len_x_shape) + x.shape)
-      else: y = y.reshape((1,) * (len_x_shape - len_y_shape) + y.shape)
-
-    shape_ret = tuple([max(x, y) for x, y in zip(x.shape, y.shape)])
-    if x.shape != shape_ret: x = x.expand(shape_ret)
-    if y.shape != shape_ret: y = y.expand(shape_ret)
+    reshape_x, reshape_y, expand_x, expand_y = Tensor.consolidate_shapes(x.shape, y.shape)
+    if reshape_x: x = x.reshape(reshape_x)
+    if reshape_y: y = y.reshape(reshape_y)
+    if expand_x: x = x.expand(expand_x)
+    if expand_y: y = y.expand(expand_y)
 
     return fxn.apply(x, y)
 
