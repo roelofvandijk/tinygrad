@@ -15,8 +15,10 @@ from tinygrad.ops import LoadOps
 class Function:
 
   def __init__(self, device:str, *tensors:Tensor):
-    self.device, self.parents, self.needs_input_grad = device, tensors, [tensors[0].requires_grad] if len(tensors) == 1 else [tensors[0].requires_grad, tensors[1].requires_grad] if len(tensors) == 2 else [t.requires_grad for t in tensors]
-    self.requires_grad = True if True in self.needs_input_grad else None if None in self.needs_input_grad else False
+    self.device, self.parents,self.needs_input_grad, self.requires_grad = device, tensors, [tensors[0].requires_grad], tensors[0].requires_grad
+    if len(tensors) > 1: 
+      self.needs_input_grad =  [t.requires_grad for t in tensors]
+      self.requires_grad = True if True in self.needs_input_grad else None if None in self.needs_input_grad else False
 
   def forward(self, *args, **kwargs): raise NotImplementedError(f"forward not implemented for {type(self)}")
   def backward(self, *args, **kwargs): raise RuntimeError(f"backward not implemented for {type(self)}")
@@ -41,7 +43,7 @@ class Tensor:
 
   def __init__(self, data:Union[int, float, list, tuple, LazyBuffer, np.ndarray], device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
     assert dtype is None or isinstance(dtype, DType), f"invalid dtype {dtype}"
-    device = Device.canonicalize(device)
+    device = Device.DEFAULT if device is None else Device.canonicalize(device)
     # tensors have gradients, buffers do not
     self.grad: Optional[Tensor] = None
 
@@ -51,14 +53,13 @@ class Tensor:
 
     # internal variables used for autograd graph constructionf
     self._ctx: Optional[Function] = None
-    if isinstance(data, LazyBuffer):
+    if type(data) is LazyBuffer:
       assert dtype is None or dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
     elif isinstance(data, (int, float)):
       self.lazydata = LazyBuffer.loadop(LoadOps.CONST, tuple(), dtype or Tensor.default_type, device, data)
-    elif data.__class__ in (np.ndarray, list):
-      if data.__class__ is list: data = np.array(data, dtype=(dtype or Tensor.default_type).np)
-      assert isinstance(data, np.ndarray)
+    elif type(data) in (np.ndarray, list):
+      if not type(data) is np.ndarray: data = np.array(data, dtype=(dtype or Tensor.default_type).np)
       data = LazyBuffer.fromCPU(data)
       self.lazydata = data if data.device == device else LazyBuffer.loadop(LoadOps.FROM, data.shape, data.dtype, device, src=data)
     else:
