@@ -1,7 +1,7 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
 from __future__ import annotations
 import time
-from functools import partialmethod, reduce
+from functools import partialmethod, reduce, lru_cache
 from itertools import accumulate
 import operator
 import numpy as np
