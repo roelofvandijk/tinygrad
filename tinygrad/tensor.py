@@ -281,7 +281,7 @@ class Tensor:
     # Flip
     if (flip_axes := tuple(i for i, s in enumerate(strides) if s < 0)):
       sliced_tensor = sliced_tensor.flip(axis=flip_axes)
-    if any(s > 1 or s < 0 for s in strides):
+    if any([s != 1 for s in strides]):
       # normalize if negative strides
       strides = tuple(abs(s) for s in strides)
       def num_zeros(step, dim_sz): return 0 if step == 1 or (y := dim_sz % step) == 0 else (step - y)
