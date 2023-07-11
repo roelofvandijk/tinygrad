@@ -129,8 +129,8 @@ class LazyBuffer:
   def __repr__(self): return f"<LB {self.shape} {self.dtype} op={self.op.op if not self.realized else self.realized} st={self.st}>"
   @property
   def key(self):
-    if self.realized: return (self.dtype.key, self.realized.key, self.st.key)
-    return (self.dtype.key, self.op.op, self.st.key)
+    if self.realized: return (self.dtype, self.realized.key, self.st.key)
+    return (self.dtype, self.op.op, self.st.key)
 
   def _device_extra_args(self) -> Dict[str, str]: return {"device": self.device.split(":", 1)[1]} if ":" in self.device else {}
 
@@ -171,6 +171,7 @@ class LazyBuffer:
     return self
 
   @staticmethod
+  @functools.lru_cache(None)
   def loadop(op, shape, dtype, device, arg=None, src=None) -> LazyBuffer:
     return create_lazybuffer(device, ShapeTracker(tuple(shape)), LoadOps, LazyOp(op, tuple() if src is None else (src,), arg), dtype)
 
