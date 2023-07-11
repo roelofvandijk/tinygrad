@@ -136,18 +136,10 @@ def get_unsafe_resize_offset(strides, arg):
 class ShapeTracker(NamedTuple):
   views: Tuple[View]
 
-  @property
-  def contiguous(self) -> bool: return self.views[-1].contiguous and len(self.views) == 1
-  
-  @property
-  def shape(self) -> Tuple[int, ...]: return self.views[-1].shape
-
+  # this is the real size (ish)
   @staticmethod
   @functools.lru_cache(None)
-  def from_shape(shape): return ShapeTracker((View(tuple(shape)),))
-
-  # this is the real size (ish)
-  def size(self): return prod([s for s,st in zip(self.views[-1].shape, self.views[-1].strides) if st != 0])
+  def size(views:View) -> int: return prod([s for s,st in zip(views[-1].shape, views[-1].strides) if st != 0])
 
   # these are multiview strides, value is None if it's not a simple strided dimension
   # TODO: this can be shared code between simplify and merge_views
