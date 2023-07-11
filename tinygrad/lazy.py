@@ -285,7 +285,7 @@ def _push_movement_ops(srcs:Tuple[LazyBuffer, ...]) -> Tuple[LazyBuffer, ...]:
       mops.append((bx.op.op, bx.op.arg))
       bx = cast(LazyBuffer, bx.op.src[0])
     # NOTE: can't push pads with a div
-    if not bx.realized and bx.optype is BinaryOps and len(bx.children) <= 1 and len(mops) and (all(x[0] != MovementOps.PAD for x in mops) or all(x.op is not BinaryOps.DIV for x in bx.op.get_lazyops())):
+    if mops and not bx.realized and bx.optype is BinaryOps and len(bx.children) <= 1 and (all(x[0] != MovementOps.PAD for x in mops) or all(x.op is not BinaryOps.DIV for x in bx.op.get_lazyops())):
       new_srcs.append(bx.op.replace_with_movement_ops(mops[::-1]))
     else:
       new_srcs.append(x)
