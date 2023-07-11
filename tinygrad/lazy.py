@@ -7,7 +7,7 @@ import numpy as np
 from tinygrad.helpers import GRAPH, DEBUG, prod, getenv, DType, dtypes, flatten, ImageDType, LightWeakSet, LightWeakValueDictionary
 from tinygrad.runtime.ops_cpu import RawNumpyBuffer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
-from tinygrad.shape.shapetracker import MovementOps, ShapeTracker, View, get_contraction, view_from_shape
+from tinygrad.shape.shapetracker import MovementOps, ShapeTracker, View, get_contraction
 from tinygrad.ops import Compiled, Interpreted, UnaryOps, BinaryOps, ReduceOps, LoadOps, OpType, LazyOp
 from tinygrad.runtime.lib import RawBufferMapped, RawBuffer, RawConst
 
@@ -264,7 +264,7 @@ class LazyBuffer:
     return self.shuffle_and_prune_movement_ops(views, MovementOps.SHRINK, arg)
 
   def stride(self:LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
-    local_st = (ShapeTracker.stride(view_from_shape(self.shape), arg),)
+    local_st = (ShapeTracker.stride(View(self.shape), arg),)
     if self.shape == local_st.shape and local_st[0].contiguous: return self
 
     if not self.realized and self.op.op is MovementOps.STRIDE: return self.op.src[0].stride(tuple(map(operator.mul, arg, self.op.arg)))
