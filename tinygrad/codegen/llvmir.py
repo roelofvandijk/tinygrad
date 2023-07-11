@@ -52,10 +52,10 @@ def uops_to_llvm_ir(uops:List[UOp], bufs:List[LazyBuffer]) -> str:
   render_llvm[Variable] = lambda self,ops,ctx: lvars[self.expr]
 
   for uop,newvar,vin,args in uops:
-    if uop == UOps.CONST:
+    if uop is UOps.CONST:
       lvars[newvar] = ir.Constant(ir.FloatType(), args)
       reduce_phis.append(newvar)
-    if uop == UOps.LOOP:
+    if uop is UOps.LOOP:
       for var in args[0]:
         if isinstance(var, NumNode): continue
         bb.append(ir.IRBuilder(func.append_basic_block(f"loop_body_{var.expr}")))
@@ -71,7 +71,7 @@ def uops_to_llvm_ir(uops:List[UOp], bufs:List[LazyBuffer]) -> str:
 
         lvars[var.expr] = bb[-1].phi(ir.IntType(64), name=var.expr)
         lvars[var.expr].add_incoming(int_const(var.min), bb[-2]._block)
-    if uop == UOps.ENDLOOP:
+    if uop is UOps.ENDLOOP:
       for var in args[0][::-1]:
         if isinstance(var, NumNode): continue
         block, phis = loop_blocks.pop()
@@ -80,7 +80,7 @@ def uops_to_llvm_ir(uops:List[UOp], bufs:List[LazyBuffer]) -> str:
         for n,phi in phis: phi.add_incoming(lvars[n], bb[-1]._block)
         bb.append(ir.IRBuilder(func.append_basic_block(f"loop_exit_{var.expr}")))
         bb[-2].cbranch(bb[-2].icmp_unsigned("==", idx_p1, int_const(var.max+1)), bb[-1]._block, block._block)
-    if uop == UOps.LOAD:
+    if uop is UOps.LOAD:
       idx, valid = args.idx.render(render_llvm, bb[-1]), args.valid.render(render_llvm, bb[-1])
       if args.valid.min == 0:
         aug_idx = bb[-1].select(valid, idx, int_const(0))
@@ -93,7 +93,7 @@ def uops_to_llvm_ir(uops:List[UOp], bufs:List[LazyBuffer]) -> str:
         else:
           val = bb[-1].fpext(val, ir.FloatType())
       lvars[newvar] = val
-    if uop == UOps.STORE:
+    if uop is UOps.STORE:
       assert args.valid.min == 1, "store must be valid"
       idx = args.idx.render(render_llvm, bb[-1])
       element = lvars[vin[0]]
@@ -103,7 +103,7 @@ def uops_to_llvm_ir(uops:List[UOp], bufs:List[LazyBuffer]) -> str:
         else:
           element = bb[-1].fptrunc(element, func_dtypes[0])
       bb[-1].store(element, bb[-1].gep(func.args[args.i], [idx], inbounds=True))
-    if uop == UOps.ALU:
+    if uop is UOps.ALU:
       lvars[newvar] = code_for_op[args](bb[-1], *[lvars[x] for x in vin])
 
   bb[-1].ret_void()

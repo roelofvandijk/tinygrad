@@ -41,12 +41,12 @@ class LazyOp:
   def __eq__(self, __value: object) -> bool:
     if __value.__class__ is not LazyOp: return False
     __value = cast(LazyOp, __value)
-    return self.op == __value.op and self.src == __value.src and self.arg == __value.arg
+    return self.op is __value.op and self.src == __value.src and self.arg == __value.arg
   def __hash__(self) -> int: return  hash((self.op, self.src, self.arg))
   @property
   def key(self): return (self.op, self.src, self.arg)
 
-  # Any == Union[LazyBuffer, DeviceBuffer]
+  # Any is Union[LazyBuffer, DeviceBuffer]
   def map_buffers(self, real_srcs: Dict[Any, Any]) -> LazyOp: return LazyOp(self.op, tuple([y.map_buffers(real_srcs) for y in self.src]), self.arg)
   def get_lazyops(self) -> List[LazyOp]: return [self] + [item for x in self.src for item in x.get_lazyops()]
 
@@ -88,7 +88,7 @@ class Interpreted:
     self.codegen = None
 
   def exec_ast(self, ast:LazyOp, output=None, context=None, **kwargs):
-    if FusedOps.MULACC in self.fxn_for_op and ast.op == ReduceOps.SUM and ast.src[0].__class__ is LazyOp and ast.src[0].op == BinaryOps.MUL:
+    if FusedOps.MULACC in self.fxn_for_op and ast.op is ReduceOps.SUM and ast.src[0].__class__ is LazyOp and ast.src[0].op is BinaryOps.MUL:
       ast = LazyOp(FusedOps.MULACC, cast(LazyOp, ast.src[0]).src, ast.arg)
     created_context = context is None
     if context is None: context = dict()

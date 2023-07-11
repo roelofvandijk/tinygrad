@@ -129,7 +129,7 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
           pend_close = None
         depth -= 1
         kk("}"*len(args[0]) + f" /* {args[1]} */")
-    elif uop == UOps.WMMA:
+    elif uop is UOps.WMMA:
       # ((lidx2*32)+(lidx3*4)+(lidx4*16)+(lidx5*8)+(lidx6*2))
       kk("{ simdgroup_float8x8 a,b,c;")
       kk(f"a.thread_elements()[0] = {vin[0].render()}; a.thread_elements()[1] = {vin[1].render()};")
@@ -137,13 +137,13 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
       kk(f"c.thread_elements()[0] = {vin[4].render()}; c.thread_elements()[1] = {vin[5].render()};")
       kk("simdgroup_multiply_accumulate(c, a, b, c);")
       kk(f"{vin[4].render()} = c.thread_elements()[0]; {vin[5].render()} = c.thread_elements()[1]; }}")
-    elif uop == UOps.CONST:
+    elif uop is UOps.CONST:
       assert newvar is not None
       kk(f"{newvar.render(True)} = {lang.render_const(args, newvar.dtype)};")
-    elif uop == UOps.ALU:
+    elif uop is UOps.ALU:
       assert newvar is not None
       kk(f"{newvar.render(newvar not in vin)} = {code_for_op[args](*[x.render() for x in vin])};")
-    elif uop == UOps.LOAD:
+    elif uop is UOps.LOAD:
       assert newvar is not None
       # valids are handled here
       if args.valid.max == 0:
@@ -154,13 +154,13 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
         val = lang.render_load(newvar.dtype, bufnames[args.i], bufs[args.i].dtype, args.idx, isinstance(bufs[args.i], LocalBuffer))
       if args.valid.min == 0 and args.valid.max == 1: val = f"({args.valid.render(render_cl)}) ? ({val}) : {lang.render_const(0.0, newvar.dtype)}"
       kk(f"{newvar.render(True)} = {val};")
-    elif uop == UOps.STORE:
+    elif uop is UOps.STORE:
       assert args.valid.min == 1, "store must be valid"
       # TODO: instead of dtypes.float, a base type
       kk(lang.render_store(bufnames[args.i], bufs[args.i].dtype, vin[0].render(), vin[0].dtype if vin[0].offset is None else dtypes.float, args.idx, isinstance(bufs[args.i], LocalBuffer)))
-    elif uop == UOps.CAST and newvar is not None and newvar.dtype.sz > 1:
+    elif uop is UOps.CAST and newvar is not None and newvar.dtype.sz > 1:
       kk(f"{newvar.render(True)} = {lang.render_cast([x.render() for x in vin], newvar.dtype)};")
-    elif uop == UOps.DEFINE_LOCAL:
+    elif uop is UOps.DEFINE_LOCAL:
       kk(lang.smem_prefix + f"float {args[0]}[{args[1]}];")
     else:
       raise RuntimeError(f"failed to render {uop}")

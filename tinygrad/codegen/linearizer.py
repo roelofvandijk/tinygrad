@@ -128,7 +128,7 @@ class Linearizer:
 
   def __init__(self, ast:LazyOp, output_buffer:LazyBuffer):
     # NOTE: if there's a RESHAPE, we skip it. the output shape is set from the reduce op or a latebuf
-    self.ast = ast.src[0] if ast.op == MovementOps.RESHAPE else ast
+    self.ast = ast.src[0] if ast.op is MovementOps.RESHAPE else ast
 
     # get the output buffers
     self.bufs = [output_buffer] + dedup(ast.buffers)
@@ -438,13 +438,13 @@ class Linearizer:
     if x.op in [UnaryOps.NOOP, UnaryOps.CAST]: return self.ast_parse(x.src[0], acc, loaded_buffers, ssa)  # cast isn't an ALU op
     if x.op in ReduceOps and not do_reduce: return acc
     # MULACC fusion. TODO: this is copied from Interpreted
-    if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == BinaryOps.MUL:
+    if x.op is ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op is BinaryOps.MUL:
       x = LazyOp(FusedOps.MULACC, x.src[0].src, x.arg)
-    if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op == BinaryOps.MUL:
+    if x.op is ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op is UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op is BinaryOps.MUL:
       x = LazyOp(FusedOps.MULACC, x.src[0].src[0].src, x.arg)
     if x.op in {BinaryOps.ADD, BinaryOps.MUL}:
       # Reorder sources to put constants first so get_grouped_maybe_float4 can fold the op
-      srcs = sorted(x.src, key=lambda x: (x.realized.__class__ != RawConst) if x.__class__ == LazyBuffer else 0)
+      srcs = sorted(x.src, key=lambda x: (x.realized.__class__ is not RawConst) if x.__class__ is LazyBuffer else 0)
       x.src = tuple(srcs)
     if x not in self.saved_exprs:
       values = [self.ast_parse(v, acc, loaded_buffers, ssa) for v in x.src]
@@ -616,8 +616,8 @@ class Linearizer:
     # should use tensor cores?
     # first, confirm it's a straightforward mulacc on a device with real locals
     tensor_cores_allowed = getenv("TC", 1) != 0 and (getenv("TC", 1) == 2 or (self.bufs[0].device == "METAL" and getenv("CI", "") != "true"))
-    if tensor_cores_allowed and self.reduceop and self.reduceop.op == ReduceOps.SUM and \
-       isinstance(self.reduceop.src[0], LazyOp) and self.reduceop.src[0].op == BinaryOps.MUL and \
+    if tensor_cores_allowed and self.reduceop and self.reduceop.op is ReduceOps.SUM and \
+       isinstance(self.reduceop.src[0], LazyOp) and self.reduceop.src[0].op is BinaryOps.MUL and \
        isinstance(self.reduceop.src[0].src[0], LazyBuffer) and isinstance(self.reduceop.src[0].src[1], LazyBuffer) and hasattr(self, 'lang') and len(self.lang.lid):
       buf0 = self.bufs.index(self.reduceop.src[0].src[0])
       buf1 = self.bufs.index(self.reduceop.src[0].src[1])
