@@ -91,18 +91,15 @@ def add_gl_dimension(args, i, var, local_size, xid):
 
 def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lang:CStyleLanguage) -> Tuple[str, List[int], List[int]]:
   prekernel: Set[str] = set()
-  kernel = []
-  global_size = []
-  local_size = []
-  pend_close = None
+  kernel, global_size, local_size, pend_close = [], [], [], None
 
-  bufnames = [b.name if isinstance(b, LocalBuffer) else f"data{i}" for i,b in enumerate(bufs)]
+  bufnames = [b.name if b.__class__ is LocalBuffer else f"data{i}" for i,b in enumerate(bufs)]
 
   depth = 0
   def kk(s): kernel.append("  "*depth+s)
 
   for uop,newvar,vin,args in uops:
-    if uop == UOps.LOOP:
+    if uop is UOps.LOOP:
       for i,var in enumerate(args[0]):
         if isinstance(var, NumNode):
           if args[1] == "global" and lang.gid: global_size.append(1)
@@ -118,10 +115,10 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
             if getenv("NOUNROLL"): kk("#pragma unroll(1)")   # prevent loop unrolling
             kk(f"for (int {var.expr} = {var.min}; {var.expr} <= {var.max}; ++{var.expr}) {{")
       depth += 1
-    elif uop == UOps.BARRIER:
+    elif uop is UOps.BARRIER:
       kk(lang.barrier)
-    elif uop == UOps.ENDLOOP:
-      if args[1] == "local" and len(lang.lid):
+    elif uop is UOps.ENDLOOP:
+      if args[1] == "local" and lang.lid:
         # TODO: this is a bit of a hack. the local loop isn't real on the GPU
         kk(f"if ({Variable.sum(args[0]).render(render_cl)} == 0) {{")
         pend_close = "}"*(len(args[0])+1) + f" /* {args[1]} */"

@@ -18,7 +18,7 @@ if DEBUG >= 5:
 
 class _CL:
   def __init__(self):
-    platforms: List[List[cl.Device]] = [y for y in ([x.get_devices(device_type=cl.device_type.GPU) for x in cl.get_platforms()] + [x.get_devices(device_type=cl.device_type.CPU) for x in cl.get_platforms()]) if len(y)]
+    platforms: List[List[cl.Device]] = [y for y in ([x.get_devices(device_type=cl.device_type.GPU) for x in cl.get_platforms()] + [x.get_devices(device_type=cl.device_type.CPU) for x in cl.get_platforms()]) if y]
     devices: List[cl.Device] = [x for x in platforms[getenv('CL_PLATFORM', 0)] if x.name not in getenv('CL_EXCLUDE', '').split(',')]
     if DEBUG >= 1: print(f"using devices: {[d.hashable_model_and_version_identifier for d in devices]}")
     self.cl_ctx: cl.Context = cl.Context(devices=devices)

@@ -3,7 +3,7 @@ import functools, time
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Union, Type, Tuple, Any, List, Optional, Dict, Callable, cast
 from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored
-from tinygrad.shape.shapetracker import MovementOps, view_from_shape
+from tinygrad.shape.shapetracker import MovementOps, ShapeTracker, View
 from tinygrad.runtime.lib import RawBuffer, RawConst
 if TYPE_CHECKING:
   from tinygrad.lazy import LazyBuffer
@@ -30,23 +30,21 @@ class LazyOp:
   buffers: Tuple[LazyBuffer, ...]
 
   def __init__(self, op: Op, src: Tuple[Union[LazyOp, LazyBuffer], ...], arg: Any = None):
-    self.op = op
-    self.src = src
-    self.arg = arg
-    try:
-      self.buffers = tuple([y for x in src for y in x.buffers])
-    except AttributeError:
+    self.op, self.src, self.arg, self.buffers = op, src, arg, ()
+    for x in src: 
       # NOTE: the linearizer's key function maps the buffers to ints, and LOCAL_BUFFER is used. we don't care about buffers in these cases
-      pass
+      try: self.buffers += x.buffers
+      except AttributeError: pass
+
 
   def __repr__(self): return f"LazyOp(op={self.op}, src={self.src}, arg={self.arg})"
   def __eq__(self, __value: object) -> bool:
     if __value.__class__ is not LazyOp: return False
     __value = cast(LazyOp, __value)
     return self.op == __value.op and self.src == __value.src and self.arg == __value.arg
-  def __hash__(self) -> int: return hash((self.op, self.src, self.arg))
+  def __hash__(self) -> int: return  hash((self.op, self.src, self.arg))
   @property
-  def key(self): return (self.op, tuple(map(lambda x: getattr(x, "key", x), self.src)), getattr(self.arg, "key", self.arg))
+  def key(self): return (self.op, self.src, self.arg)
 
   # Any == Union[LazyBuffer, DeviceBuffer]
   def map_buffers(self, real_srcs: Dict[Any, Any]) -> LazyOp: return LazyOp(self.op, tuple([y.map_buffers(real_srcs) for y in self.src]), self.arg)
@@ -115,10 +113,10 @@ class FlopCounter:
 from tinygrad.shape.shapetracker import ShapeTracker
 shape_fxn_for_op: Dict[Op, Callable] = {
   UnaryOps.CAST: lambda self,dtype: (self.shape, dtype, self.consume_flops()),   # cast uses no flops
-  **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
+  **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op is not UnaryOps.CAST},
   **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
-  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker.movement_op((view_from_shape(self.shape),), mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps}}
+  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker.movement_op((View(tuple(self.shape)),), mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps}}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: FlopCounter((x.shape, x.dtype, 0)), lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
 
@@ -167,14 +165,13 @@ class Compiled:
     if output.realized:
       if output.realized.__class__ is RawConst: output.realized = None  # can't assign to RawConst
       for a in ast.buffers:
-        if a.realized == output.realized and not a.st.contiguous:
+        if a.realized == output.realized and not ShapeTracker.contiguous(a.st):
           output.realized = None
           break
 
     # we don't have an output buffer, we have to create it
     if not output.realized:
       output.realized = self.buffer(prod(output.shape), output.dtype, **kwargs)
-
     # compilation time
     k = self.codegen(ast, output)
 

@@ -10,14 +10,12 @@ ShapeType = Tuple[int, ...]
 # NOTE: helpers is not allowed to import from anything else in tinygrad
 OSX = platform.system() == "Darwin"
 
-def dedup(x): return list(dict.fromkeys(x))   # retains list order
-def argfix(*x):
-  if x[0].__class__ in {tuple, list}:
-    try: return tuple(x[0])
-    except IndexError: return tuple()
-  return tuple(x)
+def cached_staticmethod(func): return staticmethod(functools.lru_cache(None)(func))
+
+def dedup(x): return [] if not x else list(x) if len(x) == 1 else list(dict.fromkeys(x))   # retains list order
+def argfix(*x): return tuple(x if type(x[0]) is int else x[0])
 def argsort(x): return type(x)(sorted(range(len(x)), key=x.__getitem__)) # https://stackoverflow.com/questions/3382352/equivalent-of-numpy-argsort-in-basic-python
-def all_same(items): return all(x == items[0] for x in items)
+def all_same(items): return len(set(items)) == 1 if len(items) > 1 else True
 def colored(st, color, background=False): return f"\u001b[{10*background+60*(color.upper() == color)+30+['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'].index(color.lower())}m{st}\u001b[0m" if color is not None else st  # replace the termcolor library with one line
 def ansilen(s): return len(re.sub('\x1b\\[(K|.*?m)', '', s))
 def partition(lst, fxn): return [x for x in lst if fxn(x)], [x for x in lst if not fxn(x)]
@@ -66,8 +64,6 @@ class DType(NamedTuple):
   np: Optional[type]  # TODO: someday this will be removed with the "remove numpy" project
   sz: int = 1
   def __repr__(self): return f"dtypes.{self.name}"
-  @property
-  def key(self): return (self.name)
 
 # dependent typing?
 class ImageDType(DType):
@@ -85,7 +81,7 @@ class dtypes:
   def is_float(x: DType) -> bool: return x in (dtypes.float16, dtypes.float32, dtypes._half4, dtypes._float4)
   @staticmethod
   def is_unsigned(x: DType) -> bool: return x in (dtypes.uint8, dtypes.uint32, dtypes.uint64)
-  @staticmethod
+  @cached_staticmethod
   def from_np(x) -> DType: return DTYPES_DICT[np.dtype(x).name]
   @staticmethod
   def fields() -> Dict[str, DType]: return DTYPES_DICT
@@ -121,26 +117,20 @@ class GlobalCounters:
 
 # Stripped down version of a WeakSet
 class LightWeakSet:
-  __slots__ = 'data', '_remove', '__weakref__'
+  __slots__ = 'data', '__weakref__'
   def __init__(self):
     self.data = set()
-    def _remove(item, selfref=ref(self)):
-      self = selfref()
-      if self: self.data.discard(item)
-    self._remove = _remove
-
   def __len__(self): return len(self.data)
   def add(self, item): self.data.add(ref(item, self._remove))
   def discard(self, item): self.data.discard(ref(item))
+  def _remove(self, item):
+    try: ref(self)().data.remove(item)
+    except: pass
 
 # Stripped down version of a WeakValueDictionary
 class LightWeakValueDictionary:
-  __slots__ = 'data', '_remove', '__weakref__'
+  __slots__ = 'data', '__weakref__'
   def __init__(self):
-    def remove(wr, selfref=ref(self), _atomic_removal=_remove_dead_weakref):
-      self = selfref()
-      if self: _atomic_removal(self.data, wr.key)
-    self._remove = remove
     self.data = {}
 
   def __getitem__(self, key):
@@ -152,3 +142,6 @@ class LightWeakValueDictionary:
   def __delitem__(self, key): del self.data[key]
   def __setitem__(self, key, value): self.data[key] = KeyedRef(value, self._remove, key)
   def __contains__(self, key): return key in self.data
+  def _remove(self, wr):
+    try: _remove_dead_weakref(ref(self)().data, wr.key)
+    except: pass
