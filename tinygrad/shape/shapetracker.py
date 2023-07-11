@@ -280,7 +280,7 @@ class ShapeTracker(NamedTuple):
   @staticmethod
   @functools.lru_cache(maxsize=None)
   def movement_op(views, op: MovementOps, arg:Union[Tuple[int, ...], Tuple[Tuple[int, int], ...]]) -> ShapeTracker:
-    assert isinstance(arg, tuple) and (len(arg) == len(views[-1].shape) or op == MovementOps.RESHAPE), f"arg {arg} for {op} doesn't match dim of shape {views[-1].shape}"
+    assert isinstance(arg, tuple) and (len(arg) == len(views[-1].shape) or op is MovementOps.RESHAPE), f"arg {arg} for {op} doesn't match dim of shape {views[-1].shape}"
     return dispatch[op](views if op is MovementOps.RESHAPE else views[-1], arg)
  
 

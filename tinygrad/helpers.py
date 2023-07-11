@@ -103,7 +103,7 @@ class dtypes:
   _float4: Final[DType] = DType(4, 4*4, "float4", None, 4)
 
 # HACK: staticmethods are not callable in 3.8 so we have to compare the class
-DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if not k.startswith('__') and not callable(v) and not v.__class__ == staticmethod}
+DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if not k.startswith('__') and not callable(v) and not v.__class__ is staticmethod}
 
 class GlobalCounters:
   global_ops: ClassVar[int] = 0

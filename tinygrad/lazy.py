@@ -24,8 +24,8 @@ MERGE_ONE_REDUCE_INTO_ELEMENTWISE, SHUFFLE_PAD_OPS, SIMPLIFY_SUM_RESHAPE_EXPAND_
 PUSH_PERMUTES, PUSH_CONTIGUOUS = OPT>=3, OPT>=3
 
 def _simplify_sum_reshape_expand_sum(self:LazyBuffer, src: Any, prev_src: Any) -> Optional[LazyOp]:
-  if prev_src.op.op == MovementOps.EXPAND:
-    if src.op.op == ReduceOps.SUM:
+  if prev_src.op.op is MovementOps.EXPAND:
+    if src.op.op is ReduceOps.SUM:
       if src.shape == self.shape:
         dim_difference = [i for i, (a, b) in enumerate(zip(prev_src.shape, self.shape)) if a != b]
         # NOTE: we can probably also handle the case where more than one dimension is different with more thought
@@ -44,9 +44,9 @@ def _ast_reduceops(self:LazyBuffer) -> LazyOp:
     # When a tensor is reduced, reshaped/expanded back and then reduced again along the same axis,
     # it's equivalent to performing the initial reduction and multiplying the result
     # by the size of the expanded dimension.
-    if SIMPLIFY_SUM_RESHAPE_EXPAND_SUM and src.op.op == MovementOps.EXPAND: # type: ignore
+    if SIMPLIFY_SUM_RESHAPE_EXPAND_SUM and src.op.op is MovementOps.EXPAND: # type: ignore
       expanded = src.op.src[0] # type: ignore
-      if expanded.op.op == MovementOps.RESHAPE: # type: ignore
+      if expanded.op.op is MovementOps.RESHAPE: # type: ignore
         reshaped = expanded.op.src[0] # type: ignore
         simplified = _simplify_sum_reshape_expand_sum(self, reshaped, src)
       else:
@@ -64,11 +64,11 @@ def _ast_binaryops(self:LazyBuffer) -> LazyOp:
   real_srcs: Dict[LazyBuffer, Union[None, LazyOp, LazyBuffer]] = {x:None for x in self.op.buffers}
   # NOTE: contiguous does not always mean the same size with SHRINK. this is still mergeable but requires more thought how
   # TODO: this can also support late fusion of BinaryOps, required for test_fold_conv_sgd
-  psrcs: List[Tuple[LazyBuffer, LazyBuffer]] = [(k,x) for k,x in zip(real_srcs.keys(), map(get_movementroot_contiguous, real_srcs.keys())) if x.optype == ReduceOps and not x.realized and prod(k.shape) == prod(x.shape) and len(x.children) <= 1 and len(k.children) <= 1]
+  psrcs: List[Tuple[LazyBuffer, LazyBuffer]] = [(k,x) for k,x in zip(real_srcs.keys(), map(get_movementroot_contiguous, real_srcs.keys())) if x.optype is ReduceOps and not x.realized and prod(k.shape) == prod(x.shape) and len(x.children) <= 1 and len(k.children) <= 1]
   intermediate_shape: Tuple[int, ...] = self.shape
   if MERGE_ONE_REDUCE_INTO_ELEMENTWISE and len(psrcs) >= 1:
     psrc = psrcs[0] # NOTE: right now we can't handle multiple, as we'd have to check for loop
-    if psrc[1].optype == ReduceOps:
+    if psrc[1].optype is ReduceOps:
       top = _ast_reduceops(psrc[1])
     real_srcs[psrc[0]] = top
     real_srcs.update({x:x for x in top.buffers})  # the reduce op buffers are not modified
@@ -88,8 +88,8 @@ def _ast_binaryops(self:LazyBuffer) -> LazyOp:
 # **** lazy operations ****
 
 def get_single_root(root:LazyBuffer) -> LazyBuffer: return get_single_root(cast(LazyBuffer, root.op.src[0])) if getattr(root, 'op', None) and len(root.op.src) == 1 else root
-def get_movementroot(root:LazyBuffer, allow_contiguous=False) -> LazyBuffer: return get_movementroot(cast(LazyBuffer, root.op.src[0]), allow_contiguous) if not root.realized and (root.optype == MovementOps or (root.op.op == LoadOps.CONTIGUOUS and allow_contiguous and len(root.op.src[0].st) == 1 and root.op.src[0].st[-1].contiguous)) else root
-def get_movementroot_contiguous(x:LazyBuffer) -> LazyBuffer: return get_movementroot_contiguous(cast(LazyBuffer, x.op.src[0])) if not x.realized and x.op.op == LoadOps.CONTIGUOUS else (get_movementroot(x, True) if x.optype == MovementOps and len(x.st) == 1 and x.st[-1].contiguous else x)
+def get_movementroot(root:LazyBuffer, allow_contiguous=False) -> LazyBuffer: return get_movementroot(cast(LazyBuffer, root.op.src[0]), allow_contiguous) if not root.realized and (root.optype is MovementOps or (root.op.op is LoadOps.CONTIGUOUS and allow_contiguous and len(root.op.src[0].st) == 1 and root.op.src[0].st[-1].contiguous)) else root
+def get_movementroot_contiguous(x:LazyBuffer) -> LazyBuffer: return get_movementroot_contiguous(cast(LazyBuffer, x.op.src[0])) if not x.realized and x.op.op is LoadOps.CONTIGUOUS else (get_movementroot(x, True) if x.optype is MovementOps and len(x.st) == 1 and x.st[-1].contiguous else x)
 
 lazycache: LightWeakValueDictionary = LightWeakValueDictionary()
 def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType):
@@ -144,8 +144,8 @@ class LazyBuffer:
         for x in self.op.buffers: x.realize()
 
         # HACK: image shape can be wrong, hot cast it back to a normal float
-        if self.dtype.__class__ is ImageDType and self.optype != MovementOps and (prod(self.shape) != prod(cast(ImageDType, self.dtype).shape) or not any(self.shape[x]%4 == 0 for x in ShapeTracker.unit_stride_axes(tuple(self.st)))):
-          if self.op.op == MovementOps.RESHAPE:
+        if self.dtype.__class__ is ImageDType and self.optype is not MovementOps and (prod(self.shape) != prod(cast(ImageDType, self.dtype).shape) or not any(self.shape[x]%4 == 0 for x in ShapeTracker.unit_stride_axes(tuple(self.st)))):
+          if self.op.op is MovementOps.RESHAPE:
             # put CAST before the final RESHAPE
             self.op = LazyOp(MovementOps.RESHAPE, (LazyOp(UnaryOps.CAST, self.op.src, dtypes.float32),), self.op.arg)
           else:
@@ -192,7 +192,7 @@ class LazyBuffer:
   def unary_op(self:LazyBuffer, op:UnaryOps) -> LazyBuffer: return elementwise_op(op, self)
   def binary_op(self:LazyBuffer, op:BinaryOps, y:LazyBuffer) -> LazyBuffer: return elementwise_op(op, self, y)
   def contiguous(self:LazyBuffer) -> LazyBuffer:
-    if not self.realized and self.op.op == LoadOps.CONTIGUOUS: return self  # two CONTIGUOUS in a row is one
+    if not self.realized and self.op.op is LoadOps.CONTIGUOUS: return self  # two CONTIGUOUS in a row is one
     return create_lazybuffer(self.device, self.shape, LoadOps, LazyOp(LoadOps.CONTIGUOUS, (self,), None), self.dtype)
 
   def shuffle_and_prune_movement_ops(self, views:Tuple[View], op: MovementOps, arg: Union[Tuple[int, ...], Tuple[Tuple[int, int], ...]]) -> LazyBuffer:
@@ -213,7 +213,7 @@ class LazyBuffer:
 
   def reshape(self:LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     if self.shape == arg: return self
-    if not self.realized and self.op.op == MovementOps.RESHAPE:
+    if not self.realized and self.op.op is MovementOps.RESHAPE:
       self.op.src[0].children.discard(self) # NOTE: this is only required in reshape and when pushing permutes, why??
       return self.op.src[0].reshape(arg)
   
@@ -222,22 +222,22 @@ class LazyBuffer:
 
   def pad(self:LazyBuffer, arg:Tuple[Tuple[int, int], ...]) -> LazyBuffer:
     if all(b == 0 and e == 0 for b,e in arg): return self
-    if not self.realized and self.op.op == MovementOps.PAD: return self.op.src[0].pad(tuple([(b1+b2, e1+e2) for (b1,e1),(b2,e2) in zip(self.op.arg, arg)]))
+    if not self.realized and self.op.op is MovementOps.PAD: return self.op.src[0].pad(tuple([(b1+b2, e1+e2) for (b1,e1),(b2,e2) in zip(self.op.arg, arg)]))
     views = self.st[:-1] + (ShapeTracker.pad(self.st[-1], arg),)
     return self.shuffle_and_prune_movement_ops(views, MovementOps.PAD, arg)
 
   def expand(self: LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     if self.shape == arg: return self
-    if not self.realized and self.op.op == MovementOps.EXPAND:
+    if not self.realized and self.op.op is MovementOps.EXPAND:
       return self.op.src[0].expand(arg)
     views = self.st[:-1] + (ShapeTracker.expand(self.st[-1], arg),)
     return self.shuffle_and_prune_movement_ops(views, MovementOps.EXPAND, arg)
 
   def permute(self: LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     if arg == tuple(range(len(self.shape))): return self
-    if not self.realized and self.op.op == MovementOps.PERMUTE: return self.op.src[0].permute(tuple([self.op.arg[i] for i in arg]))
+    if not self.realized and self.op.op is MovementOps.PERMUTE: return self.op.src[0].permute(tuple([self.op.arg[i] for i in arg]))
     if not self.realized:
-      if PUSH_PERMUTES and self.optype == ReduceOps:
+      if PUSH_PERMUTES and self.optype is ReduceOps:
         # reduceops have one buffer input, permute it
         narg = tuple([self.op.arg[arg[i]] for i in range(len(arg))])
         src, rop = self.op.src[0], self.op.op
@@ -246,11 +246,11 @@ class LazyBuffer:
         return src.permute(arg).reduce_op(cast(ReduceOps, rop), narg)
 
       # move permutes before expands (always, this is safe)
-      if self.op.op == MovementOps.EXPAND:
+      if self.op.op is MovementOps.EXPAND:
         return self.op.src[0].permute(arg).expand(tuple([self.op.arg[a] for a in arg]))
 
       # move permutes before reshapes if we can
-      if PUSH_PERMUTES and self.op.op == MovementOps.RESHAPE and self.op.src[0].__class__ is LazyBuffer:
+      if PUSH_PERMUTES and self.op.op is MovementOps.RESHAPE and self.op.src[0].__class__ is LazyBuffer:
         if shape_idx_groups := get_contraction(self.op.src[0].shape, self.shape):
           self.op.src[0].children.discard(self) # NOTE: this is only required in reshape and when pushing permutes, why??
           return self.op.src[0].permute(tuple(flatten(shape_idx_groups[i] for i in arg))).reshape(tuple([self.st[-1].shape[a] for a in arg]))
@@ -259,7 +259,7 @@ class LazyBuffer:
 
   def shrink(self:LazyBuffer, arg:Tuple[Tuple[int, int], ...]) -> LazyBuffer:
     if all(b - a == s for s, (a, b) in zip(self.shape, arg)): return self
-    if not self.realized and self.op.op == MovementOps.SHRINK: return self.op.src[0].shrink(tuple([(b1+b2, b1+e2) for (b1,_),(b2,e2) in zip(self.op.arg, arg)]))
+    if not self.realized and self.op.op is MovementOps.SHRINK: return self.op.src[0].shrink(tuple([(b1+b2, b1+e2) for (b1,_),(b2,e2) in zip(self.op.arg, arg)]))
     views = self.st[:-1] + (ShapeTracker.shrink(self.st[-1], arg),)
     return self.shuffle_and_prune_movement_ops(views, MovementOps.SHRINK, arg)
 
@@ -267,7 +267,7 @@ class LazyBuffer:
     local_st = (ShapeTracker.stride(view_from_shape(self.shape), arg),)
     if self.shape == local_st.shape and local_st[0].contiguous: return self
 
-    if not self.realized and self.op.op == MovementOps.STRIDE: return self.op.src[0].stride(tuple(map(operator.mul, arg, self.op.arg)))
+    if not self.realized and self.op.op is MovementOps.STRIDE: return self.op.src[0].stride(tuple(map(operator.mul, arg, self.op.arg)))
     views = self.st[:-1] + (ShapeTracker.stride(self.st[-1], arg),)
     return self.shuffle_and_prune_movement_ops(views, MovementOps.STRIDE, arg)
 
@@ -291,7 +291,7 @@ def _push_movement_ops(srcs:Tuple[LazyBuffer, ...]) -> Tuple[LazyBuffer, ...]:
       mops.append((bx.op.op, bx.op.arg))
       bx = cast(LazyBuffer, bx.op.src[0])
     # NOTE: can't push pads with a div
-    if mops and not bx.realized and bx.optype is BinaryOps and len(bx.children) <= 1 and (all(x[0] != MovementOps.PAD for x in mops) or all(x.op != BinaryOps.DIV for x in bx.op.get_lazyops())):
+    if mops and not bx.realized and bx.optype is BinaryOps and len(bx.children) <= 1 and (all(x[0] != MovementOps.PAD for x in mops) or all(x.op is not BinaryOps.DIV for x in bx.op.get_lazyops())):
       new_srcs.append(bx.op.replace_with_movement_ops(mops[::-1]))
     else:
       new_srcs.append(x)
