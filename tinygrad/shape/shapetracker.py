@@ -20,13 +20,6 @@ def to_shape_strides(shape:Tuple[int, ...], strides:Tuple[int, ...]) -> Tuple[Tu
       ret.append((shape[i], strides[i]))
   return tuple(ret)
 
-@functools.lru_cache(maxsize=None)
-def is_contiguous(shape:Tuple[int, ...], strides:Tuple[int, ...]) -> bool: return all(s1 == s2 or s == 1 for s,s1,s2 in zip(shape, strides, strides_for_shape(shape)))
-
-@functools.lru_cache(maxsize=None)
-def filter_strides(shape:Tuple[int, ...], strides:Tuple[int, ...]) -> Tuple[int, ...]:
-  return tuple(stride if shp != 1 else 0 for stride, shp in zip(strides, shape))
-
 class ViewInternal(NamedTuple):
   shape:Tuple[int, ...]
   strides:Tuple[int, ...]
@@ -39,8 +32,8 @@ class ViewInternal(NamedTuple):
 class View(ViewInternal):
   def __new__(cls, shape, strides=None, offset=0, mask=None):
     strides_from_shape = strides_for_shape(shape) 
-    strides = strides_from_shape if not strides else filter_strides(shape, strides)
-    contiguous = offset == 0 and is_contiguous(shape, strides) and mask is None
+    strides = strides_from_shape if not strides else tuple(stride if shp != 1 else 0 for stride, shp in zip(strides, shape))
+    contiguous = offset == 0 and mask is None and  all(s1 == s2 or s == 1 for s,s1,s2 in zip(shape, strides, strides_for_shape(shape)))
     return super().__new__(cls, shape, strides, offset, mask, contiguous, to_shape_strides(shape, strides))  
   def __init__(self, shape, strides=None, offset=0, mask=None, contiguous=False, shape_strides=()): super().__init__()
 
@@ -84,11 +77,6 @@ def strides_for_shape(shape:Tuple[int, ...]) -> Tuple[int, ...]:
   strides = [1] if shape else []
   for d in shape[::-1][:-1]: strides = [d*strides[0]] + strides
   return tuple([st if s != 1 else 0 for st, s in zip(strides, shape)])
-
-@functools.lru_cache(maxsize=None)
-def view_from_shape(shape:Tuple[int, ...]) -> View:
-  assert all(isinstance(x, int) for x in shape)
-  return View(tuple(shape), strides_for_shape(shape))
 
 @functools.lru_cache(maxsize=None)
 def merge_views(vm2:View, vm1:View) -> Optional[View]:
@@ -136,7 +124,7 @@ def get_unsafe_resize_offset(strides, arg):
 class ShapeTracker:
   __slots__ = "views"
   def __init__(self, shape:Union[ShapeTracker, Tuple[int, ...]], views:Optional[List[View]]=None):
-    self.views: List[View] = views if views is not None else ([*cast(ShapeTracker, shape).views] if shape.__class__ is ShapeTracker else [view_from_shape(shape)])
+    self.views: List[View] = views if views is not None else ([*cast(ShapeTracker, shape).views] if shape.__class__ is ShapeTracker else [View(shape)])
   def __repr__(self): return f"ShapeTracker(shape={self.views[-1].shape}, views={self.views})"
   def copy(self) -> ShapeTracker: return ShapeTracker(self.views[-1].shape, [*self.views])
 
