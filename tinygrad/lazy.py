@@ -2,9 +2,9 @@ from __future__ import annotations
 import operator
 from typing import Callable, Optional, Tuple, Union, List, Dict, Any, cast
 import sys, importlib, inspect, functools, pathlib
-
+from weakref import ref
 import numpy as np
-from tinygrad.helpers import GRAPH, DEBUG, prod, getenv, DType, dtypes, flatten, ImageDType, LightWeakSet
+from tinygrad.helpers import GRAPH, DEBUG, prod, getenv, DType, dtypes, flatten, ImageDType, LightWeakSet, LightWeakValueDictionary
 from tinygrad.runtime.ops_cpu import RawNumpyBuffer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
 from tinygrad.shape.shapetracker import MovementOps, ShapeTracker, View, get_contraction, view_from_shape
@@ -91,9 +91,20 @@ def get_single_root(root:LazyBuffer) -> LazyBuffer: return get_single_root(cast(
 def get_movementroot(root:LazyBuffer, allow_contiguous=False) -> LazyBuffer: return get_movementroot(cast(LazyBuffer, root.op.src[0]), allow_contiguous) if not root.realized and (root.optype == MovementOps or (root.op.op == LoadOps.CONTIGUOUS and allow_contiguous and len(root.op.src[0].st) == 1 and root.op.src[0].st[-1].contiguous)) else root
 def get_movementroot_contiguous(x:LazyBuffer) -> LazyBuffer: return get_movementroot_contiguous(cast(LazyBuffer, x.op.src[0])) if not x.realized and x.op.op == LoadOps.CONTIGUOUS else (get_movementroot(x, True) if x.optype == MovementOps and len(x.st) == 1 and x.st[-1].contiguous else x)
 
-@functools.lru_cache(None)
-def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType): 
-  return LazyBuffer(device, (View(st),) if not st or type(st[0]) is int else st, optype, op, dtype) 
+lazycache: LightWeakValueDictionary = LightWeakValueDictionary()
+def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType):
+  st =  (View(st),) if not st or type(st[0]) is int else st
+  #print("create_lazybuffer", device, shape, optype, op, dtype)
+
+  # fromcpu aren't cached
+  if not LAZYCACHE or (optype is LoadOps and op.op in {LoadOps.EMPTY, LoadOps.RAND, LoadOps.CONST}): return LazyBuffer(device, st, optype, op, dtype)
+
+  # wop is the deduping key. i feel this used to compare more deeply
+  wop = (device, dtype, optype, ref(op))
+  if wop in lazycache: return lazycache[wop]
+
+  lazycache[wop] = ret = LazyBuffer(device, st, optype, op, dtype)
+  return ret
 
 class LazyBuffer:
   __slots__ = 'st', 'device', 'shape', 'optype', 'dtype', 'op', 'realized', 'output_buffer', 'children', 'node_id', '__weakref__', '_device_extra_args'
