@@ -132,19 +132,19 @@ def get_pad_args(shape:Tuple[int,...], arg:Tuple[Tuple[int, int], ...]):
 def get_unsafe_resize_offset(strides, arg):
   return sum([s * x[0] for s, x in zip(strides,arg)])
 
-@functools.lru_cache(None)
+@functools.lru_cache(maxsize=None)
 class ShapeTracker(NamedTuple):
   views: Tuple[View]
 
   # this is the real size (ish)
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def size(views:View) -> int: return prod([s for s,st in zip(views[-1].shape, views[-1].strides) if st != 0])
 
   # these are multiview strides, value is None if it's not a simple strided dimension
   # TODO: this can be shared code between simplify and merge_views
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def real_offset(views) -> int:
     real_offset, mask = ShapeTracker.expr_node(views, Variable('zero', 0, 0))
     assert real_offset.__class__ is NumNode, f"how is the offset not a number? {real_offset} {mask}"
@@ -152,7 +152,7 @@ class ShapeTracker(NamedTuple):
 
   # NOTE: if a stride is not always valid, it will be None
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def real_strides(views, ignore_valid=False) -> Tuple[Optional[int], ...]:
     if len(views) == 1 and views[-1].mask is None: return views[-1].strides
     idxs = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(views[-1].shape)]
@@ -170,11 +170,11 @@ class ShapeTracker(NamedTuple):
     return tuple(ret)
   
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def unit_stride_axes(views, ignore_valid=False) -> List[int]: return [i for i,st in enumerate(ShapeTracker.real_strides(views, ignore_valid)) if st == 1]
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def _expr_idx(views, idx, valid):
     for v in reversed(views[0:-1]):
       valid = v.expr_node_mask(idx, valid)
@@ -182,7 +182,7 @@ class ShapeTracker(NamedTuple):
     return idx, valid
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def simplify(views):
     if len(views) >= 2:
       new_view = merge_views(views[-2], views[-1])
@@ -191,7 +191,7 @@ class ShapeTracker(NamedTuple):
         return ShapeTracker.simplify((*views[:-2], new_view))
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def expr_idxs(views, idxs=None):
     if idxs is None: idxs = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(views[-1].shape)]
     v = views[-1]
@@ -200,7 +200,7 @@ class ShapeTracker(NamedTuple):
     return ShapeTracker._expr_idx(views, idx, valid)
   
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def expr_node(views, idx='idx'):
     v = views[-1]
     if idx.__class__ is str: idx = Variable(idx, 0, prod(v.shape)-1)
@@ -209,13 +209,13 @@ class ShapeTracker(NamedTuple):
     return ShapeTracker._expr_idx(views, idx, valid)
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def needs_valid(views) -> bool: return any([v.mask is not None for v in views])
 
   # *** under this line are the movement ops ***
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def __unsafe_resize(view, arg: Tuple[Tuple[int, int], ...], mask=None) -> View:
     offset = get_unsafe_resize_offset(view.strides, arg)
     if view.mask:
@@ -226,7 +226,7 @@ class ShapeTracker(NamedTuple):
     return View(tuple([y-x for x,y in arg]), view.strides, view.offset+offset, mask)
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def pad(view, arg: Tuple[Tuple[int, int], ...]) -> View:
     assert all((b>=0 and e>=0) for b,e in arg) and len(arg) == len(view.shape)
     if any([b or e for b, e in arg]):
@@ -234,13 +234,13 @@ class ShapeTracker(NamedTuple):
     return ShapeTracker.__unsafe_resize(view, zvarg, mask=mask)
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def shrink(view, arg: Tuple[Tuple[int, int], ...]) -> View:
     assert all((b>=0 and e<=s) for s,(b,e) in zip(view.shape,arg)) and len(arg) == len(view.shape)
     return ShapeTracker.__unsafe_resize(view, arg)
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def expand(view, new_shape:Tuple[int, ...]) -> View:
     assert len(new_shape) == len(view.shape)
     assert all(isinstance(x, int) and (s == x or (s == 1 and st == 0)) for s,x,st in zip(view.shape, new_shape, view.strides)), f"can't expand {view.shape} into {new_shape}"
@@ -249,7 +249,7 @@ class ShapeTracker(NamedTuple):
     return View(new_shape, view.strides, view.offset, mask)
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def reshape(views, new_shape:Tuple[int, ...]) -> Tuple[View]:
     if views[-1].shape == new_shape: return views
     assert all(isinstance(x, int) and x > 0 for x in new_shape), f"shape must be ints and can't contain 0 or negative numbers {new_shape}"
@@ -258,7 +258,7 @@ class ShapeTracker(NamedTuple):
     return (views if extra else views[:-1]) + (new_view, )
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def permute(view, axis: Tuple[int, ...]) -> View:
     assert all(isinstance(x, int) and x >= 0 and x < len(view.shape) for x in axis), f"invalid permute {axis} for {view.shape}"
     assert len(set(axis)) == len(axis) == len(view.shape), f"can't permute {view.shape} with {axis}"
@@ -266,7 +266,7 @@ class ShapeTracker(NamedTuple):
 
   # except for the negative case, you can build this from the others. invertible in the negative case
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def stride(view, mul: Tuple[int, ...]) -> View:
     assert all(isinstance(x, int) and x != 0 for x in mul), f"invalid stride {mul} for {view.shape}"
     strides = tuple([z*m for z,m in zip(view.strides, mul)])
@@ -278,7 +278,7 @@ class ShapeTracker(NamedTuple):
   # *** entry point for external ***
 
   @staticmethod
-  @functools.lru_cache(None)
+  @functools.lru_cache(maxsize=None)
   def movement_op(views, op: MovementOps, arg:Union[Tuple[int, ...], Tuple[Tuple[int, int], ...]]) -> ShapeTracker:
     assert isinstance(arg, tuple) and (len(arg) == len(views[-1].shape) or op == MovementOps.RESHAPE), f"arg {arg} for {op} doesn't match dim of shape {views[-1].shape}"
     return dispatch[op](views if op is MovementOps.RESHAPE else views[-1], arg)
