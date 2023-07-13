@@ -198,7 +198,7 @@ class ShapeTracker(NamedTuple):
 
   @staticmethod
   @functools.lru_cache(maxsize=None)
-  def needs_valid(views) -> bool: return any([v.mask is not None for v in views])
+  def needs_valid(views) -> bool: return any(v.mask is not None for v in views)
 
   # *** under this line are the movement ops ***
 
@@ -217,7 +217,7 @@ class ShapeTracker(NamedTuple):
   @functools.lru_cache(maxsize=None)
   def pad(view, arg: Tuple[Tuple[int, int], ...]) -> View:
     assert all((b>=0 and e>=0) for b,e in arg) and len(arg) == len(view.shape)
-    if any([b or e for b, e in arg]):
+    if any(b or e for b, e in arg):
       zvarg, mask = get_pad_args(view.shape, arg)
     return ShapeTracker.__unsafe_resize(view, zvarg, mask=mask)
 
