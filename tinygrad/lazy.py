@@ -199,7 +199,6 @@ class LazyBuffer:
     if SHUFFLE_MOVEMENT_OPS and self.optype is BinaryOps and not self.realized and self.children and (op in (MovementOps.SHRINK, MovementOps.STRIDE, MovementOps.PERMUTE) or (op is MovementOps.RESHAPE and self.op.op in UnaryOps)):
       return self.op.replace_with_movement_ops([(op, arg)])
     ret = create_lazybuffer(self.device, views, MovementOps, LazyOp(op, (self,), arg), self.dtype)
-    # return ret
     if REMOVE_MOVEMENT_NOPS and not self.realized and not ret.realized and ret.st[-1].contiguous and len(ret.st) == 1:
       # MovementOps aren't stacked any more, they each have one parent, find the root
       if (root:= get_movementroot(self)).st[-1].contiguous and len(root.st) == 1 and root != self and prod(ret.st[-1].shape) == prod(root.shape):
@@ -239,7 +238,7 @@ class LazyBuffer:
     if not self.realized:
       if PUSH_PERMUTES and self.optype is ReduceOps:
         # reduceops have one buffer input, permute it
-        narg = tuple([self.op.arg[arg[i]] for i in range(len(arg))])
+        narg = tuple([self.op.arg[a] for a in arg])
         src, rop = self.op.src[0], self.op.op
         src.children.discard(self)
         del self  # TODO: why doesn't this delete remove it from the children
