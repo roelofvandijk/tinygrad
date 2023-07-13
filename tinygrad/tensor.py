@@ -333,7 +333,7 @@ class Tensor:
     base_shape = self.shape
     if len(repeats) > self.ndim:
       base_shape = (1,) * (len(repeats) - self.ndim) + base_shape
-    new_shape = [x for i in range(len(base_shape)) for x in [1, base_shape[i]]]
+    new_shape = [x for b in base_shape for x in [1, b]]
     expand_shape = [x for r,s in zip(repeats, base_shape) for x in [r,s]]
     final_shape = [r*s for r,s in zip(repeats, base_shape)]
     return self.reshape(new_shape).expand(expand_shape).reshape(final_shape)
@@ -367,8 +367,8 @@ class Tensor:
   def _reduce(self, fxn:Type[Function], axis:Optional[Union[int, Tuple[int, ...]]]=None, keepdim=False):
     axis_: List[int] = list(range(len(self.shape))) if axis is None else ([axis] if axis.__class__ is int else list(axis)) # type: ignore
     axis_ = [x if x >= 0 else x+len(self.shape) for x in axis_]
-    shape = [self.shape[i] for i in range(len(self.shape)) if i not in axis_]
-    ret = fxn.apply(self, new_shape=tuple([1 if i in axis_ else self.shape[i] for i in range(len(self.shape))]))
+    shape = [s for i,s in enumerate(self.shape) if i not in axis_]
+    ret = fxn.apply(self, new_shape=tuple([1 if i in axis_ else s for i,s in enumerate(self.shape)]))
     return ret if keepdim else ret.reshape(shape=shape)
 
   def sum(self, axis=None, keepdim=False): return self._reduce(mlops.Sum, axis, keepdim)

@@ -507,8 +507,8 @@ class Linearizer:
 
   def colored_shape(self) -> str: return ' '.join(colored(f"{s:4d}", color) for s,color in zip(self.full_shape, self.colors()))
   def printbufs(self, prefix=""):
-    for i in range(len(self.sts)):
-      print(prefix, f"{i:3d} {str(self.bufs[i].realized) if self.bufs[i].realized is not None else str(self.bufs[i]):47s}", self.sts[i])
+    for i,st in enumerate(self.sts):
+      print(prefix, f"{i:3d} {str(self.bufs[i].realized) if self.bufs[i].realized is not None else str(self.bufs[i]):47s}", st)
     print(self.colored_shape())
 
   # ******************** base simplifiers ********************
@@ -745,7 +745,7 @@ class Linearizer:
     # if nothing at all is upcasted and it's easy to, do an upcast
     # TODO: this is breaking the tests
     for splits in [4]:
-      if self.upcasted == 0 and len(self.full_unupcasted_shape) > 0 and self.full_unupcasted_shape[-1] % splits == 0:
+      if self.upcasted == 0 and self.full_unupcasted_shape and self.full_unupcasted_shape[-1] % splits == 0:
         self.shift_to(len(self.full_unupcasted_shape)-1, splits, insert_before=len(self.full_unupcasted_shape))
         self.upcast()
 
@@ -755,7 +755,7 @@ class Linearizer:
       local_size = prod(self.full_shape[self.first_reduce-self.local_dims:self.first_reduce])
       if self.full_shape[axis] == 1: continue
       last_try = self.local_dims == 0 and axis == 0
-      if any(self.sts[buf_index][-1].strides[axis] == 0 for buf_index in range(len(self.sts))) or last_try:
+      if any(st[-1].strides[axis] == 0 for st in self.sts) or last_try:
         for sz in [x for x in (([32] if last_try else []) + [16,8,4,3]) if self.full_shape[axis] % x == 0 and local_size*x <= 128]:
           self.shift_to(axis, sz, insert_before=self.first_reduce-self.local_dims)
           self.local_dims += 1
