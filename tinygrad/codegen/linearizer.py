@@ -505,8 +505,8 @@ class Linearizer:
 
   def colored_shape(self) -> str: return ' '.join(colored(f"{s:4d}", color) for s,color in zip(self.full_shape, self.colors()))
   def printbufs(self, prefix=""):
-    for i in range(len(self.sts)):
-      print(prefix, f"{i:3d} {str(self.bufs[i].realized) if self.bufs[i].realized is not None else str(self.bufs[i]):47s}", self.sts[i].views)
+    for st in self.sts:
+      print(prefix, f"{i:3d} {str(st.realized) if st.realized is not None else str(st):47s}", st.views)
     print(self.colored_shape())
 
   # ******************** base simplifiers ********************
@@ -740,7 +740,7 @@ class Linearizer:
     # if nothing at all is upcasted and it's easy to, do an upcast
     # TODO: this is breaking the tests
     for splits in [4]:
-      if self.upcasted == 0 and len(self.full_unupcasted_shape) > 0 and self.full_unupcasted_shape[-1] % splits == 0:
+      if self.upcasted == 0 and self.full_unupcasted_shape and self.full_unupcasted_shape[-1] % splits == 0:
         self.shift_to(len(self.full_unupcasted_shape)-1, splits, insert_before=len(self.full_unupcasted_shape))
         self.upcast()
 
