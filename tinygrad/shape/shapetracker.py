@@ -32,7 +32,7 @@ class ViewInternal(NamedTuple):
 class View(ViewInternal):
   def __new__(cls, shape, strides=None, offset=0, mask=None):
     strides_from_shape = strides_for_shape(shape) 
-    strides = strides_from_shape if not strides else tuple(stride if shp != 1 else 0 for stride, shp in zip(strides, shape))
+    strides = strides_from_shape if not strides else tuple([stride if shp != 1 else 0 for stride, shp in zip(strides, shape)])
     contiguous = offset == 0 and mask is None and  all(s1 == s2 or s == 1 for s,s1,s2 in zip(shape, strides, strides_for_shape(shape)))
     return super().__new__(cls, shape, strides, offset, mask, contiguous, to_shape_strides(shape, strides))  
   def __init__(self, shape, strides=None, offset=0, mask=None, contiguous=False, shape_strides=()): super().__init__()
