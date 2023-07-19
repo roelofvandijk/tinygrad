@@ -339,7 +339,7 @@ class Linearizer:
           elif (elc:=[el for el in extra_locals if v.min == el.min and (v.max+1)%(el.max+1) == 0]):
             tacc = Variable.num(0)
             rem = v.max+1
-            while len(elc) and rem%(elc[0].max+1) == 0:
+            while elc and rem%(elc[0].max+1) == 0:
               if DEBUG >= 4: print(f"upcasting partial stride {rem} {elc[0]} left: {elc[1:]}")
               rem = rem//(elc[0].max+1)
               tacc += (elc[0] * rem)
