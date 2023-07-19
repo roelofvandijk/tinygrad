@@ -116,7 +116,7 @@ def get_pad_args(shape:Tuple[int,...], arg:Tuple[Tuple[int, int], ...]):
 
 @functools.lru_cache(maxsize=None)
 def get_unsafe_resize_offset(strides, arg):
-  return sum([s * x[0] for s, x in zip(strides,arg)])
+  return sum(s * x[0] for s, x in zip(strides,arg))
 
 @functools.lru_cache(maxsize=None)
 class ShapeTracker(NamedTuple):
@@ -257,7 +257,7 @@ class ShapeTracker(NamedTuple):
     assert all(isinstance(x, int) and x != 0 for x in mul), f"invalid stride {mul} for {view.shape}"
     strides = tuple([z*m for z,m in zip(view.strides, mul)])
     new_shape = tuple([(s+(abs(m)-1))//abs(m) for s,m in zip(view.shape, mul)])
-    offset = sum([(s-1)*z for s,z,m in zip(view.shape, view.strides, mul) if m < 0])
+    offset = sum((s-1)*z for s,z,m in zip(view.shape, view.strides, mul) if m < 0)
     mask = tuple([(((mx if m > 0 else s-my)+(abs(m)-1))//abs(m), ((my if m > 0 else s-mx)+(abs(m)-1))//abs(m)) for (mx,my),s,m in zip(view.mask, view.shape, mul)]) if view.mask is not None else None
     return View(new_shape, strides, view.offset + offset, mask)
 
@@ -285,11 +285,11 @@ def get_contraction(old_shape:Tuple[int, ...], new_shape:Tuple[int, ...]) -> Opt
     if new_shape[i] == 1 and old_shape[old_shape_i] != 1:
       if i < len(new_shape) - 1: i += 1
     else:
-      if new_shape[i] % old_shape[old_shape_i] != 0 or prod([old_shape[x] for x in axis_groups[i]]) * old_shape[old_shape_i] > new_shape[i]:
+      if new_shape[i] % old_shape[old_shape_i] != 0 or prod(old_shape[x] for x in axis_groups[i]) * old_shape[old_shape_i] > new_shape[i]:
         return None
       axis_groups[i].append(old_shape_i)
       # Move to next axes group if total size of all dimensions match.
-      if prod([old_shape[x] for x in axis_groups[i]]) == new_shape[i]:
+      if prod(old_shape[x] for x in axis_groups[i]) == new_shape[i]:
         if i < len(new_shape) - 1: i += 1
       old_shape_i += 1
   return axis_groups
