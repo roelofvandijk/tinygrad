@@ -123,8 +123,8 @@ class LightWeakSet:
   def add(self, item): self.data.add(ref(item, self._remove))
   def discard(self, item): self.data.discard(ref(item))
   def _remove(self, item):
-    try: ref(self)().data.remove(item)
-    except: pass
+    try: ref(self)().data.remove(item)  # type: ignore[union-attr]
+    except (AttributeError, KeyError): pass
 
 # Stripped down version of a WeakValueDictionary
 class LightWeakValueDictionary:
@@ -142,5 +142,5 @@ class LightWeakValueDictionary:
   def __setitem__(self, key, value): self.data[key] = KeyedRef(value, self._remove, key)
   def __contains__(self, key): return key in self.data
   def _remove(self, wr):
-    try: _remove_dead_weakref(ref(self)().data, wr.key)
-    except: pass
+    try: _remove_dead_weakref(ref(self)().data, wr.key)  # type: ignore[union-attr]
+    except (AttributeError, KeyError): pass
