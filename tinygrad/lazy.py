@@ -128,7 +128,6 @@ class LazyBuffer:
     self._device_extra_args = {"device": device.split(":", 1)[1]} if ":" in self.device else {}
   def __repr__(self): return f"<LB {self.shape} {self.dtype} op={self.op.op if not self.realized else self.realized} st={self.st}>"
   @property
-
   def key(self): return (self.dtype, getattr(getattr(self, "op", None), "op", None), self.realized.key if self.realized is not None else None, self.st)
   
   def realize(self:LazyBuffer) -> LazyBuffer:

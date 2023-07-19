@@ -109,7 +109,7 @@ class FlopCounter:
   def consume_flops(self):
     self.flops, ret = 0, self.flops
     return ret
-from tinygrad.shape.shapetracker import ShapeTracker
+
 shape_fxn_for_op: Dict[Op, Callable] = {
   UnaryOps.CAST: lambda self,dtype: (self.shape, dtype, self.consume_flops()),   # cast uses no flops
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op is not UnaryOps.CAST},
