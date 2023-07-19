@@ -125,7 +125,7 @@ class ShapeTracker(NamedTuple):
   # this is the real size (ish)
   @staticmethod
   @functools.lru_cache(maxsize=None)
-  def size(views:View) -> int: return prod([s for s,st in zip(views[-1].shape, views[-1].strides) if st != 0])
+  def size(views:Tuple[View]) -> int: return prod(s for s,st in zip(views[-1].shape, views[-1].strides) if st != 0)
 
   # these are multiview strides, value is None if it's not a simple strided dimension
   # TODO: this can be shared code between simplify and merge_views
@@ -265,7 +265,7 @@ class ShapeTracker(NamedTuple):
 
   @staticmethod
   @functools.lru_cache(maxsize=None)
-  def movement_op(views, op: MovementOps, arg:Union[Tuple[int, ...], Tuple[Tuple[int, int], ...]]) -> ShapeTracker:
+  def movement_op(views, op: MovementOps, arg:Union[Tuple[int, ...], Tuple[Tuple[int, int], ...]]) -> View:
     assert isinstance(arg, tuple) and (len(arg) == len(views[-1].shape) or op is MovementOps.RESHAPE), f"arg {arg} for {op} doesn't match dim of shape {views[-1].shape}"
     return dispatch[op](views if op is MovementOps.RESHAPE else views[-1], arg)
  

@@ -10,8 +10,6 @@ ShapeType = Tuple[int, ...]
 # NOTE: helpers is not allowed to import from anything else in tinygrad
 OSX = platform.system() == "Darwin"
 
-def cached_staticmethod(func): return staticmethod(functools.lru_cache(None)(func))
-
 def dedup(x): return [] if not x else list(x) if len(x) == 1 else list(dict.fromkeys(x))   # retains list order
 def argfix(*x): return tuple(x if type(x[0]) is int else x[0])
 def argsort(x): return type(x)(sorted(range(len(x)), key=x.__getitem__)) # https://stackoverflow.com/questions/3382352/equivalent-of-numpy-argsort-in-basic-python
@@ -81,7 +79,8 @@ class dtypes:
   def is_float(x: DType) -> bool: return x in (dtypes.float16, dtypes.float32, dtypes._half4, dtypes._float4)
   @staticmethod
   def is_unsigned(x: DType) -> bool: return x in (dtypes.uint8, dtypes.uint32, dtypes.uint64)
-  @cached_staticmethod
+  @staticmethod
+  @functools.lru_cache(None)
   def from_np(x) -> DType: return DTYPES_DICT[np.dtype(x).name]
   @staticmethod
   def fields() -> Dict[str, DType]: return DTYPES_DICT

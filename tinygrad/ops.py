@@ -164,7 +164,7 @@ class Compiled:
     if output.realized:
       if output.realized.__class__ is RawConst: output.realized = None  # can't assign to RawConst
       for a in ast.buffers:
-        if a.realized == output.realized and not ShapeTracker.contiguous(a.st):
+        if a.realized == output.realized and not (len(a.st) == 1 and a.st[-1].contiguous):
           output.realized = None
           break
 

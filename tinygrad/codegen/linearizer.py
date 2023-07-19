@@ -154,7 +154,7 @@ class Linearizer:
     self.earlybufs = dedup(self.reduceop.buffers) if self.reduceop else []
 
     # create new shapetrackers inside this kernel, we will permute them
-    self.sts: List[ShapeTracker] = [x.st for x in self.bufs]
+    self.sts: List[Tuple[View]] = [x.st for x in self.bufs]
     for st in self.sts: st = ShapeTracker.simplify(tuple(st))
 
     # make the output buffer shape correct in here
@@ -519,7 +519,7 @@ class Linearizer:
       if new_shape_fxn is not None: 
         self.sts[i] = ShapeTracker.reshape(self.sts[i], tuple(new_shape_fxn(self.sts[i][-1].shape)))
       if axis is not None: 
-        self.sts[i] = tuple(self.sts[i][:-1]) + (ShapeTracker.permute(self.sts[i][-1], tuple(axis)),)
+        self.sts[i] = tuple(self.sts[i][:-1]) + tuple([ShapeTracker.permute(self.sts[i][-1], tuple(axis))])
 
   # drops the final dimension
   def upcast(self):
