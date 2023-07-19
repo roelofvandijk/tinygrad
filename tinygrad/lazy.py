@@ -92,7 +92,7 @@ def get_movementroot(root:LazyBuffer, allow_contiguous=False) -> LazyBuffer: ret
 def get_movementroot_contiguous(x:LazyBuffer) -> LazyBuffer: return get_movementroot_contiguous(cast(LazyBuffer, x.op.src[0])) if not x.realized and x.op.op is LoadOps.CONTIGUOUS else (get_movementroot(x, True) if x.optype is MovementOps and len(x.st) == 1 and x.st[-1].contiguous else x)
 
 lazycache: LightWeakValueDictionary = LightWeakValueDictionary()
-def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType):
+def create_lazybuffer(device:str, st:Union[Tuple[View], Tuple[int]], optype:OpType, op:LazyOp, dtype:DType):
   st =  (View(st),) if not st or type(st[0]) is int else st
   #print("create_lazybuffer", device, shape, optype, op, dtype)
 
@@ -109,7 +109,7 @@ def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dty
 class LazyBuffer:
   __slots__ = 'st', 'device', 'shape', 'optype', 'dtype', 'op', 'realized', 'output_buffer', 'children', 'node_id', '__weakref__', '_device_extra_args'
   __deletable__ = ('op',)
-  def __init__(self, device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType, src:Optional[RawBuffer]=None):
+  def __init__(self, device:str, st:Tuple[View], optype:OpType, op:LazyOp, dtype:DType, src:Optional[RawBuffer]=None):
     self.device, self.optype, self.dtype, self.shape, self.st, self.realized, self.op = device, optype, dtype, st[-1].shape, st, src, op  
     # NOTE: st is not a copy! this should be a "read-only" ShapeTracker
     # NOTE: op should be read only after construction of LazyBuffer
@@ -264,7 +264,7 @@ class LazyBuffer:
 
   def stride(self:LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     local_st = (ShapeTracker.stride(View(self.shape), arg),)
-    if self.shape == local_st.shape and local_st[0].contiguous: return self
+    if self.shape == local_st[-1].shape and local_st[0].contiguous: return self
 
     if not self.realized and self.op.op is MovementOps.STRIDE: return self.op.src[0].stride(tuple(map(operator.mul, arg, self.op.arg)))
     views = self.st[:-1] + (ShapeTracker.stride(self.st[-1], arg),)
