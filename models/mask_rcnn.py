@@ -1,7 +1,7 @@
 import re
-import math
 import os
 import numpy as np
+from math import log, log2, ceil
 from pathlib import Path
 from tinygrad import nn
 from tinygrad.tensor import Tensor
@@ -506,7 +506,7 @@ class RPNHead:
 
 
 class BoxCoder(object):
-  def __init__(self, weights, bbox_xform_clip=math.log(1000. / 16)):
+  def __init__(self, weights, bbox_xform_clip=log(1000. / 16)):
     self.weights = weights
     self.bbox_xform_clip = bbox_xform_clip
 
@@ -967,8 +967,8 @@ class Pooler:
       )
     self.poolers = poolers
     self.output_size = output_size
-    lvl_min = -math.log2(scales[0])
-    lvl_max = -math.log2(scales[-1])
+    lvl_min = -log2(scales[0])
+    lvl_max = -log2(scales[-1])
     self.map_levels = LevelMapper(lvl_min, lvl_max)
 
   def convert_to_roi_format(self, boxes):
@@ -1215,8 +1215,8 @@ def to_image_list(tensors, size_divisible=32):
 
       stride = size_divisible
       max_size = list(max_size)
-      max_size[1] = int(math.ceil(max_size[1] / stride) * stride)
-      max_size[2] = int(math.ceil(max_size[2] / stride) * stride)
+      max_size[1] = int(ceil(max_size[1] / stride) * stride)
+      max_size[2] = int(ceil(max_size[2] / stride) * stride)
       max_size = tuple(max_size)
 
     batch_shape = (len(tensors),) + max_size

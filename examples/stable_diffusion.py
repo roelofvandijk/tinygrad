@@ -3,9 +3,10 @@
 import os
 import tempfile
 from pathlib import Path
-import gzip, argparse, math, re
+import gzip, argparse, re
 from functools import lru_cache
 from collections import namedtuple
+from math import log, sqrt
 
 from tqdm import tqdm
 from tinygrad.tensor import Tensor
@@ -250,7 +251,7 @@ class Upsample:
 
 def timestep_embedding(timesteps, dim, max_period=10000):
   half = dim // 2
-  freqs = (-math.log(max_period) * Tensor.arange(half) / half).exp()
+  freqs = (-log(max_period) * Tensor.arange(half) / half).exp()
   args = timesteps * freqs
   return Tensor.cat(args.cos(), args.sin()).reshape(1, -1)
 
@@ -609,16 +610,16 @@ if __name__ == "__main__":
     temperature = 1
     a_t, a_prev = alphas[index], alphas_prev[index]
     sigma_t = 0
-    sqrt_one_minus_at = math.sqrt(1-a_t)
+    sqrt_one_minus_at = sqrt(1-a_t)
     #print(a_t, a_prev, sigma_t, sqrt_one_minus_at)
 
-    pred_x0 = (x - sqrt_one_minus_at * e_t) / math.sqrt(a_t)
+    pred_x0 = (x - sqrt_one_minus_at * e_t) / sqrt(a_t)
 
     # direction pointing to x_t
-    dir_xt = math.sqrt(1. - a_prev - sigma_t**2) * e_t
+    dir_xt = sqrt(1. - a_prev - sigma_t**2) * e_t
     noise = sigma_t * Tensor.randn(*x.shape) * temperature
 
-    x_prev = math.sqrt(a_prev) * pred_x0 + dir_xt #+ noise
+    x_prev = sqrt(a_prev) * pred_x0 + dir_xt #+ noise
     return x_prev, pred_x0
 
   # start with random noise

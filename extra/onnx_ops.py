@@ -5,7 +5,7 @@ from onnx.helper import tensor_dtype_to_np_dtype
 import numpy as np
 import functools
 from typing import Union, Tuple, Optional
-import math
+from math import e, sqrt
 
 def Unsqueeze(data, axes):
   axes = [len(data.shape) + int(x) if x < 0 else int(x) for x in safe_numpy(axes)]
@@ -161,8 +161,8 @@ def Clip(input, min=None, max=None):
 def Sin(x): return x.sin()
 def Cos(x): return x.cos()
 def Tan(x): return x.tan()
-def Cosh(x): return (math.e ** x + math.e ** -x) / 2
-def Sinh(x): return (math.e ** x - math.e ** -x) / 2
+def Cosh(x): return (e ** x + e ** -x) / 2
+def Sinh(x): return (e ** x - e ** -x) / 2
 def Tanh(x): return Sinh(x) / Cosh(x)
 
 def Less(x:Tensor,y:Tensor): return (x<y).cast(dtypes.bool)
@@ -311,7 +311,7 @@ def Attention(input:Tensor, weights, bias:Optional[Tensor]=None, mask_index:Opti
   def attn(query, key, value, attn_mask):
     query_length, key_length = query.shape[-2], key.shape[-2]
     cdim = max(query_length, key_length) + 1
-    attn_weights = query @ key.transpose(-1, -2) / math.sqrt(value.shape[-1])
+    attn_weights = query @ key.transpose(-1, -2) / sqrt(value.shape[-1])
     # This is where Tensor.scaled_dot_product_attention differs:
     causal_mask = Tensor.ones((cdim, cdim), requires_grad=False).cast(dtypes.bool).tril(0)[key_length - query_length : key_length, :key_length].cast(dtypes.bool)
     return (Tensor.where(causal_mask, attn_weights, -float("inf")) + attn_mask).softmax(-1) @ value

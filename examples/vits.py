@@ -1,4 +1,5 @@
-import json, logging, math, os, re, sys, time, wave, argparse, numpy as np
+import json, logging, os, re, sys, time, wave, argparse, numpy as np
+from math import log, pi, sqrt
 from functools import reduce
 from pathlib import Path
 from typing import List
@@ -88,7 +89,7 @@ class StochasticDurationPredictor:
       u = z_u.sigmoid() * x_mask
       z0 = (w - u) * x_mask
       log_det_tot_q += Tensor.sum((z_u.logsigmoid() + (-z_u).logsigmoid()) * x_mask, [1,2])
-      log_q = Tensor.sum(-0.5 * (math.log(2*math.pi) + (e_q**2)) * x_mask, [1,2]) - log_det_tot_q
+      log_q = Tensor.sum(-0.5 * (log(2*pi) + (e_q**2)) * x_mask, [1,2]) - log_det_tot_q
       log_det_tot = 0
       z0, log_det = self.log_flow.forward(z0, x_mask)
       log_det_tot += log_det
@@ -96,7 +97,7 @@ class StochasticDurationPredictor:
       for flow in flows:
         z, log_det = flow.forward(z, x_mask, g=x, reverse=reverse)
         log_det_tot = log_det_tot + log_det
-      nll = Tensor.sum(0.5 * (math.log(2*math.pi) + (z**2)) * x_mask, [1,2]) - log_det_tot
+      nll = Tensor.sum(0.5 * (log(2*pi) + (z**2)) * x_mask, [1,2]) - log_det_tot
       return nll + log_q # [b]
     flows = list(reversed(self.flows))
     flows = flows[:-2] + [flows[-1]] # remove a useless vflow
@@ -129,7 +130,7 @@ class TextEncoder:
     self.encoder = Encoder(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout)
     self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
   def forward(self, x: Tensor, x_lengths: Tensor, emotion_embedding=None):
-    if self.n_vocab!=0: x = (self.emb(x) * math.sqrt(self.hidden_channels))
+    if self.n_vocab!=0: x = (self.emb(x) * sqrt(self.hidden_channels))
     if emotion_embedding: x = x + self.emo_proj(emotion_embedding).unsqueeze(1)
     x = x.transpose(1, -1)  # [b, t, h] -transpose-> [b, h, t]
     x_mask = sequence_mask(x_lengths, x.shape[2]).unsqueeze(1).cast(x.dtype)
@@ -271,8 +272,8 @@ class ConvFlow:
     h = self.proj(self.convs.forward(self.pre(x0), x_mask, g=g)) * x_mask
     b, c, t = x0.shape
     h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2) # [b, cx?, t] -> [b, c, t, ?]
-    un_normalized_widths = h[..., :self.num_bins] / math.sqrt(self.filter_channels)
-    un_normalized_heights = h[..., self.num_bins:2*self.num_bins] / math.sqrt(self.filter_channels)
+    un_normalized_widths = h[..., :self.num_bins] / sqrt(self.filter_channels)
+    un_normalized_heights = h[..., self.num_bins:2*self.num_bins] / sqrt(self.filter_channels)
     un_normalized_derivatives = h[..., 2 * self.num_bins:]
     x1, log_abs_det = piecewise_rational_quadratic_transform(x1, un_normalized_widths, un_normalized_heights, un_normalized_derivatives, inverse=reverse, tails='linear', tail_bound=self.tail_bound)
     x = x0.cat(x1, dim=1) * x_mask
@@ -331,11 +332,11 @@ class MultiHeadAttention:
     query = query.reshape(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
     key = key.reshape(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
     value = value.reshape(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
-    scores = (query / math.sqrt(self.k_channels)) @ key.transpose(-2, -1)
+    scores = (query / sqrt(self.k_channels)) @ key.transpose(-2, -1)
     if self.window_size is not None:
       assert t_s == t_t, "Relative attention is only available for self-attention."
       key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
-      rel_logits = self._matmul_with_relative_keys(query / math.sqrt(self.k_channels), key_relative_embeddings)
+      rel_logits = self._matmul_with_relative_keys(query / sqrt(self.k_channels), key_relative_embeddings)
       scores = scores + self._relative_position_to_absolute_position(rel_logits)
     if mask is not None:
       scores = Tensor.where(mask, scores, -1e4)

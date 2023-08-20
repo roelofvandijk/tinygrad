@@ -2,9 +2,9 @@
 import sys
 import io
 import time
-import math
 import cv2
 import numpy as np
+from math import prod
 from PIL import Image
 from tinygrad.tensor import Tensor
 from tinygrad.nn import BatchNorm2d, Conv2d
@@ -295,7 +295,7 @@ class Darknet:
         if batch_normalize:
           bn = model[1]
           # Get the number of weights of batchnorm
-          num_bn_biases = math.prod(bn.bias.shape)
+          num_bn_biases = prod(bn.bias.shape)
           # Load weights
           bn_biases = Tensor(weights[ptr:ptr + num_bn_biases])
           ptr += num_bn_biases
@@ -317,7 +317,7 @@ class Darknet:
           bn.running_var = bn_running_var
         else:
           # load biases of the conv layer
-          num_biases = math.prod(conv.bias.shape)
+          num_biases = prod(conv.bias.shape)
           # Load weights
           conv_biases = Tensor(weights[ptr: ptr+num_biases])
           ptr += num_biases
@@ -326,7 +326,7 @@ class Darknet:
           # Copy
           conv.bias = conv_biases
         # Load weighys for conv layers
-        num_weights = math.prod(conv.weight.shape)
+        num_weights = prod(conv.weight.shape)
         conv_weights = Tensor(weights[ptr:ptr+num_weights])
         ptr += num_weights
         conv_weights = conv_weights.reshape(shape=tuple(conv.weight.shape))

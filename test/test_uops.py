@@ -1,5 +1,6 @@
-import unittest, math
+import unittest
 import numpy as np
+from math import isnan, log2, sin, sqrt
 from tinygrad.helpers import dtypes, getenv
 from tinygrad.tensor import Device
 from tinygrad.ops import UnaryOps, BinaryOps, TernaryOps, ASTRunner, Compiled
@@ -39,7 +40,7 @@ def _test_single_value_const(tc, tt, vals, op):
 
 class TestUOps(unittest.TestCase):
   def _equal(self, v1, v2):
-    if not (math.isnan(v1) and math.isnan(v2)): self.assertAlmostEqual(v1, v2, places=5)
+    if not (isnan(v1) and isnan(v2)): self.assertAlmostEqual(v1, v2, places=5)
 
   def _test_uop_fxn(self, bop, fxn, dt=dtypes.float32):
     for f in [_test_single_value, _test_single_value_const]:
@@ -62,9 +63,9 @@ class TestUOps(unittest.TestCase):
 @unittest.skipIf(not isinstance(Device[Device.DEFAULT], Compiled), "only test for compiled backends")
 class TestFloatUOps(TestUOps):
   def test_exp2(self): self._test_uop_fxn(UnaryOps.EXP2, lambda a: np.exp2(a))
-  def test_log2(self): self._test_uop_fxn(UnaryOps.LOG2, lambda a: math.log2(a) if a > 0 else float('-inf' if a==0 else 'nan'))
-  def test_sin(self): self._test_uop_fxn(UnaryOps.SIN, lambda a: math.sin(a))
-  def test_sqrt(self): self._test_uop_fxn(UnaryOps.SQRT, lambda a: math.sqrt(a) if a >= 0 else float('nan'))
+  def test_log2(self): self._test_uop_fxn(UnaryOps.LOG2, lambda a: log2(a) if a > 0 else float('-inf' if a==0 else 'nan'))
+  def test_sin(self): self._test_uop_fxn(UnaryOps.SIN, lambda a: sin(a))
+  def test_sqrt(self): self._test_uop_fxn(UnaryOps.SQRT, lambda a: sqrt(a) if a >= 0 else float('nan'))
   # this is not on most backends
   #def test_recip(self): self._test_uop_fxn(UnaryOps.RECIP, lambda a: 1.0/a if a != 0 else float('inf'))
 

@@ -1,4 +1,4 @@
-import math
+from math import ceil
 from tinygrad.helpers import flatten
 import tinygrad.nn as nn
 from models.resnet import ResNet
@@ -221,7 +221,7 @@ class FPN:
 
       # upsample to inner_lateral's shape
       (ih, iw), (oh, ow), prefix = last_inner.shape[-2:], inner_lateral.shape[-2:], last_inner.shape[:-2]
-      eh, ew = math.ceil(oh / ih), math.ceil(ow / iw)
+      eh, ew = ceil(oh / ih), ceil(ow / iw)
       inner_top_down = last_inner.reshape(*prefix, ih, 1, iw, 1).expand(*prefix, ih, eh, iw, ew).reshape(*prefix, ih*eh, iw*ew)[:, :, :oh, :ow]
 
       last_inner = inner_lateral + inner_top_down

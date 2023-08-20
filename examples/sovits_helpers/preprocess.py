@@ -1,4 +1,4 @@
-import math
+from math import gcd, ceil, pi
 from typing import Optional, Tuple
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import dtypes
@@ -126,7 +126,7 @@ class Slicer:  # from https://github.com/svc-develop-team/so-vits-svc/
 class Resample:
   def __init__(self, orig_freq:int=16000, new_freq:int=16000, lowpass_filter_width:int=6, rolloff:float=0.99, beta:Optional[float]=None, dtype:Optional[dtypes]=None):
     self.orig_freq, self.new_freq, self.lowpass_filter_width, self.rolloff, self.beta = orig_freq, new_freq, lowpass_filter_width, rolloff, beta
-    self.gcd = math.gcd(int(self.orig_freq), int(self.new_freq))
+    self.gcd = gcd(int(self.orig_freq), int(self.new_freq))
     self.kernel, self.width = self._get_sinc_resample_kernel(dtype) if self.orig_freq != self.new_freq else (None, None)
   def __call__(self, waveform:Tensor) -> Tensor:
     if self.orig_freq == self.new_freq: return waveform
@@ -137,7 +137,7 @@ class Resample:
     shape = waveform.shape
     waveform = waveform.reshape(-1, shape[-1])  # pack batch
     num_wavs, length = waveform.shape
-    target_length = int(math.ceil(new_freq * length / orig_freq))
+    target_length = int(ceil(new_freq * length / orig_freq))
     waveform = waveform.pad2d((self.width, self.width + orig_freq))
     resampled = waveform[:, None].conv2d(self.kernel, stride=orig_freq)
     resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
@@ -149,13 +149,13 @@ class Resample:
     if self.lowpass_filter_width <= 0: raise ValueError("Low pass filter width should be positive.")
     base_freq = min(orig_freq, new_freq)
     base_freq *= self.rolloff
-    width = math.ceil(self.lowpass_filter_width * orig_freq / base_freq)
+    width = ceil(self.lowpass_filter_width * orig_freq / base_freq)
     idx = Tensor.arange(-width, width + orig_freq, dtype=(dtype if dtype is not None else dtypes.float32))[None, None] / orig_freq
     t = Tensor.arange(0, -new_freq, -1, dtype=dtype)[:, None, None] / new_freq + idx
     t *= base_freq
     t = t.clip(-self.lowpass_filter_width, self.lowpass_filter_width)
-    window = (t * math.pi / self.lowpass_filter_width / 2).cos() ** 2
-    t *= math.pi
+    window = (t * pi / self.lowpass_filter_width / 2).cos() ** 2
+    t *= pi
     scale = base_freq / orig_freq
     kernels = Tensor.where(t == 0, Tensor(1.0, dtype=t.dtype).to(t.device), t.sin() / t)
     kernels *= window * scale

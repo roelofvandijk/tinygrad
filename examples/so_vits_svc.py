@@ -1,6 +1,7 @@
 # original implementation: https://github.com/svc-develop-team/so-vits-svc
 from __future__ import annotations
-import sys, os, logging, time, io, math, argparse, operator, numpy as np
+import sys, os, logging, time, io, argparse, operator, numpy as np
+from math import sqrt
 from functools import partial, reduce
 from pathlib import Path
 from typing import Tuple, Optional, Type
@@ -105,7 +106,7 @@ class TransformerEncoder:
   def __init__(self, cfg: HParams):
     def make_conv() -> nn.Conv1d:
       layer = nn.Conv1d(self.embedding_dim, self.embedding_dim, kernel_size=cfg.conv_pos, padding=cfg.conv_pos // 2, groups=cfg.conv_pos_groups)
-      std = std = math.sqrt(4 / (cfg.conv_pos * self.embedding_dim))
+      std = std = sqrt(4 / (cfg.conv_pos * self.embedding_dim))
       layer.weight, layer.bias = (Tensor.normal(*layer.weight.shape, std=std)), (Tensor.zeros(*layer.bias.shape))
       # for training: layer.weights need to be weight_normed
       return layer

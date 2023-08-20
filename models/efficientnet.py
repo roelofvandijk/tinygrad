@@ -1,4 +1,4 @@
-import math
+from math import ceil
 from tinygrad.tensor import Tensor
 from tinygrad.nn import BatchNorm2d
 from extra.utils import get_child
@@ -77,7 +77,7 @@ class EfficientNet:
       return int(new_filters)
 
     def round_repeats(repeats):
-      return int(math.ceil(global_params[1] * repeats))
+      return int(ceil(global_params[1] * repeats))
 
     out_channels = round_filters(32)
     self._conv_stem = Tensor.glorot_uniform(out_channels, input_channels, 3, 3)

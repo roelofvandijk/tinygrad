@@ -1,6 +1,6 @@
 import torch
 import time
-import math
+from math import isnan
 import numpy as np
 import unittest
 from tinygrad.tensor import Tensor
@@ -1120,7 +1120,7 @@ class TestOps(unittest.TestCase):
   @unittest.skip("this test is broken #862")
   def test_max_inf(self):
     n = Tensor([1, float("nan")]).max().numpy()
-    assert math.isnan(n.item()), f"{n.item()} is not nan"
+    assert isnan(n.item()), f"{n.item()} is not nan"
 
   def test_inf_where(self):
     x = Tensor.full((3, 3), float("inf"))

@@ -1,4 +1,4 @@
-import math
+from math import exp, fabs, sqrt
 import unittest
 import numpy as np
 import torch
@@ -13,12 +13,12 @@ def ksprob(a):
   fac, total, termbf = 2.0, 0.0, 0.0
   a2 = -2.0 * a * a
   for j in range(1, 101):
-    term = fac * math.exp(a2 * j * j)
+    term = fac * exp(a2 * j * j)
     total += term
-    if math.fabs(term) <= 0.001 * termbf or math.fabs(term) <= 1e-8 * total:
+    if fabs(term) <= 0.001 * termbf or fabs(term) <= 1e-8 * total:
       return total
     fac = -fac
-    termbf = math.fabs(term)
+    termbf = fabs(term)
   return 1.0
 
 def kstest(l1, l2):
@@ -34,11 +34,11 @@ def kstest(l1, l2):
     if d2 <= d1:
       fn2 = (float(j2) + 1.0) / float(n2)
       j2 += 1
-    dtemp = math.fabs(fn2 - fn1)
+    dtemp = fabs(fn2 - fn1)
     if dtemp > d:
       d = dtemp
   ne = float(n1 * n2) / float(n1 + n2)
-  nesq = math.sqrt(ne)
+  nesq = sqrt(ne)
   prob = ksprob((nesq + 0.12 + 0.11 / nesq) * d)
   return prob
 
@@ -77,11 +77,11 @@ class TestRandomness(unittest.TestCase):
 
   def test_scaled_uniform(self):
     self.assertFalse(normal_test(Tensor.scaled_uniform))
-    self.assertTrue(equal_distribution(Tensor.scaled_uniform, lambda x: torch.nn.init.uniform_(torch.empty(x), a=-1, b=1) / math.sqrt(math.prod(x)), lambda x: (np.random.rand(*x) * 2 - 1) / math.sqrt(math.prod(x))))
+    self.assertTrue(equal_distribution(Tensor.scaled_uniform, lambda x: torch.nn.init.uniform_(torch.empty(x), a=-1, b=1) / sqrt(prod(x)), lambda x: (np.random.rand(*x) * 2 - 1) / sqrt(prod(x))))
 
   def test_glorot_uniform(self):
     self.assertFalse(normal_test(Tensor.glorot_uniform))
-    self.assertTrue(equal_distribution(Tensor.glorot_uniform, lambda x: torch.nn.init.xavier_uniform_(torch.empty(x)), lambda x: (np.random.rand(*x) * 2 - 1) * math.sqrt(6 / (x[0] + math.prod(x[1:])))))
+    self.assertTrue(equal_distribution(Tensor.glorot_uniform, lambda x: torch.nn.init.xavier_uniform_(torch.empty(x)), lambda x: (np.random.rand(*x) * 2 - 1) * sqrt(6 / (x[0] + prod(x[1:])))))
 
   def test_kaiming_uniform(self):
     Tensor.manual_seed(1337)
