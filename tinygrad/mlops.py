@@ -3,7 +3,7 @@ from tinygrad.helpers import argsort, ShapeType, DType
 from tinygrad.ops import UnaryOps, BinaryOps, TernaryOps, ReduceOps
 from tinygrad.tensor import Function
 from tinygrad.lazy import LazyBuffer
-import math
+from math import pi, log
 
 class Contiguous(Function):
   def forward(self, x): return x.contiguous()
@@ -25,7 +25,7 @@ class Sin(Function):
     self.x = x
     return x.unary_op(UnaryOps.SIN)
   def backward(self, grad:LazyBuffer) -> LazyBuffer:
-    return ((math.pi / 2) - self.x).unary_op(UnaryOps.SIN) * grad
+    return ((pi / 2) - self.x).unary_op(UnaryOps.SIN) * grad
 
 # NOTE: maximum(x, 0) behaves differently where x=0
 class Relu(Function):
@@ -41,7 +41,7 @@ class Log(Function):
   __slots__ = "x"
   def forward(self, x:LazyBuffer) -> LazyBuffer:
     self.x = x
-    return x.unary_op(UnaryOps.LOG2) * math.log(2)
+    return x.unary_op(UnaryOps.LOG2) * log(2)
 
   def backward(self, grad_output:LazyBuffer) -> LazyBuffer:
     return grad_output / self.x
@@ -49,7 +49,7 @@ class Log(Function):
 class Exp(Function):
   __slots__ = "ret"
   def forward(self, x:LazyBuffer) -> LazyBuffer:
-    self.ret = (x * (1/math.log(2))).unary_op(UnaryOps.EXP2)
+    self.ret = (x * (1/log(2))).unary_op(UnaryOps.EXP2)
     return self.ret
 
   def backward(self, grad_output:LazyBuffer) -> LazyBuffer:
@@ -70,7 +70,7 @@ class Sqrt(Function):
 class Sigmoid(Function):
   __slots__ = "ret"
   def forward(self, x:LazyBuffer) -> LazyBuffer:
-    self.ret = 1 / (1 + (x * (-1/math.log(2))).unary_op(UnaryOps.EXP2))
+    self.ret = 1 / (1 + (x * (-1/log(2))).unary_op(UnaryOps.EXP2))
     return self.ret
 
   def backward(self, grad_output:LazyBuffer) -> LazyBuffer:
