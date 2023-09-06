@@ -62,12 +62,12 @@ class View(ViewInternal):
     for d,s in reversed(self.shape_strides):
       ret.append(((idx//acc)%d)*s)
       acc *= d
-    return Variable.sum(ret)
+    return Variable.sum(tuple(ret))
 
   # generate an expression if you have a variable or expression for each index
   def expr_idxs(self, idxs) -> Node:
     assert len(idxs) == len(self.shape), f"need an idx for all dimensions {idxs} vs {self.shape}"
-    return Variable.sum([Variable.num(self.offset) if isinstance(self.offset, int) else self.offset] + [idx*st for idx,sh,st in zip(idxs, self.shape, self.strides) if sh != 1 and st != 0])
+    return Variable.sum(tuple([Node.num(self.offset) if isinstance(self.offset, int) else self.offset] + [idx*st for idx,sh,st in zip(idxs, self.shape, self.strides) if sh != 1 and st != 0]))
 
 @functools.lru_cache(maxsize=None)
 def idxs_to_idx(shape:Tuple[int, ...], idxs) -> Node:
@@ -77,7 +77,7 @@ def idxs_to_idx(shape:Tuple[int, ...], idxs) -> Node:
   for tidx,d in reversed(list(zip(idxs, shape))):
     ret.append(tidx * acc)
     acc *= d
-  return Variable.sum(ret)
+  return Variable.sum(tuple(ret))
 
 @functools.lru_cache(maxsize=None)
 def strides_for_shape(shape:Tuple[int, ...]) -> Tuple[int, ...]:

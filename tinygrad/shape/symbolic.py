@@ -35,7 +35,7 @@ class Node:
     if not isinstance(other, Node): return NotImplemented
     return self.key == other.key
   def __neg__(self): return self*-1
-  def __add__(self, b:Union[Node,int]): return Variable.sum([self, b if isinstance(b, Node) else Variable.num(b)])
+  def __add__(self, b:Union[Node,int]): return Variable.sum(tuple([self, b if isinstance(b, Node) else Variable.num(b)]))
   def __radd__(self, b:int): return self+b
   def __sub__(self, b:Union[Node,int]): return self+-b
   def __rsub__(self, b:int): return -self+b
@@ -52,11 +52,11 @@ class Node:
         mul_gcd = muls[0].b
         for x in muls[1:]: mul_gcd = gcd(mul_gcd, x.b)
         if b%mul_gcd == 0:
-          all_others = Variable.sum(others)
+          all_others = Variable.sum(tuple(others))
           #print(mul_gcd, muls, all_others)
           if all_others.min >= 0 and all_others.max < mul_gcd:
             # TODO: should we divide both by mul_gcd here?
-            lhs = Variable.sum(muls)
+            lhs = Variable.sum(tuple(muls))
     return create_node(LtNode(lhs, b))
   def __mul__(self, b:Union[Node, int]):
     if b == 0: return NumNode(0)
@@ -116,8 +116,9 @@ class Node:
     return [MulNode(a, b_sum) if b_sum != 1 else a for a, b_sum in mul_groups.items() if b_sum != 0]
 
   @staticmethod
-  def sum(nodes:List[Node]) -> Node:
-    nodes = [x for x in nodes if x.max or x.min]
+  @functools.lru_cache(None)
+  def sum(nodes_in:Tuple[Node]) -> Node:
+    nodes = [x for x in nodes_in if x.max or x.min]
     if not nodes: return NumNode(0)
     if len(nodes) == 1: return nodes[0]
 
@@ -222,12 +223,12 @@ class ModNode(OpNode):
   def substitute(self, var_vals: Dict[Variable, Node]) -> Node: return self.a.substitute(var_vals) % self.b
 
 class RedNode(Node):
-  def __init__(self, nodes:List[Node]): self.nodes = nodes
+  def __init__(self, nodes:Union[Tuple[Node],List[Node]]): self.nodes = nodes
   def vars(self): return functools.reduce(lambda l,x: l+x.vars(), self.nodes, [])
 
 class SumNode(RedNode):
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
-  def __mul__(self, b: Union[Node, int]): return Node.sum([x*b for x in self.nodes]) # distribute mul into sum
+  def __mul__(self, b: Union[Node, int]): return Node.sum(tuple([x*b for x in self.nodes])) # distribute mul into sum
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
   def __floordiv__(self, b: Union[Node, int], factoring_allowed=True):
     fully_divided: List[Node] = []
@@ -257,9 +258,9 @@ class SumNode(RedNode):
       else:
         rest.append(x)
         _gcd = 1
-    if _gcd > 1: return Node.sum(fully_divided) + Node.sum(rest).__floordiv__(_gcd) // (b//_gcd)
-    if divisor > 1: return Node.sum(fully_divided) + Node.sum(rest).__floordiv__(divisor) // (b//divisor)
-    return Node.sum(fully_divided) + Node.__floordiv__(Node.sum(rest), b)
+    if _gcd > 1: return Node.sum(tuple(fully_divided)) + Node.sum(tuple(rest)).__floordiv__(_gcd) // (b//_gcd)
+    if divisor > 1: return Node.sum(tuple(fully_divided)) + Node.sum(tuple(rest)).__floordiv__(divisor) // (b//divisor)
+    return Node.sum(tuple(fully_divided)) + Node.__floordiv__(Node.sum(tuple(rest)), b)
 
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
   def __mod__(self, b: Union[Node, int]):
@@ -273,7 +274,7 @@ class SumNode(RedNode):
       if x.__class__ is NumNode: new_nodes.append(Variable.num(x.b%b))
       elif isinstance(x, MulNode): new_nodes.append(x.a * (x.b%b))
       else: new_nodes.append(x)
-    return Node.__mod__(Node.sum(new_nodes), b)
+    return Node.__mod__(Node.sum(tuple(new_nodes)), b)
 
   def __lt__(self, b:Union[Node,int]):
     if isinstance(b, int):
@@ -282,11 +283,11 @@ class SumNode(RedNode):
         # TODO: should we just force the last one to always be the number
         if isinstance(x, NumNode): b -= x.b
         else: new_sum.append(x)
-      return Node.__lt__(Node.sum(new_sum), b)
+      return Node.__lt__(Node.sum(tuple(new_sum)), b)
     return Node.__lt__(self, b)
 
-  def expand(self) -> List[Node]: return [Variable.sum(list(it)) for it in itertools.product(*[x.expand() for x in self.nodes])]
-  def substitute(self, var_vals: Dict[Variable, Node]) -> Node: return Variable.sum([node.substitute(var_vals) for node in self.nodes])
+  def expand(self) -> List[Node]: return [Variable.sum(tuple(it)) for it in itertools.product(*[x.expand() for x in self.nodes])]
+  def substitute(self, var_vals: Dict[Variable, Node]) -> Node: return Variable.sum(tuple([node.substitute(var_vals) for node in self.nodes]))
 
   @property
   def flat_components(self): # recursively expand sumnode components

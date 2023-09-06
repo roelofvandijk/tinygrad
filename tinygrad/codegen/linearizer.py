@@ -29,8 +29,8 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=F
     if isinstance(idx, SumNode):
       unfactored, idx_nodes = partition(idx.nodes, lambda x: isinstance(x, MulNode) and x.b == -base_shape[1])
       assert len(unfactored) <= 1
-      idx = Variable.sum(idx_nodes)
-      unfactored = (Variable.sum(unfactored) // base_shape[1])
+      idx = Variable.sum(tuple(idx_nodes))
+      unfactored = (Variable.sum(tuple(unfactored)) // base_shape[1])
       idy += unfactored
       # ugh really...handtuned garbage
       if idx.min >= (base_shape[1]*3)//4:
