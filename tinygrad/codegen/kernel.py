@@ -53,7 +53,7 @@ class Kernel:
     self.earlybufs = dedup(self.reduceop.buffers) if self.reduceop else []
 
     # create new shapetrackers inside this kernel, we will permute them
-    self.sts: List[ShapeTracker] = [x.st.copy() for x in self.bufs]
+    self.sts: List[ShapeTracker] = [ShapeTracker(views=x.st.views, var_vals=x.st.var_vals) for x in self.bufs]
     for st in self.sts: st.simplify()
 
     # make the output buffer shape correct in here
