@@ -61,7 +61,6 @@ class Node:
   def __mul__(self, b:Union[Node, int]):
     if b == 0: return NumNode(0)
     if b == 1: return self
-    if self.__class__ is NumNode: return NumNode(self.b*b) if isinstance(b, int) else b*self.b
     return create_node(MulNode(self, b.b)) if isinstance(b, NumNode) else create_node(MulNode(self, b))
   def __rmul__(self, b:int): return self*b
 
@@ -163,8 +162,9 @@ class NumNode(Node):
     self.min, self.max = num, num
   def __int__(self): return self.b
   def __index__(self): return self.b
-  def __eq__(self, other): return self.b == other
+  def __eq__(self, other): return self.b == other if other.__class__ is int else other.max == other.min == self.b
   def __hash__(self): return self.hash  # needed with __eq__ override
+  def __mul__(self, b): return Node.num(self.b*b) if b.__class__ is int else b*self.b
   def expand(self) -> List[Node]: return [self]
   def substitute(self, var_vals: Dict[Variable, Node]) -> Node: return self
 
