@@ -220,6 +220,7 @@ class SumNode(RedNode):
   def __mul__(self, b: Union[Node, int]): return Node.sum([x*b for x in self.nodes]) # distribute mul into sum
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
   def __floordiv__(self, b: Union[Node, int], factoring_allowed=True):
+    if b.__class__ in (int, NumNode) and b == 1: return self
     fully_divided: List[Node] = []
     rest: List[Node] = []
     if isinstance(b, SumNode):
@@ -232,7 +233,6 @@ class SumNode(RedNode):
         else: rest.append(x)
       if (sum_fully_divided:=create_rednode(SumNode, fully_divided)) != 0: return sum_fully_divided + create_rednode(SumNode, rest) // b
       return Node.__floordiv__(self, b, False)
-    if b == 1: return self
     if not factoring_allowed: return Node.__floordiv__(self, b, factoring_allowed)
     fully_divided, rest = [], []
     _gcd = b
