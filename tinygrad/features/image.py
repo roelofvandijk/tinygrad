@@ -146,7 +146,7 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node) -> Tuple[Tup
   # This part is substituting variables by just looking at single var LtNodes in valid
   # Basically if var[0-5] < 3 -> var[0-2]
   if valid.min == 0:
-    nodes: List = valid.nodes if isinstance(valid, AndNode) else [valid]
+    nodes: Tuple[Node, ...] = valid.nodes if isinstance(valid, AndNode) else (valid,)
     var_dict = {var:[var.min, var.max] for var in valid.vars()}
 
     for nd in nodes:
@@ -168,7 +168,7 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node) -> Tuple[Tup
 
   # Simplify ModNode if possibe # test_padded_conv_transpose2d, Needs much more thinking
   if valid.min == 0 and isinstance(idx, ModNode) and isinstance(idx.a, SumNode):
-    nodes = valid.nodes if isinstance(valid, AndNode) else [valid]
+    nodes = valid.nodes if isinstance(valid, AndNode) else (valid,)
     same_dict: Dict[Node, List[Tuple[int, Node]]] = {}
     idx_nodes = idx.a.flat_components
 

@@ -255,9 +255,9 @@ class TestSymbolicVars(unittest.TestCase):
     c = Variable("c", 0, 10)
     assert z.vars() == z.vars() == []
     assert a.vars() == a.vars() == [a]
-    m = MulNode(a, 3)
+    m = MulNode.create(a, 3)
     assert m.vars() == [a]
-    s = SumNode([a, b, c])
+    s = Node.sum([a, b, c])
     assert s.vars() == [a, b, c]
 
   def test_compound(self):
@@ -401,24 +401,24 @@ class TestSymbolicSymbolicOps(unittest.TestCase):
 
   def test_mul_node_expand(self):
     a = Variable(None, 5, 7)
-    m = MulNode(a, 3)
+    m = MulNode.create(a, 3)
     assert m.expand() == [NumNode(15), NumNode(18), NumNode(21)]
 
     b = Variable("b", 1, 3)
-    n = MulNode(b, 3)
+    n = MulNode.create(b, 3)
     assert n.expand() == [Variable("b", 1, 3)*3]
 
   def test_sum_node_expand(self):
     a = Variable(None, 1, 3)
     b = Variable("b", 5, 7)
 
-    s1 = create_rednode(SumNode, [a, b])
+    s1 = create_rednode(SumNode, (a, b))
     assert s1.expand() == [Variable.sum([NumNode(i),b]) for i in range(1,4)]
 
   def test_multi_expand(self):
     a = Variable("a", 1, 3)
     b = Variable("b", 14, 17)
-    s1 = create_rednode(SumNode, [a, b])
+    s1 = create_rednode(SumNode, (a, b))
     # expand increments earlier variables faster than later variables (as specified in the argument)
     # this behavior was just copied from before, no idea why this should be true
     assert s1.expand((a, b)) == [NumNode(x + y) for x in range(b.min, b.max + 1) for y in range(a.min, a.max + 1)]
