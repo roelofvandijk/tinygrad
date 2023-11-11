@@ -4,7 +4,7 @@ import functools, operator
 from dataclasses import dataclass
 from typing import Tuple, List, Optional, Dict, cast
 from tinygrad.ops import MovementOps
-from tinygrad.helpers import prod, DEBUG, dedup
+from tinygrad.helpers import prod, DEBUG, dedup, flatten
 from tinygrad.shape.symbolic import Variable, MulNode, Node, SumNode, sint
 from tinygrad.shape.view import View
 
@@ -82,10 +82,16 @@ class ShapeTracker:
 
   def size(self): return 0 if prod(self.shape)==0 else self.expr_idxs()[0].max+1
 
-  def vars(self) -> List[Variable]: return dedup(functools.reduce(operator.add, [v.vars() for v in self.views], []))
+  @functools.cached_property
+  def pure_int(self): return all(v.pure_int for v in self.views)
+
+  def vars(self) -> List[Variable]:
+    if self.pure_int: return []
+    return dedup(functools.reduce(operator.add, [v.vars() for v in self.views if not v.pure_int], []))
 
   @property
   def var_vals(self) -> Dict[Variable, int]:
+    if self.pure_int: return {}
     ret:Dict[Variable, int] = {}
     for v in self.vars():
       var, val = v.unbind()
@@ -93,7 +99,9 @@ class ShapeTracker:
       ret[var] = val
     return ret
 
-  def unbind(self) -> ShapeTracker: return ShapeTracker(tuple(v.unbind() for v in self.views))
+  def unbind(self) -> ShapeTracker: 
+    if self.pure_int: return self
+    return ShapeTracker(tuple(v.unbind() for v in self.views))
 
   def to_movement_ops(self) -> List[Tuple[MovementOps, Tuple]]:
     to_apply:List[Tuple[MovementOps, Tuple]] = []
