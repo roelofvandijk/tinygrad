@@ -20,7 +20,18 @@ def stop_profile(pr, sort='cumtime', frac=0.2):
   ps = pstats.Stats(pr)
   ps.strip_dirs()
   ps.sort_stats(sort)
-  ps.print_stats(frac)
+  profiles = ps.get_stats_profile().func_profiles.values()
+  filenames= ["lazy.py", "tensor.py", "shapetracker.py", "ops.py", "symbolic.py", "helpers.py", "lib.py", "view.py", "realize.py"]
+  for p in filenames:
+    ps.print_stats(p, 0.3)
+  perf = [(name, ps_sum(profiles,name)) for name in filenames]
+  for name, time in perf:
+    print(f"{time:.2f} {name}")
+  print(f"{sum(x[1] for x in perf):.2f} total")
+  print("\n")
+
+def ps_sum(profiles, filename):
+  return sum([x.tottime for x in profiles if x.file_name == filename])
 
 class TestConvSpeed(unittest.TestCase):
 
