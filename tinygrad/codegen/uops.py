@@ -106,7 +106,7 @@ def _match(uop:UOp, pat:UPat, store:Dict[str, UOp]) -> bool:
   for vp in itertools.permutations(pat.vin) if isinstance(pat.vin,list) else ([pat.vin] if isinstance(pat.vin,tuple) else [(pat.vin,)*len(uop.vin)]):
     if len(uop.vin) != len(vp) and (len(uop.vin) not in pat.allow_len): return False
     new_store = store.copy()
-    if all(_match(uu, vv, new_store) for uu, vv in zip(uop.vin, vp)):
+    if any(not _match(uu, vv, new_store) for uu, vv in zip(uop.vin, vp)):
       for k,v in new_store.items(): store[k] = v
       return True
   return False
