@@ -571,8 +571,8 @@ class Kernel:
       xb_choices = []
       for axis, upcast_amount in itertools.product(range(self.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
         # if we haven't upcasted it, it's not symbolic, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
-        if axis not in upcasted_axis and isinstance(self.full_shape[axis], int) and self.full_shape[axis]%upcast_amount == 0 and any(st.views[-1].strides[axis] == 0 and not any(x[1] == 0 for x in self.upcasted_axis(buf_index)) for buf_index, st in enumerate(self.sts)):  # noqa: E501
-          xb_choices.append((sum(st.views[-1].strides[axis]>0 for st in self.sts), sum(st.views[-1].strides[axis] for st in self.sts), axis, upcast_amount))  # noqa: E501
+        if axis not in upcasted_axis and isinstance(self.full_shape[axis], int) and self.full_shape[axis]%upcast_amount == 0 and any(st[-1].strides[axis] == 0 and not any(x[1] == 0 for x in self.upcasted_axis(buf_index)) for buf_index, st in enumerate(self.sts)):  # noqa: E501
+          xb_choices.append((sum(st[-1].strides[axis]>0 for st in self.sts), sum(st[-1].strides[axis] for st in self.sts), axis, upcast_amount))  # noqa: E501
       if xb_choices:
         xb_choices = sorted(xb_choices)
         if DEBUG >= 4: print(f"float4 merging axis : {xb_choices}")
@@ -606,7 +606,7 @@ class Kernel:
         self.apply_opt(Opt(OptOps.NOLOCALS))
       else:
         # prioritize making expand axes local
-        local_axis_ranking = [(any(self.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:self.first_reduce]))]  # noqa: E501
+        local_axis_ranking = [(any(self.sts[buf_index][-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:self.first_reduce]))]  # noqa: E501
         to_local: List[Tuple[int, int]] = []
         for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
           local_size = prod(sz for _, sz in to_local)

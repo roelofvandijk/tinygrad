@@ -36,7 +36,7 @@ class LazyBuffer:
 
       if self.op is LoadOps.VIEW:
         # some LazyBuffers can be processed with only a view, no AST required
-        self.buffer: Buffer = srcs[0].base.buffer.view(st.size, dtype, srcs[0].st.views[0].offset * srcs[0].dtype.itemsize)
+        self.buffer: Buffer = srcs[0].base.buffer.view(st.size, dtype, srcs[0].st[0].offset * srcs[0].dtype.itemsize)
       else:
         self.buffer = srcs[1].base.buffer if self.op is LoadOps.ASSIGN else Buffer(device, self.size, dtype)
       self.buffer.ref(1)
@@ -111,7 +111,7 @@ class LazyBuffer:
     return create_lazybuffer(self.device, ShapeTracker.from_shape(new_shape), dtype, cast_op, dtype, (self,))
 
   def is_unrealized_const(self): return self.base.realized is None and self.base.op is LoadOps.CONST and not isinstance(self.base.arg, Variable)
-  def is_unrealized_unmasked_const(self): return self.is_unrealized_const() and all(v.mask is None for v in self.st.views)
+  def is_unrealized_unmasked_const(self): return self.is_unrealized_const() and all(v.mask is None for v in self.st)
 
   def _copy(self, device:str) -> LazyBuffer:
     return create_lazybuffer(device, ShapeTracker.from_shape(self.shape), self.dtype, LoadOps.COPY, self.buffer.nbytes, (self,), enable_cache=False)
@@ -207,7 +207,7 @@ class LazyBuffer:
   # *** movement ops ***
 
   def _view(self, new_st:ShapeTracker) -> LazyBuffer:
-    if self.st.size == 0 or (new_st.views[-1].mask is not None and any((x[1]-x[0]) == 0 for x in new_st.views[-1].mask)):
+    if self.st.size == 0 or (new_st[-1].mask is not None and any((x[1]-x[0]) == 0 for x in new_st[-1].mask)):
       return self.const(0, new_st.shape)
     if new_st.contiguous and self.base.shape == new_st.shape: return self.base
     return create_lazybuffer(self.device, new_st, self.dtype, base=self.base)

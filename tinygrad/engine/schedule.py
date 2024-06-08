@@ -72,8 +72,8 @@ def _recursive_lazyop(buf:LazyBuffer, inputs:List[LazyBuffer], outputs:Tuple[Laz
       # can only assign to contiguous read+write buffer
       if not unbound_st.contiguous:
         # we also allow masked views. if it has a single view and it's equal when you shrink a contig, it's fine
-        if not (len(unbound_st.views) == 1 and unbound_st.views[0].mask is not None and
-            ShapeTracker.from_shape(unbound_st.shape).shrink(unbound_st.views[0].mask) == unbound_st.shrink(unbound_st.views[0].mask)):
+        if not (len(unbound_st) == 1 and unbound_st[0].mask is not None and
+            ShapeTracker.from_shape(unbound_st.shape).shrink(unbound_st[0].mask) == unbound_st.shrink(unbound_st[0].mask)):
           raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                              +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
       return LazyOp(BufferOps.LOAD, (), MemBuffer(outputs.index(assign_targets[buf]), buf.dtype, unbound_st))
@@ -135,8 +135,8 @@ def _recurse_lb(buf:LazyBuffer, realizes:Dict[LazyBuffer, None], allbufs:Dict[La
   # view
   if buf.base != buf:
     # fuse some pads
-    if len(buf.st.views) == 1 and buf.st.views[-1].mask is not None and all_int(buf.base.st.shape) and \
-        prod(buf.base.st.shape) >= prod([y-x for x,y in buf.st.views[-1].mask]):
+    if len(buf.st) == 1 and buf.st[-1].mask is not None and all_int(buf.base.st.shape) and \
+        prod(buf.base.st.shape) >= prod([y-x for x,y in buf.st[-1].mask]):
       simple_pads.add(buf.base)
     # realize all expands
     elif prod(buf.base.st.shape) < prod(buf.st.shape):
