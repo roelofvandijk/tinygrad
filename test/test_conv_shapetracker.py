@@ -16,7 +16,7 @@ class TestConvShapetracker(unittest.TestCase):
     sched = [si for si in create_schedule([conv(Tensor.empty(1, 16, 10, 10)).lazydata], seen) if si.ast[0].op not in LoadOps]
     assert len(sched) == 1, f"conv should only have one kernel, getting {len(sched)}"
     for st in [x.arg.st for x in sched[0].ast[0].lazyops if x.op is BufferOps.LOAD]:
-      assert len(st.views) == 1
+      assert len(st) == 1
 
 if __name__ == '__main__':
   unittest.main()

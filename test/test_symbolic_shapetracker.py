@@ -55,13 +55,13 @@ class TestSymbolicVarVals(unittest.TestCase):
   def test_var_vals_offset(self):
     x = Variable("x", 1, 100).bind(3)
     st = ShapeTracker.from_shape((4, 3)).shrink(((x, x+1), (0, 3)))
-    assert st.views[-1].offset == x * 3
+    assert st[-1].offset == x * 3
     assert st.var_vals == {Variable("x", 1, 100): 3}
 
   def test_var_vals_mask(self):
     x = Variable("x", 1, 100).bind(3)
     view = View.create(shape=(3,4), strides=(4,1), offset=0, mask=((0, x), (0, 4)))
-    st = ShapeTracker(views=(view,))
+    st = ShapeTracker((view,))
     assert st.var_vals == {Variable("x", 1, 100): 3}
 
   def test_var_vals_complex(self):
@@ -69,7 +69,7 @@ class TestSymbolicVarVals(unittest.TestCase):
     y = Variable("y", 1, 100).bind(4)
     z = Variable("z", 1, 100).bind(5)
     st = ShapeTracker.from_shape((x, 5, y)).shrink(((0, x), (z, z+1), (0, 3)))
-    assert st.views[-1].offset == y * z
+    assert st[-1].offset == y * z
     assert st.var_vals == {Variable("x", 1, 100): 3, Variable("y", 1, 100):4, Variable("z", 1, 100): 5}
 
   def test_shrink_reshape(self):
@@ -157,7 +157,7 @@ class TestSymbolicReshapeFromNonContiguous(unittest.TestCase):
     t = Tensor.ones(3, 4).reshape(3, vi)
     assert t.shape == (3, vi)
     assert not t.lazydata.st.contiguous
-    assert len(t.lazydata.st.views) == 1
+    assert len(t.lazydata.st) == 1
 
   def test_reshape_not_allowed(self):
     vi = Variable("i", 1, 5).bind(4)
@@ -172,13 +172,13 @@ class TestSymbolicReshapeFromNonContiguous(unittest.TestCase):
     vi = Variable("i", 1, 5).bind(4)
     t = Tensor.ones(3, 4).contiguous().expand(2, 3, 4).pad(((1, 1), None, None)).shrink((None, None, (1, 3)))
     st = t.lazydata.st
-    assert len(st.views) == 1
-    view = st.views[0]
+    assert len(st) == 1
+    view = st[0]
     assert view.shape == (4, 3, 2)
     t = t.reshape(vi, 3, 2)
     st2 = t.lazydata.st
-    assert len(st2.views) == 1
-    view2 = st2.views[0]
+    assert len(st2) == 1
+    view2 = st2[0]
     # check only shape changed. strides, offset, mask, contiguous remained the same
     assert view2.shape == (vi, 3, 2)
     assert view.strides == view2.strides == (0, 4, 1)

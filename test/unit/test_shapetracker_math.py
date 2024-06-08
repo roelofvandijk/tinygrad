@@ -39,13 +39,13 @@ class TestShapeTrackerBasics(unittest.TestCase):
     a = ShapeTracker.from_shape((10, 10))
     a = a.pad(((0,2), (0,2)))
     a = a.shrink(((0,10), (0,10)))
-    assert len(a.views) == 1 and a.views[-1].mask is None
+    assert len(a) == 1 and a[-1].mask is None
 
   def test_pad_shrink_leaves_mask(self):
     a = ShapeTracker.from_shape((10, 10))
     a = a.pad(((0,2), (0,2)))
     a = a.shrink(((0,10), (0,11)))
-    assert len(a.views) == 1 and a.views[-1].mask is not None
+    assert len(a) == 1 and a[-1].mask is not None
 
   def test_reshape_makes_same(self):
     a = ShapeTracker.from_shape((2, 5))
@@ -56,7 +56,7 @@ class TestShapeTrackerBasics(unittest.TestCase):
     assert x == x1.simplify()
 
   def test_simplify_is_correct(self):
-    multiv = ShapeTracker(views=(View(shape=(15, 3), strides=(9, 1), offset=6, mask=None, contiguous=False),
+    multiv = ShapeTracker((View(shape=(15, 3), strides=(9, 1), offset=6, mask=None, contiguous=False),
                                  View(shape=(4, 3), strides=(12, 4), offset=0, mask=None, contiguous=False)))
     assert st_equal(multiv, multiv.simplify())
 
@@ -85,9 +85,9 @@ class TestShapeTrackerAdd(unittest.TestCase):
     assert st_equal(backup + st.sts[1], st.sts[0])
 
   def test_off_by_one(self):
-    st1 = ShapeTracker(views=(View(shape=(5,), strides=(1,), offset=0, mask=None, contiguous=True),
+    st1 = ShapeTracker((View(shape=(5,), strides=(1,), offset=0, mask=None, contiguous=True),
                               View(shape=(5,), strides=(1,), offset=0, mask=None, contiguous=True)))
-    st2 = ShapeTracker(views=(View(shape=(4,), strides=(1,), offset=0, mask=None, contiguous=True),
+    st2 = ShapeTracker((View(shape=(4,), strides=(1,), offset=0, mask=None, contiguous=True),
                               View(shape=(5,), strides=(1,), offset=0, mask=None, contiguous=True)))
     assert not (st_equal(st1, st2))
 
