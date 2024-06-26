@@ -344,9 +344,7 @@ def _internal_memory_planner(buffers:List[Union[List[Buffer], Tuple[Buffer, ...]
 
   def handle_buffer(buf):
     key = (buf.device, buf.size, buf.dtype)
-    if buf not in assigned:
-      if len(ll:=local_cache[key]): assigned[buf] = ll.pop()
-      else: assigned[buf] = Buffer(*key)
+    assigned.setdefault(buf, ll.pop() if len(ll:=local_cache[key]) else Buffer(*key))
     if i == last_appearance[buf]:
       if assigned[buf] not in local_cache[key]: local_cache[key].append(assigned[buf])
 

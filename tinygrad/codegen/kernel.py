@@ -64,8 +64,7 @@ class Kernel:
 
     cached_ordered_lazyops: Dict[LazyOp, List[LazyOp]] = {}
     def ordered_lazyops(op):
-      if op not in cached_ordered_lazyops: cached_ordered_lazyops[op] = dedup([item for x in op.src for item in ordered_lazyops(x)] + [op])
-      return cached_ordered_lazyops[op]
+      return cached_ordered_lazyops.setdefault[op, dedup([item for x in op.src for item in ordered_lazyops(x)] + [op])]
     self.reduceops = dedup([x for out in self.ast for x in ordered_lazyops(out) if x.op in ReduceOps])
 
     self.outbufs, self.vars = [x.arg for x in self.ast], flatten([x.vars() for x in self.ast])
