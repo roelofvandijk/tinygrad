@@ -448,7 +448,7 @@ class TestMultiTensor(unittest.TestCase):
 
     out = bn(t)
     scheds = [sched for sched in create_schedule(out.lazydata.lbs) if sched.outputs[0].device in devices_4 and sched.ast[0].op is not LoadOps.COPY]
-    assert set(out.device for sched in scheds for out in sched.outputs) == set(devices_4), "should have ast on each shard device"
+    assert {out.device for sched in scheds for out in sched.outputs} == set(devices_4), "should have ast on each shard device"
     asts = [sched.ast for sched in scheds]
     assert len(asts)
     # test case to show that ast can be different on devices

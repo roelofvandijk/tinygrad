@@ -23,6 +23,12 @@ lint.select = [
   "W291",   # trailing-whitespace
   "W293",   # blank-line-with-whitespace
   "UP039",  # unnecessary-class-parentheses
+  "C401",   # unnecessary-generator-set
+  "C403",   # unnecessary-list-comprehension-set
+  "C405",   # unnecessary-literal-set
+  "C409",   # unnecessary-literal-within-tuple-call
+  "C411",   # unnecessary-list-call
+  "C414",   # unnecessary-double-cast-or-process
   "C416",   # unnecessary-comprehension
   "RET506", # superfluous-else-raise
   "RET507", # superfluous-else-continue

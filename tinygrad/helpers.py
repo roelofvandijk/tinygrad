@@ -34,7 +34,7 @@ def fromimport(mod, frm): return getattr(__import__(mod, fromlist=[frm]), frm)
 def strip_parens(fst:str): return fst[1:-1] if fst[0] == '(' and fst[-1] == ')' and fst[1:-1].find('(') <= fst[1:-1].find(')') else fst
 def round_up(num, amt:int): return (num+amt-1)//amt * amt
 def merge_dicts(ds:Iterable[Dict[T,U]]) -> Dict[T,U]:
-  assert len(kvs:=set([(k,v) for d in ds for k,v in d.items()])) == len(set(kv[0] for kv in kvs)), f"cannot merge, {kvs} contains different values for the same key"  # noqa: E501
+  assert len(kvs:={(k,v) for d in ds for k,v in d.items()}) == len({kv[0] for kv in kvs}), f"cannot merge, {kvs} contains different values for the same key"  # noqa: E501
   return {k:v for d in ds for k,v in d.items()}
 def partition(lst:List[T], fxn:Callable[[T],bool]) -> Tuple[List[T], List[T]]:
   a:List[T] = []

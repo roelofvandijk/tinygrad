@@ -227,7 +227,7 @@ class TestLinearizer(unittest.TestCase):
     ast2 = LazyOp(op=ReduceOps.SUM, src=(LazyOp(BinaryOps.ADD, src=(ast1, LazyOp(op=UnaryOps.NEG, \
       src=(LazyOp(op=BufferOps.LOAD, src=(), arg=load),), arg=None))),), arg=(0,))
     ast3 = LazyOp(op=ReduceOps.SUM, src=(LazyOp(BinaryOps.ADD, src=(LazyOp(op=BinaryOps.ADD, src=(LazyOp(op=BufferOps.LOAD, src=(), arg=load), LazyOp(op=UnaryOps.NEG, src=(ast2,), arg=None))), LazyOp(op=BinaryOps.ADD, src=(LazyOp(op=BufferOps.LOAD, src=(), arg=load), LazyOp(op=UnaryOps.NEG, src=(ast0,), arg=None))),)),), arg=(0,)) # noqa E501
-    for order in [(d, c, b, a) for d in range(4) for c in range(4) for b in range(4) for a in range(4) if len(set([a,b,c,d])) == 4]:
+    for order in [(d, c, b, a) for d in range(4) for c in range(4) for b in range(4) for a in range(4) if len({a,b,c,d}) == 4]:
       asts = [
         LazyOp(op=BufferOps.STORE, src=(ast0,), arg=MemBuffer(idx=order.index(0), dtype=dtypes.float, st=ShapeTracker.from_shape((1,)))),
         LazyOp(op=BufferOps.STORE, src=(ast1,), arg=MemBuffer(idx=order.index(1), dtype=dtypes.float, st=ShapeTracker.from_shape((1,)))),
@@ -717,7 +717,7 @@ class TestLinearizer(unittest.TestCase):
       # ignore kernel optimized IF statements for now
       if if_op:=next((u for u in uops if u.op is UOps.IF), None):
         uops = uops[:uops.index(if_op)]
-      assert len(set([u.op for u in uops if u.op in {UOps.RANGE, UOps.SPECIAL}])) == 1, "has either specials or ranges, not both"
+      assert len({u.op for u in uops if u.op in {UOps.RANGE, UOps.SPECIAL}}) == 1, "has either specials or ranges, not both"
       assert len([u for u in uops if u.op is UOps.PHI]) == 0, "PHI should have been simplified"
       # TODO: once uops track min/max this will be fixed
       #assert len([u for u in uops if u.arg is BinaryOps.MAX]) <= max_ops, "no unnecessary MAX ops"

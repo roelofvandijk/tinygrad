@@ -277,12 +277,12 @@ def _graph_schedule(outs:List[LazyBuffer], seen:Set[LazyBuffer]) -> Tuple[Defaul
   for key, lsi in prescheduled.items():
     if key not in in_degree: in_degree[key] = 0
     # realize outputs after all parents are realized
-    scheduled_parents = set(schedule_targets[x].outputs[0] for x in lsi.inputs if x in schedule_targets)
+    scheduled_parents = {schedule_targets[x].outputs[0] for x in lsi.inputs if x in schedule_targets}
     for x in scheduled_parents:
       graph[x].append(key)
       in_degree[key] += 1
     # realize outputs before a parent is assigned to
-    parents_assigns = set(schedule_targets[assign_targets[x]].outputs[0] for x in lsi.inputs if x in assign_targets)
+    parents_assigns = {schedule_targets[assign_targets[x]].outputs[0] for x in lsi.inputs if x in assign_targets}
     for assign in parents_assigns:
       graph[key].append(assign)
       in_degree[assign] += 1

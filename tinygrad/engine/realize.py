@@ -164,7 +164,7 @@ class ExecItem:
     return et
 
 def lower_schedule_item(si:ScheduleItem) -> ExecItem:
-  assert len(set(x.device for x in si.bufs)) == 1 or si.ast[0].op is LoadOps.COPY or getenv("USE_COPY_KERNEL")
+  assert len({x.device for x in si.bufs}) == 1 or si.ast[0].op is LoadOps.COPY or getenv("USE_COPY_KERNEL")
   if si.ast[0].op is BufferOps.STORE:
     runner = get_runner(si.outputs[0].device, si.ast)
     return ExecItem(runner, [si.bufs[x[0]] for x in runner.p.globals])

@@ -19,7 +19,7 @@ def get_hsa_buffer_and_kernargs(dev):
   test_buf.copyin(memoryview(bytearray(4))) # zero mem
   assert test_buf.as_buffer().cast('I')[0] == 0 # check mem is visible + sync to exec
 
-  args_struct_t = init_c_struct_t(tuple([('f0', ctypes.c_void_p)]))
+  args_struct_t = init_c_struct_t((('f0', ctypes.c_void_p),))
   kernargs = dev.alloc_kernargs(8)
   args_st = args_struct_t.from_address(kernargs)
   args_st.__setattr__('f0', test_buf._buf)

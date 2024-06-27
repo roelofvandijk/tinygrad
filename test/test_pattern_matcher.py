@@ -75,7 +75,7 @@ class TestPatternMatcher(TestUOps):
     self.assertEqual(matcher.rewrite(c2), None)
 
   def test_dtype_set(self):
-    matcher = PatternMatcher([(UPat(UOps.CONST, name="x", dtype=set([dtypes.float32, dtypes.float64])), lambda x: x)])
+    matcher = PatternMatcher([(UPat(UOps.CONST, name="x", dtype={dtypes.float32, dtypes.float64}), lambda x: x)])
     c1 = UOp(UOps.CONST, dtypes.float, arg=1.0)
     c2 = UOp(UOps.CONST, dtypes.float64, arg=1.0)
     c3 = UOp(UOps.CONST, dtypes.float16, arg=1.0)
@@ -152,7 +152,7 @@ class TestPatternMatcher(TestUOps):
     matcher = PatternMatcher([(UPat(UOps.CONST, name="x", dtype=dtypes.int),
                                lambda x: UOp(UOps.STORE, x.dtype, (UOp(UOps.DEFINE_GLOBAL, x.dtype, tuple(), None), x)))])
     matcher.rewrite_graph(uops)
-    uops.remove_childless(set(x for x in uops if x.op in {UOps.STORE}))
+    uops.remove_childless({x for x in uops if x.op in {UOps.STORE}})
 
     self.assertEqual(len(uops.uops), 3)
 

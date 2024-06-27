@@ -77,8 +77,8 @@ class UOp:
   @functools.cached_property
   def parents(self) -> Set[UOp]: return set.union(set(self.src), *[x.parents for x in self.src])
   @property  # parents with self
-  def sparents(self) -> Set[UOp]: return set([self]).union(self.parents)
-  def vars(self) -> Set[UOp]: return set([x for x in set.union(set([self]), self.parents) if x.op is UOps.DEFINE_VAR])
+  def sparents(self) -> Set[UOp]: return {self}.union(self.parents)
+  def vars(self) -> Set[UOp]: return {x for x in set.union({self}, self.parents) if x.op is UOps.DEFINE_VAR}
 
 def uop_alu_resolve(u:UOp) -> sint:
   if u.op is UOps.CONST: return u.arg
@@ -373,7 +373,7 @@ class UOpGraph:
     @functools.lru_cache(None)
     def get_recursive_children(x:UOp, end:UOps, include_self=False) -> Set[UOp]:
       if x.op is UOps.SINK: return set()
-      return set.union(set((x,)) if include_self else set(), *([get_recursive_children(u, end, True) for u in graph[x] if x.op is not end]))
+      return set.union({x} if include_self else set(), *([get_recursive_children(u, end, True) for u in graph[x] if x.op is not end]))
     # scope children impact the toposort and END* insertion
     end_for_uop = {UOps.IF:(UOps.STORE, UOps.ENDIF), UOps.RANGE:(UOps.PHI, UOps.ENDRANGE)}
     loops, ifs = [x for x in in_degree if x.op is UOps.RANGE], [x for x in in_degree if x.op is UOps.IF]
