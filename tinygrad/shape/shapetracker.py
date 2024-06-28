@@ -15,21 +15,28 @@ def _expr_view(view:View, idxs:List[Node], valid:Optional[Node]=None) -> Tuple[N
     if m is not None: vexpr += [create_ge_node(idx, m[0]), create_lt_node(idx, m[1])]  # idx >= m[0], idx < m[1]
   return Node.sum(iexpr), Node.ands(vexpr)
 
+import functools
+@functools.lru_cache(None)
+def simplify(views: Tuple[View]) -> Tuple[View]:
+  if len(views) >= 2 and (new_view:=views[-2] + views[-1]) is not None:
+    return simplify(views[:-2] + (new_view,))
+  return views
+
 @dataclass(frozen=True)
 class ShapeTracker:
   views: Tuple[View, ...]
 
   def __add__(self, st:ShapeTracker) -> ShapeTracker:
-    ret = self
-    for v in st.views: ret = ShapeTracker(ret.views + (v,)).simplify() # one view at a time = better simplification
-    return ret
+    ret = self.views
+    for v in st.views: ret = simplify(ret + (v,)) # one view at a time = better simplification
+    return ShapeTracker(ret)
 
   def invert(self, out_shape:Tuple[sint, ...]) -> Optional[ShapeTracker]:
     inverted_views:List[View] = []
     for v,s in zip(self.views[::-1], [x.shape for x in self.views[::-1][1:]]+[out_shape]):
       if (inverted:= v.invert(s)) is None: return None
       inverted_views.append(inverted)
-    return ShapeTracker(tuple(inverted_views)).reshape(out_shape)
+    return ShapeTracker(simplify(tuple(inverted_views))).reshape(out_shape)
 
   @staticmethod
   def from_shape(shape:Tuple[sint, ...]): return ShapeTracker((View.create(shape),))
@@ -63,7 +70,7 @@ class ShapeTracker:
 
   def unbind(self) -> Tuple[ShapeTracker, Dict[Variable, int]]:
     unbound_views, var_vals = zip(*[v.unbind() for v in self.views])
-    return ShapeTracker(tuple(unbound_views)), merge_dicts(var_vals)
+    return ShapeTracker(simplify(tuple(unbound_views))), merge_dicts(var_vals)
 
   # NOTE: if a stride is not always valid, it will be None
   def real_strides(self, ignore_valid=False) -> Tuple[Optional[sint], ...]:
@@ -103,19 +110,15 @@ class ShapeTracker:
     _, valid = self.expr_idxs()
     return f'idx{axis}' in [v.expr for v in valid.vars()]
 
-  def simplify(self) -> ShapeTracker:
-    if len(self.views) >= 2 and (new_view := self.views[-2] + self.views[-1]) is not None:
-      return ShapeTracker(self.views[:-2] + (new_view,)).simplify()
-    return self
-
   # *** under this line are the movement ops ***
 
-  def pad(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].pad(arg), ))
-  def shrink(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].shrink(arg), ))
-  def expand(self, new_shape: Tuple[sint, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].expand(new_shape), ))
-  def permute(self, axis: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].permute(axis), ))
-  def stride(self, mul: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].stride(mul), ))
+  def pad(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker: return ShapeTracker(simplify(self.views[0:-1] + (self.views[-1].pad(arg), )))
+  def shrink(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker: return ShapeTracker(simplify(self.views[0:-1] + (self.views[-1].shrink(arg), )))
+  def expand(self, new_shape: Tuple[sint, ...]) -> ShapeTracker: return ShapeTracker(simplify(self.views[0:-1] + (self.views[-1].expand(new_shape), )))
+  def permute(self, axis: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(simplify(self.views[0:-1] + (self.views[-1].permute(axis), )))
+  def stride(self, mul: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(simplify(self.views[0:-1] + (self.views[-1].stride(mul), )))
 
   def reshape(self, new_shape: Tuple[sint, ...]) -> ShapeTracker:
-    if getenv("MERGE_VIEW", 1) and (new_view := self.views[-1].reshape(new_shape)) is not None: return ShapeTracker(self.views[0:-1] + (new_view,))
-    return ShapeTracker(self.views + (View.create(new_shape), ))
+    if getenv("MERGE_VIEW", 1) and (new_view := self.views[-1].reshape(new_shape)) is not None: 
+      return ShapeTracker(simplify(self.views[:-1] + (new_view,)))
+    return ShapeTracker(simplify(self.views + (View.create(new_shape), )))

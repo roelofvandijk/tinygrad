@@ -54,7 +54,7 @@ def _recursive_lazyop(buf:LazyBuffer, inputs:List[LazyBuffer], outputs:Tuple[Laz
 
   # consts are always fused and generated
   if buf.op is LoadOps.CONST:
-    unbound_st, st_var_vals = st.simplify().unbind()
+    unbound_st, st_var_vals = st.unbind()
     var_vals.update(st_var_vals)
     if isinstance(buf.arg, Variable):
       val, var_val = buf.arg.unbind()
@@ -66,7 +66,7 @@ def _recursive_lazyop(buf:LazyBuffer, inputs:List[LazyBuffer], outputs:Tuple[Laz
 
   # if we aren't fusing it, it's a load and we add it to the inputs
   if buf.realized is not None or (buf in realizes and buf not in outputs):
-    unbound_st, st_var_vals = st.simplify().unbind()
+    unbound_st, st_var_vals = st.unbind()
     var_vals.update(st_var_vals)
     if buf in assign_targets:
       # can only assign to contiguous read+write buffer
@@ -120,7 +120,7 @@ def _schedule_group(outs:Tuple[LazyBuffer, ...], realizes:Dict[LazyBuffer, None]
       output_st = ShapeTracker.from_shape(reduce_for_op[out].shape if out in reduce_for_op else out.shape)
       output_view = out.arg[0] if out.op is LoadOps.ASSIGN and out.arg else output_st
       lop = _recursive_lazyop(out, inputs, outs, var_vals, output_st, realizes, assign_targets, cache={})
-      output_view, vv = output_view.simplify().unbind()
+      output_view, vv = output_view.unbind()
       if vv: var_vals.update(vv)
       ast.append(LazyOp(BufferOps.STORE, (lop, ), MemBuffer(i, out.dtype, output_view)))
   return _LBScheduleItem(tuple(ast), outs, tuple(inputs), var_vals)
