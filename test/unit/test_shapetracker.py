@@ -64,7 +64,7 @@ class CheckingShapeTracker:
     return self.t.flatten()[val]
 
   @property
-  def views(self): return self.st.views
+  def views(self): return self.st
 
   @property
   def contiguous(self): return self.st.contiguous
@@ -82,26 +82,26 @@ class TestRealIssues(unittest.TestCase):
   def test_reshape_doesnt_multiview(self):
     self.st = ShapeTracker((View.create((256, 256, 2, 2, 2, 2, 2, 256, 8, 2), (0, 8, 0, 4, 0, 0, 2, 16384, 2048, 1), 0, None),))
     self.st.reshape((128, 2, 256, 2, 2, 2, 2, 2, 256, 8, 2))
-    assert len(self.st.views) == 1
+    assert len(self.st) == 1
 
   def test_reshape_stable_diffusion(self):
     # regression test for https://github.com/tinygrad/tinygrad/pull/2616
     st = ShapeTracker((View((2, 1920, 32, 32), (1310720, 1024, 32, 1), 0, ((0, 2), (0, 1280), (0, 32), (0, 32)), False),))
     st = st.reshape((2, 32, 240, 256))
-    assert len(st.views) == 2
+    assert len(st) == 2
 
   def test_reshape_trailing_invalid_ones(self):
     st = ShapeTracker((View(shape=(1, 1, 5), strides=(0, 0, 1), offset=-5, mask=((1, 1), (0, 1), (0, 5)), contiguous=False),))
     st = st.reshape((5,))
-    assert len(st.views) == 1
-    assert st.views[0].mask == ((0,0),)
+    assert len(st) == 1
+    assert st[0].mask == ((0,0),)
 
 class TestRealDoesntSimplify(unittest.TestCase):
   def tearDown(self):
     st = self.st.real_strides()
     print(st)
     self.st = self.st.simplify()
-    assert len(self.st.views) != 1
+    assert len(self.st) != 1
     assert None in st
 
   def test_1(self):
@@ -129,9 +129,9 @@ class TestRealSimplifies(unittest.TestCase):
   def tearDown(self):
     st = self.st.real_strides()
     self.st = self.st.simplify()
-    assert len(self.st.views) == 1
-    print(self.st.views[-1].strides, st)
-    assert self.st.views[-1].strides == st
+    assert len(self.st) == 1
+    print(self.st[-1].strides, st)
+    assert self.st[-1].strides == st
 
   def test_1(self):
     self.st = ShapeTracker((
@@ -770,7 +770,7 @@ class TestIdxs(unittest.TestCase):
   def test_check_idx_range(self):
     # generated from: (Tensor.rand(4096,599*64) @ Tensor.rand(599*64,1024)).realize()
     # TODO: use int64
-    st = ShapeTracker(views=(View(shape=(4096, 1024, 599, 1), strides=(613376, 599, 1, 0), offset=0, mask=None, contiguous=True),))
+    st = ShapeTracker((View(shape=(4096, 1024, 599, 1), strides=(613376, 599, 1, 0), offset=0, mask=None, contiguous=True),))
     with self.assertRaises(AssertionError):
       st.expr_idxs()
 
