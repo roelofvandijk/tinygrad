@@ -14,7 +14,7 @@ def apply_mop(st: ShapeTracker, mop_arg: Tuple[MovementOps, Tuple]) -> ShapeTrac
   mop, arg = mop_arg
   if mop == MovementOps.RESHAPE:
     # shapetracker doesn't allow flattening with -1 but required for MovementOps.RESHAPE
-    if arg == (-1,): return st.reshape((prod(st.views[-1].shape),))
+    if arg == (-1,): return st.reshape((prod(st[-1].shape),))
     return st.reshape(arg)
   if mop == MovementOps.PERMUTE: return st.permute(arg)
   if mop == MovementOps.EXPAND:
@@ -26,19 +26,19 @@ def apply_mop(st: ShapeTracker, mop_arg: Tuple[MovementOps, Tuple]) -> ShapeTrac
   raise ValueError("invalid mop")
 
 def make_scratch_st(st: ShapeTracker) -> ShapeTracker:
-  return ShapeTracker.from_shape((get_buffer_size(st.views[0].shape, st.views[0].strides, st.views[0].offset, st.views[0].mask),))
+  return ShapeTracker.from_shape((get_buffer_size(st[0].shape, st[0].strides, st[0].offset, st[0].mask),))
 
 # ShapeTracker to an equivalent series of MovementOps (https://github.com/tinygrad/tinygrad/pull/2216)
 def to_movement_ops(st: ShapeTracker) -> List[Tuple[MovementOps, Tuple]]:
   to_apply:List[Tuple[MovementOps, Tuple]] = []
-  for i, v in enumerate(st.views):
+  for i, v in enumerate(st):
     real_shape = tuple(y-x for x,y in v.mask) if v.mask else v.shape
     offset = v.offset + sum(st*(s-1) for s,st in zip(real_shape, v.strides) if st<0)
     real_offset = offset + (sum(x*st for (x,_),st in zip(v.mask, v.strides)) if v.mask else 0)
     real_real_shape = [s for s,st in zip(real_shape, v.strides) if st]
     strides: List[Node|int] = [abs(st) if isinstance(st,int) else st for st in v.strides if st]
     buffer_size = sum((s-1)*st for s,st in zip(real_real_shape,strides)) + 1
-    if i: buffer_size = prod(st.views[i-1].shape) - real_offset
+    if i: buffer_size = prod(st[i-1].shape) - real_offset
     def sort_by_strides(shape, strides): return sorted(zip(shape, strides), key=lambda k: (k[1],-k[0]), reverse=True), sorted(range(len(strides)), key=lambda k: (strides[k],-real_real_shape[k]), reverse=True)
     ordered_shape_strides, order = sort_by_strides(real_real_shape, strides)
     to_apply.extend([(MovementOps.RESHAPE, (-1,)), (MovementOps.SHRINK, ((real_offset, real_offset+buffer_size),))])
@@ -130,8 +130,8 @@ def test_rebuild(st: ShapeTracker):
   for mop_arg in mops: rebuilt_st = apply_mop(rebuilt_st, mop_arg)
   rebuilt_st = rebuilt_st.simplify()
   assert st_equivalent(st, rebuilt_st)
-  last_v1 = st.views[-1]
-  last_v2 = rebuilt_st.views[-1]
+  last_v1 = st[-1]
+  last_v2 = rebuilt_st[-1]
   assert last_v1.shape == last_v2.shape, f"{last_v1.shape} != {last_v2.shape}"
 
 def test_rebuild_bufferop_st(ast:LazyOp):
