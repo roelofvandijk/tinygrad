@@ -310,7 +310,8 @@ class View:
 
     return None
 
-  def expr(self, idxs:List[Node], valid:Optional[Node]=None) -> Tuple[Node, Node]:
+  @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
+  def expr(self, idxs:Tuple[Node], valid:Optional[Node]=None) -> Tuple[Node, Node]:
     assert len(idxs) == len(self.shape), f"need an idx for all dimensions {idxs} vs {self.shape}"
     iexpr: List[Node] = [NumNode(self.offset) if isinstance(self.offset, int) else self.offset]
     vexpr: List[Node] = [valid] if valid is not None else []

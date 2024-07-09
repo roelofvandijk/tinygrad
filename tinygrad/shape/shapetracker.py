@@ -76,14 +76,14 @@ class ShapeTracker:
   def unit_stride_axes(self, ignore_valid=False) -> List[int]: return [i for i,st in enumerate(self.real_strides(ignore_valid)) if st == 1]
 
   def expr_idxs(self, idxs:Optional[Iterable[Node]]=None) -> Tuple[Node, Node]:
-    idxs = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(self.shape)] if idxs is None else list(idxs)
+    idxs = tuple([Variable(f"idx{i}", 0, s-1) for i,s in enumerate(self.shape)] if idxs is None else idxs)
     idx, valid = self.views[-1].expr(idxs)
-    for view in reversed(self.views[0:-1]):
+    for view in reversed(self.views[:-1]):
       if valid.max == 0: return NumNode(-1), valid
       view = view.minify()
-      acc, idxs = 1, []
+      acc, idxs = 1, ()
       for d in reversed(view.shape):
-        idxs.append((idx//acc)%d)
+        idxs += ((idx//acc)%d,)
         acc *= d
       idx, valid = view.expr(idxs[::-1], valid)
     assert not isinstance(idx.min, int) or idx.min >= -2**31, f"idx.min too small. {idx=}, {idx.min=}"
