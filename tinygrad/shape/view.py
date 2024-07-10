@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, operator, itertools, math
 from dataclasses import dataclass
 from typing import Tuple, List, Optional, Dict, Set, cast
-from tinygrad.helpers import prod, all_int, argsort
+from tinygrad.helpers import prod, all_int, argsort, flatten
 from tinygrad.shape.symbolic import Node, NumNode, Variable, sint, sym_infer, create_lt_node, create_ge_node
 
 @functools.lru_cache(maxsize=None)
@@ -38,37 +38,31 @@ def _merge_dims(shape:Tuple[int, ...], strides:Tuple[int, ...], mask:Optional[Tu
 def _reshape_mask(view: View, new_shape:Tuple[sint, ...]) -> Optional[Tuple[Tuple[sint, sint], ...]]:
   """Returns the new mask if reshape is possible, and None if not possible."""
   if view.mask is None: return tuple((0, s) for s in new_shape)
-  if any(not isinstance(m[0], int) or not isinstance(m[1], int) for m in view.mask): return None
+  if not all_int(flatten(view.mask)): return None
   new_mask: List[Tuple[int, int]] = []
-
+  invalid_mask = ((0, 0),) * len(new_shape)
   r_masks, r_shape, r_new_shape = reversed(view.mask), reversed(view.shape), reversed(new_shape)
   curr_stride, old_dim, new_dim, mask = 1, next(r_shape, 1), next(r_new_shape, 1), next(r_masks, (0,1))
-  if mask[1] - mask[0] < 1: return ((0, 0),) * len(new_shape) # invalid mask
+  if mask[1] - mask[0] < 1: return invalid_mask
 
   while len(new_mask) < len(new_shape):
     (l, r), next_stride = mask, new_dim * curr_stride
-
     if old_dim >= next_stride: # need to split mask.
       if old_dim == next_stride: # simply copy the mask and get next batch for merging
         new_mask.append((l // curr_stride, (r - 1) // curr_stride + 1))
         curr_stride, old_dim, new_dim, mask = 1, next(r_shape, 1), next(r_new_shape, 1), next(r_masks, (0,1))
-        if mask[1] - mask[0] < 1: return ((0, 0),) * len(new_shape) # invalid mask
-
+        if mask[1] - mask[0] < 1: return invalid_mask
       else: # mask can only be splitted if reshape doesn't cut across the mask.
         if (((l % next_stride != 0 or r % next_stride != 0) and l // next_stride != (r - 1) // next_stride)
             or old_dim % next_stride != 0): return None
         new_mask.append((l % next_stride // curr_stride, (r - 1) % next_stride // curr_stride + 1))
         curr_stride, new_dim = next_stride,  next(r_new_shape, 1) # need to get mask for next dimension
-
     else:
       next_mask = next(r_masks, (0, 1))
       # combine if the mask can unfold continuously
       if mask != (0, old_dim) and next_mask[1] - next_mask[0] != 1: return None
       mask, old_dim = (next_mask[0] * old_dim + l, (next_mask[1] - 1) * old_dim + r), old_dim * next(r_shape, 1)
-
-  for mask in r_masks: # if the old shape has leading 1s, need to make sure their mask is (0,1)
-    if mask != (0, 1): return ((0, 0),) * len(new_shape) # invalid mask
-
+  if any(mask != (0, 1) for mask in r_masks): return invalid_mask # leading 1s in old shape need to have mask (0,1)
   return tuple(reversed(new_mask))
 
 def un1d(shape:Tuple[sint, ...], offs:sint) -> List[sint]:
