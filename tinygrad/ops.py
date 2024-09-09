@@ -324,12 +324,13 @@ BUFFER_UOPS = {UOps.LOAD, UOps.STORE, UOps.CONST}
 
 END_FOR_UOP = {UOps.IF:(UOps.STORE, UOps.ENDIF), UOps.RANGE:(UOps.ASSIGN, UOps.ENDRANGE)}
 
-@dataclass(frozen=True, eq=False)
+@dataclass(eq=False)
 class UOp(MathTrait):
   op: UOps
   dtype: Optional[DType] = None
   src: Tuple[UOp, ...] = tuple()
   arg: Any = None
+  _parents_cache: Dict[UOp, None] = field(default_factory=dict)
   def __hash__(self): return id(self)
   @functools.cached_property
   def cmp_tuple(self) -> Tuple[int, Any, Optional[DType], Tuple[UOp, ...]]:
@@ -377,8 +378,11 @@ class UOp(MathTrait):
   def load(cls, *src:UOp, dtype:Optional[DType]=None): return cls(UOps.LOAD, dtype, src)
   @classmethod
   def store(cls, *src:UOp): return cls(UOps.STORE, None, src)
-  @functools.cached_property
-  def parents(self) -> Dict[UOp, None]: return {**{x:None for x in self.src}, **{k:None for x in self.src for k in x.parents.keys()}}
+  @property
+  def parents(self) -> Dict[UOp, None]:
+      if not self._parents_cache:
+        for x in self.src: self._parents_cache |= {x: None, **x.parents}
+      return self._parents_cache
   @property  # parents with self
   def sparents(self) -> Dict[UOp, None]: return {**self.parents, self:None}
   @functools.cached_property
@@ -421,7 +425,7 @@ class UOp(MathTrait):
     if self.op is UOps.SPECIAL: return self.const_like(0), self.const_like(self.arg[1]-1) if isinstance(self.arg[1], int) else None
     if self.op is UOps.CONST: return self, self
     if self.op is UOps.ALU and cast(DType, self.dtype).count == 1:
-      s0,s1 = [cast(UOp, self.src[i] if i < len(self.src) else None) for i in range(2)]
+      s0, s1 = (self.src+(cast(UOp, None),)*2)[:2]
       if self.arg is BinaryOps.ADD: return self.sconst_like(s0.vmin.arg+s1.vmin.arg), self.sconst_like(s0.vmax.arg+s1.vmax.arg)
       if self.arg is BinaryOps.MUL and (s0.vmin.arg >= 0 or s1.vmin.arg >= 0):
         # handle at lease one is non-negative
@@ -581,13 +585,13 @@ def get_location() -> Tuple[str, int]:
 @functools.lru_cache(None)
 def lines(fn) -> List[str]: return open(fn).readlines()
 
-@dataclass(frozen=True, repr=False)  # reuse repr from UOp
+@dataclass(repr=False)  # reuse repr from UOp
 class NOp(UOp):
   name: Optional[str] = None
   src: Tuple[NOp, ...] = tuple()
   allow_any_len: bool = False
   location: Tuple[str, int] = field(default_factory=get_location)
-
+  def __hash__(self): return id(self)
   @staticmethod
   @functools.lru_cache(None)
   def var(name:Optional[str]=None, dtype:Optional[DType]=None): return NOp(UOps.NOOP, dtype=dtype, name=name)
