@@ -772,7 +772,7 @@ class RewriteContext:
     self.replace: Dict[UOp, UOp] = {}
   def rewrite(self, n:UOp) -> UOp:
     if rn := self.replace.get(n): return rn
-    replace_source = (n.op, n.dtype, new_src:=tuple(map(self.rewrite, n.src)), n.arg)
+    replace_source = (n.op, n.dtype, new_src:=tuple([self.rewrite(x) for x in n.src]), n.arg)
     if found := self.nodes.get(replace_source): self.replace[n] = found
     else:
       x = UOp(*replace_source) if new_src != n.src else n
