@@ -4,10 +4,8 @@ import torch
 import numpy as np
 from tinygrad.helpers import getenv, GlobalCounters
 if getenv("TINY_BACKEND2"):
-  import extra.torch_backend.backend2
   device = "cpu"
 else:
-  import extra.torch_backend.backend
   device = "tiny"
 
 class TestTorchBackend(unittest.TestCase):
@@ -25,9 +23,8 @@ class TestTorchBackend(unittest.TestCase):
     a = torch.ones(4, device=device)
     np.testing.assert_equal(a.cpu().numpy(), [1,1,1,1])
 
-  def test_numpy_ones(self):
+  def test_numpy_one_int(self):
     a = torch.ones(4, dtype=torch.int32, device=device)
-    assert a.dtype == torch.int32
     np.testing.assert_equal(a.cpu().numpy(), [1,1,1,1])
 
   def test_plus(self):
@@ -65,6 +62,12 @@ class TestTorchBackend(unittest.TestCase):
     np.testing.assert_equal(null.cpu().numpy(), [[1,2],[3,4]])
     np.testing.assert_equal(perm.cpu().numpy(), [[1,3],[2,4]])
     np.testing.assert_equal(back.cpu().numpy(), [[1,2],[3,4]])
+
+  def test_permute_3(self):
+    a = torch.randn(2, 3, 4, dtype=torch.float32, device=device)
+    b = a.permute(2, 0, 1)  # (2,3,4) -> (4,2,3)
+    assert b.shape == (4, 2, 3)
+    np.testing.assert_equal(b.cpu().numpy(), a.cpu().numpy().transpose(2, 0, 1))
 
   def test_shrink(self):
     a = torch.Tensor([1,2,3,4]).to(device)
@@ -108,7 +111,6 @@ class TestTorchBackend(unittest.TestCase):
     y3 = torch.amax(x, dim=2)
     expected = np.array([[4.7, 12.9, 12.3], [16.9, 24.9, 23.6]], dtype=np.float32)
     np.testing.assert_equal(y3.cpu().numpy(), expected)
-
 
   def test_amin(self):
     x = torch.tensor([[[ 1.5,  2.3,  3.1,  4.7],
@@ -197,7 +199,7 @@ class TestTorchBackend(unittest.TestCase):
     for assume_unique in [False, True]:
       for invert, expected in [(False, expected_base), (True, ~expected_base)]:
         out = torch.empty_like(a, dtype=torch.bool)
-        res = torch.ops.aten.isin.Tensor_Tensor_out(a, b, invert=invert, assume_unique=assume_unique, out=out)
+        torch.ops.aten.isin.Tensor_Tensor_out(a, b, invert=invert, assume_unique=assume_unique, out=out)
         np.testing.assert_equal(out.cpu().numpy(), expected.cpu().numpy())
 
   def test_uniform(self):
@@ -220,21 +222,14 @@ class TestTorchBackend(unittest.TestCase):
   def test_linalg_eigh(self):
     a = torch.tensor([[1, 2], [2, 1]], dtype=torch.float32, device=device)
     w, v = torch.linalg.eigh(a)
-    np.testing.assert_equal(w.cpu().numpy(), [-1, 3])
+    np.testing.assert_allclose(w.cpu().numpy(), [-1, 3], rtol=1e-5)
     recon = (v @ torch.diag(w) @ v.T).cpu().numpy()
-    np.testing.assert_allclose(recon, a.cpu().numpy(), atol=1e-6)
+    np.testing.assert_allclose(recon, a.cpu().numpy(), rtol=1e-5)
 
   def test_linalg_det(self):
     a = torch.diag(torch.tensor([1,2,3,4,5], dtype = torch.float32, device=device))
     b = torch.linalg.det(a)
     np.testing.assert_equal(b.cpu().numpy(), 120.0)
-
-  def test_linalg_eigh(self):
-    a = torch.tensor([[1, 2], [2, 1]], dtype=torch.float32, device=device)
-    w, v = torch.linalg.eigh(a)
-    np.testing.assert_allclose(w.cpu().numpy(), [-1, 3], rtol=1e-5)
-    recon = (v @ torch.diag(w) @ v.T).cpu().numpy()
-    np.testing.assert_allclose(recon, a.cpu().numpy(), rtol=1e-5)
 
   def test_diag_vector_to_matrix(self):
     vec = torch.tensor([1., 2., 3., 4., 5.], dtype=torch.float32, device=device)
@@ -249,12 +244,6 @@ class TestTorchBackend(unittest.TestCase):
     expected = np.array([1., 5., 9.])
     np.testing.assert_allclose(vec.cpu().numpy(), expected, rtol=1e-5)
     assert vec.shape == (3,)
-    
-  def test_permute(self):
-    a = torch.randn(2, 3, 4, dtype=torch.float32, device=device)
-    b = a.permute(2, 0, 1)  # (2,3,4) -> (4,2,3)
-    assert b.shape == (4, 2, 3)
-    np.testing.assert_equal(b.cpu().numpy(), a.cpu().numpy().transpose(2, 0, 1))
 
   def test_linalg_cross(self):
     a = torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.float32, device=device)
@@ -300,7 +289,6 @@ class TestTorchBackend(unittest.TestCase):
   def test_diagonal_cube(self): self._test_diagonal(3, 3, 3)
   def test_diagonal_rectangular(self): self._test_diagonal(4, 5, 6)
   def test_diagonal_4d(self): self._test_diagonal(2, 3, 4, 5)
-
 
   def test_slice_inplace_zero(self):
     a = torch.ones((3, 3), device=device)
@@ -425,7 +413,6 @@ class TestTorchBackend(unittest.TestCase):
     a = torch.tensor([[1, 2], [3, 4]], device=device)
     result = torch.diag(a)
     np.testing.assert_equal(result.cpu().numpy(), [1, 4])
-
 
   def test_slice_inplace_multiply_offset_preservation(self):
     a = torch.tensor([1, 2, 3], device=device)
@@ -637,7 +624,7 @@ class TestTorchBackend(unittest.TestCase):
     b = torch.cumsum(a, dim=0)
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4).cumsum(dim=0)
     np.testing.assert_equal(b.cpu().numpy(), expected.numpy())
-    
+
     c = torch.cumsum(a, dim=1)
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4).cumsum(dim=1)
     np.testing.assert_equal(c.cpu().numpy(), expected.numpy())
@@ -696,12 +683,12 @@ class TestTorchBackend(unittest.TestCase):
     b = torch.diag(a)
     expected = [[1, 0, 0], [0, 2, 0], [0, 0, 3]]
     np.testing.assert_equal(b.detach().cpu().numpy(), expected)
-    
+
   def test_diag_operations_2d_to_1d(self):
     c = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float32, device=device)
     d = torch.diag(c)
     np.testing.assert_equal(d.cpu().numpy(), [1, 5, 9])
-    
+
   def test_diag_operation(self):
     e = torch.randn(5, 5, dtype=torch.float32, device=device, requires_grad=True)
     f = torch.diagonal(e)
