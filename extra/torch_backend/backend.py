@@ -83,15 +83,16 @@ def maybe_realize_storage(self: Tensor) -> bool:
   return True
 
 def inplace_fn(outvars: str|list[str]):
-  outvars = [outvars] if isinstance(outvars, str) else outvars
+  if type(outvars) is str: outvars = [outvars]
   def decorator(fn):
+    sig = inspect.signature(fn)
     def wrapper(*args, **kwargs):
-      bound = inspect.signature(fn).bind(*args, **kwargs)
+      bound = sig.bind(*args, **kwargs)
       outs = [kwargs.get(v, bound.arguments.get(v)) for v in outvars]
       outs = [unwrap(o) if isinstance(o, torch.Tensor) else o for o in outs]
       realize = any(maybe_realize_storage(o) for o in outs)
       ret = fn(*args, **kwargs)
-      if realize: Tensor.realize(*outs)
+      if realize: Tensor.realize(*(o for o in outs))
       return ret
     return wrapper
   return decorator
