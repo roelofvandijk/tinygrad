@@ -416,34 +416,24 @@ def native_batch_norm(input, weight, bias, running_mean, running_var, training, 
   running_mean_t = unwrap(running_mean) if running_mean is not None else None
   running_var_t = unwrap(running_var) if running_var is not None else None
 
-  # Calculate batch statistics
-  shape_mask = [1, -1] + [1] * (input_t.ndim - 2)
   reduce_axes = tuple(x for x in range(input_t.ndim) if x != 1)
 
   if training:
-    # Training mode: compute batch stats
-    batch_mean = input_t.mean(axis=reduce_axes)
-    y = input_t - batch_mean.stop_gradient().reshape(shape=shape_mask)
-    batch_var = (y * y).mean(axis=reduce_axes)
+    batch_var, batch_mean = input_t.var_mean(axis=reduce_axes, correction=0)
     batch_invstd = batch_var.add(eps).rsqrt()
-
-    # Apply normalization
     out = input_t.batchnorm(weight_t, bias_t, batch_mean, batch_invstd)
 
-    # Update running stats if provided
     if running_mean_t is not None and running_var_t is not None:
       numel_ratio = input_t.numel() / (input_t.numel() - input_t.shape[1])
-      running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.stop_gradient())
-      running_var_t.assign((1 - momentum) * running_var_t + momentum * numel_ratio * batch_var.stop_gradient())
+      running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.detach())
+      running_var_t.assign((1 - momentum) * running_var_t + momentum * numel_ratio * batch_var.detach())
 
     return wrap(out), wrap(batch_mean), wrap(batch_invstd)
   else:
-    # Eval mode: use running stats
     if running_mean_t is None or running_var_t is None:
       raise RuntimeError("running stats required for eval mode")
-    running_invstd = running_var_t.add(eps).rsqrt()
-    out = input_t.batchnorm(weight_t, bias_t, running_mean_t, running_invstd)
-    return wrap(out), wrap(running_mean_t), wrap(running_invstd)
+    out = input_t.batchnorm(weight_t, bias_t, running_mean_t, running_var_t.add(eps).rsqrt())
+    return wrap(out), wrap(running_mean_t), wrap(running_var_t.add(eps).rsqrt())
 
 @torch.library.impl("aten::native_batch_norm_backward", "privateuseone")
 def native_batch_norm_backward(grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask):
