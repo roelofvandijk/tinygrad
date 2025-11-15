@@ -2,6 +2,10 @@
 import unittest
 import torch
 import numpy as np
+import pathlib
+import sys
+import os
+import warnings
 from tinygrad.helpers import getenv, GlobalCounters
 if getenv("TINY_BACKEND2"):
   import extra.torch_backend.backend2
@@ -9,6 +13,7 @@ if getenv("TINY_BACKEND2"):
 else:
   import extra.torch_backend.backend
   device = "tiny"
+
 
 class TestTorchBackend(unittest.TestCase):
   def test_randperm_generator_out(self):
@@ -760,5 +765,87 @@ class TestBackendHelpers(unittest.TestCase):
     sliced_tiny_3d = torch_tiny_3d[1:3, 2:4, 3:5]
     np.testing.assert_equal(sliced_tiny_3d.cpu().numpy(), sliced_cpu_3d.numpy())
 
+class TestKernelFusionRegression(unittest.TestCase):  
+  def _realize(self, t): _ = t.detach().cpu().numpy()
+
+  def _check_kernel_count(self, fn, expected_kernels):
+    torch.manual_seed(42)
+    GlobalCounters.reset()
+    fn().detach().cpu().numpy()
+    expectation = f"{GlobalCounters.kernel_count} vs {expected_kernels} expected."
+    if GlobalCounters.kernel_count < expected_kernels: warnings.warn(f"{expectation} Expectation can be lowered.", UserWarning)
+    self.assertLessEqual(GlobalCounters.kernel_count, expected_kernels, f"{expectation}")
+  
+  def test_elementwise_fusion(self):
+    def fn():
+      x = torch.randn(128, 128, device=device)
+      return (x + 1.0) * 2.0 - 0.5
+    self._check_kernel_count(fn, 7)
+
+  def test_relu_fusion(self):
+    def fn():
+      x = torch.randn(1, 3, 32, 32, device=device)
+      conv = torch.nn.Conv2d(3, 16, 3, padding=1).to(device)
+      with torch.no_grad():
+        return torch.nn.functional.relu(conv(x))
+    self._check_kernel_count(fn, 9)
+
+
+  def test_batchnorm_fusion(self):
+    def fn():
+      x = torch.randn(2, 3, 16, 16, device=device)
+      conv = torch.nn.Conv2d(3, 8, 3, padding=1).to(device)
+      bn = torch.nn.BatchNorm2d(8).to(device)
+      bn.eval()  # eval mode for inference
+      with torch.no_grad():
+        return torch.nn.functional.relu(bn(conv(x)))
+    self._check_kernel_count(fn, 17)
+
+
+  def test_reduce_fusion(self):
+    def fn():
+      x = torch.randn(64, 64, device=device)
+      return (x * 2.0).sum()
+    self._check_kernel_count(fn, 8)
+
+  def test_matmul_elementwise_fusion(self):
+    def fn():
+      x = torch.randn(32, 32, device=device)
+      w = torch.randn(32, 32, device=device)
+      return torch.nn.functional.relu(x @ w + 1.0)
+    self._check_kernel_count(fn, 8)
+
+  def test_pooling_fusion(self):
+    def fn():
+      x = torch.randn(1, 8, 16, 16, device=device)
+      return torch.nn.functional.max_pool2d(x * 2.0, 2)
+    self._check_kernel_count(fn, 6)
+
+# class TestKernelRegression(unittest.TestCase):
+  
+#   def test_resnet18_kernel_count(self):
+#     import subprocess
+
+#     result = subprocess.run(
+#       [sys.executable, 'extra/torch_backend/example.py'],
+#       env={**os.environ, 'PYTHONPATH': '.', 'DEBUG': '2'},
+#       capture_output=True,
+#       text=True,
+#       cwd=str(pathlib.Path(__file__).parent.parent.parent)
+#     )
+    
+#     # DEBUG output goes to stdout, not stderr
+#     metal_lines = [line for line in result.stdout.split('\n') if line.startswith('*** METAL')]
+#     kernel_count = len(metal_lines)
+    
+#     self.assertGreater(kernel_count, 0, "No kernels, test failed")
+#     expected_kernels = 92
+#     expectation = f"ResNet18 kernels are {kernel_count} vs {expected_kernels} expected."
+#     if kernel_count < expected_kernels:
+#       warnings.warn(f"{expectation} Expectation can be lowered.", UserWarning)
+#     self.assertLessEqual(kernel_count, expected_kernels, f"{expectation}")
+
+
 if __name__ == "__main__":
   unittest.main()
+
