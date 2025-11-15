@@ -405,10 +405,74 @@ def _linalg_svd(self, full_matrices=False):
   U, S, Vh = unwrap(self).svd(full_matrices)
   return wrap(U), wrap(S), wrap(Vh)
 
+@torch.library.impl("aten::native_batch_norm", "privateuseone")
+def native_batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps):
+  input_t = unwrap(input)
+  weight_t = unwrap(weight) if weight is not None else None
+  bias_t = unwrap(bias) if bias is not None else None
+  running_mean_t = unwrap(running_mean) if running_mean is not None else None
+  running_var_t = unwrap(running_var) if running_var is not None else None
+
+  # Calculate batch statistics
+  shape_mask = [1, -1] + [1] * (input_t.ndim - 2)
+  reduce_axes = tuple(x for x in range(input_t.ndim) if x != 1)
+
+  if training:
+    # Training mode: compute batch stats
+    batch_mean = input_t.mean(axis=reduce_axes)
+    y = input_t - batch_mean.detach().reshape(shape=shape_mask)
+    batch_var = (y * y).mean(axis=reduce_axes)
+    batch_invstd = batch_var.add(eps).rsqrt()
+
+    # Apply normalization
+    out = input_t.batchnorm(weight_t, bias_t, batch_mean, batch_invstd)
+
+    # Update running stats if provided
+    if running_mean_t is not None and running_var_t is not None:
+      numel_ratio = input_t.numel() / (input_t.numel() - input_t.shape[1])
+      running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.detach())
+      running_var_t.assign((1 - momentum) * running_var_t + momentum * numel_ratio * batch_var.detach())
+
+    return wrap(out), wrap(batch_mean), wrap(batch_invstd)
+  else:
+    # Eval mode: use running stats
+    if running_mean_t is None or running_var_t is None:
+      raise RuntimeError("running stats required for eval mode")
+    running_invstd = running_var_t.add(eps).rsqrt()
+    out = input_t.batchnorm(weight_t, bias_t, running_mean_t, running_invstd)
+    return wrap(out), wrap(running_mean_t), wrap(running_invstd)
+
+@torch.library.impl("aten::native_batch_norm_backward", "privateuseone")
+def native_batch_norm_backward(grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask):
+  grad_out_t, input_t = unwrap(grad_out), unwrap(input)
+  weight_t = unwrap(weight) if weight is not None else None
+  save_mean_t = unwrap(save_mean)
+  save_invstd_t = unwrap(save_invstd)
+
+  # Forward pass to get computation graph for backward
+  out = input_t.batchnorm(weight_t, None, save_mean_t, save_invstd_t)
+
+  # Compute gradients
+  targets = [t for t, m in zip([input_t, weight_t], output_mask[:2]) if t is not None and m]
+  if targets:
+    grads = out.gradient(*targets, gradient=grad_out_t)
+    grad_input = grads.pop(0) if output_mask[0] else None
+    grad_weight = grads.pop(0) if output_mask[1] and weight_t is not None else None
+  else:
+    grad_input, grad_weight = None, None
+
+  # Grad bias is just sum of grad_out over batch dimensions
+  grad_bias = grad_out_t.sum(axis=tuple(x for x in range(grad_out_t.ndim) if x != 1)) if output_mask[2] else None
+
+  return (wrap(grad_input) if grad_input is not None else None,
+          wrap(grad_weight) if grad_weight is not None else None,
+          wrap(grad_bias) if grad_bias is not None else None)
+
+
 # register some decompositions
 from torch._decomp import get_decompositions
 decomps = [
-  aten.native_batch_norm, aten.native_batch_norm_backward,
+  # NOTE: native_batch_norm is NOT decomposed - we implement it directly to preserve fusion opportunities
   aten.native_layer_norm_backward,
   aten.linalg_cross,
   aten.addmm,
