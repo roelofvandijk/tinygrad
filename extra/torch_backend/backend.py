@@ -104,8 +104,12 @@ def realize_with_views(self: Tensor, views: list[Tensor]):
       if u.op in MOVEMENT_OPS: ret = MOVEMENT_OPS[u.op](ret, u)
     v.replace(ret)
 def maybe_realize_storage(self: Tensor) -> bool:
-  if (realize:=is_view(self)) and not (base:=canonical_base(self)).uop.is_realized: realize_with_views(base, derived_views(base))
-  return realize
+  if not is_view(self): return False
+  base = canonical_base(self)
+  if base.uop.is_realized: 
+    realize_with_views(base, derived_views(base))
+    return True
+  return False
 def inplace_fn(outvars: str|list[str]):
   if type(outvars) is str: outvars = [outvars]
   def decorator(fn):
@@ -281,18 +285,17 @@ def convolution_overrideable(input, weight, bias, stride, padding, dilation, tra
     print(f"convolution {input.shape=} {weight.shape=} {stride=} {padding=} {dilation=} {transposed=} {output_padding=} {groups=}")
   input, weight, bias = unwrap(input), unwrap(weight), unwrap(bias) if bias is not None else None
   # TODO: fix test_biased_conv2d fails without realize()
-  if not transposed: return wrap(input.conv2d(weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding).realize())
-  return wrap(input.conv_transpose2d(weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding, output_padding=output_padding).realize())
+  if not transposed: return wrap(input.conv2d(weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding))
+  return wrap(input.conv_transpose2d(weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding, output_padding=output_padding))
 
 @torch.library.impl("aten::convolution_backward_overrideable", "privateuseone")
 def convolution_backward_overrideable(grad_out, input, weight, stride, padding, dilation, transposed, output_padding, groups, output_mask):
   if TORCH_DEBUG >= 1:
     print(f"convolution_backward {input.shape=} {weight.shape=} {stride=} {padding=} {dilation=} {transposed=} {output_padding=} {groups=}")
-  grad_out, input, weight, bias = unwrap(grad_out), unwrap(input), unwrap(weight), Tensor.zeros(weight.shape[0], device=_from_torch_device(weight.device))
-  if not transposed: out = Tensor.conv2d(input, weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding)
-  else:
-    bias = Tensor.zeros(weight.shape[1] * groups)
-    out = Tensor.conv_transpose2d(input, weight, bias, groups=groups, stride=stride, dilation=dilation, padding=padding, output_padding=output_padding)
+  grad_out, input, weight = unwrap(grad_out), unwrap(input), unwrap(weight)
+  bias = Tensor.zeros(weight.shape[0], device=input.device) if not transposed else Tensor.zeros(weight.shape[1] * groups, device=input.device)
+  if not transposed: out = Tensor.conv2d(input, weight, bias if output_mask[2] else None, groups=groups, stride=stride, dilation=dilation, padding=padding)
+  else: out = Tensor.conv_transpose2d(input, weight, bias if output_mask[2] else None, groups=groups, stride=stride, dilation=dilation, padding=padding, output_padding=output_padding)
   grads = out.gradient(*[t for t,m in zip([input, weight, bias], output_mask) if m], gradient=grad_out)
   return tuple([wrap(grads.pop(0)) if m else None for m in output_mask])
 
@@ -420,7 +423,7 @@ def native_batch_norm(input, weight, bias, running_mean, running_var, training, 
   if training:
     # Training mode: compute batch stats
     batch_mean = input_t.mean(axis=reduce_axes)
-    y = input_t - batch_mean.detach().reshape(shape=shape_mask)
+    y = input_t - batch_mean.stop_gradient().reshape(shape=shape_mask)
     batch_var = (y * y).mean(axis=reduce_axes)
     batch_invstd = batch_var.add(eps).rsqrt()
 
@@ -430,8 +433,8 @@ def native_batch_norm(input, weight, bias, running_mean, running_var, training, 
     # Update running stats if provided
     if running_mean_t is not None and running_var_t is not None:
       numel_ratio = input_t.numel() / (input_t.numel() - input_t.shape[1])
-      running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.detach())
-      running_var_t.assign((1 - momentum) * running_var_t + momentum * numel_ratio * batch_var.detach())
+      running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.stop_gradient())
+      running_var_t.assign((1 - momentum) * running_var_t + momentum * numel_ratio * batch_var.stop_gradient())
 
     return wrap(out), wrap(batch_mean), wrap(batch_invstd)
   else:
