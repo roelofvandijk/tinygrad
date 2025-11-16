@@ -102,7 +102,7 @@ def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   if view.shape == base.shape:
     base.assign(val)
     return
-  
+  print("here")
   # Slow path: need to use indexing for actual view updates
   idx_base = (
       Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32)
@@ -287,14 +287,21 @@ def fill_scalar(x, y):
 def add_tensor_(self, other, alpha: float = 1.0):
   self_t = unwrap(self)
   other_t = unwrap(other) if isinstance(other, torch.Tensor) else Tensor(other, device=self_t.device, dtype=self_t.dtype)
-  _apply_inplace(self_t, self_t + other_t * alpha)
+  # For non-views, replace UOp directly to allow fusion
+  if not is_view(self_t):
+    self_t.replace(self_t + other_t * alpha)
+  else:
+    _apply_inplace(self_t, self_t + other_t * alpha)
   return wrap(self_t)
 
 @torch.library.impl("aten::add_.Scalar", "privateuseone")
 @inplace_fn("self")
 def add_scalar_(self, other, alpha: float = 1.0):
   self_t = unwrap(self)
-  _apply_inplace(self_t, self_t + other * alpha)
+  if not is_view(self_t):
+    self_t.replace(self_t + other * alpha)
+  else:
+    _apply_inplace(self_t, self_t + other * alpha)
   return wrap(self_t)
 
 @torch.library.impl("aten::mul_.Tensor", "privateuseone")
@@ -302,14 +309,20 @@ def add_scalar_(self, other, alpha: float = 1.0):
 def mul_tensor_(self, other):
   self_t = unwrap(self)
   other_t = unwrap(other) if isinstance(other, torch.Tensor) else Tensor(other, device=self_t.device, dtype=self_t.dtype)
-  _apply_inplace(self_t, self_t * other_t)
+  if not is_view(self_t):
+    self_t.replace(self_t * other_t)
+  else:
+    _apply_inplace(self_t, self_t * other_t)
   return wrap(self_t)
 
 @torch.library.impl("aten::mul_.Scalar", "privateuseone")
 @inplace_fn("self")
 def mul_scalar_(self, other):
   self_t = unwrap(self)
-  _apply_inplace(self_t, self_t * other)
+  if not is_view(self_t):
+    self_t.replace(self_t * other)
+  else:
+    _apply_inplace(self_t, self_t * other)
   return wrap(self_t)
 
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
@@ -516,16 +529,10 @@ def copy_(self, src, non_blocking=False):
   if src.is_tiny and self.is_tiny:
     to_device = _from_torch_device(self.device)
     src_t, dest_t = unwrap(src), unwrap(self)
-    # Realize non-views first to materialize them
-    if not is_view(dest_t): 
-      dest_t = dest_t.realize()
     if TORCH_DEBUG:
       print("copy_ tiny->tiny", dest_t.shape, "from", src_t.shape, "is_view", is_view(dest_t), "is_realized", dest_t.uop.is_realized)
-    # After realize, just assign directly - don't use _apply_inplace for realized tensors
-    if dest_t.uop.is_realized:
-      dest_t.assign(src_t.cast(cast_dtype).to(to_device))
-    else:
-      _apply_inplace(dest_t, src_t.cast(cast_dtype).to(to_device))
+    # Use _apply_inplace which handles both views and non-views correctly
+    _apply_inplace(dest_t, src_t.cast(cast_dtype).to(to_device))
     return self
   elif src.is_tiny and self.is_cpu:
     self.resize_(src.numel()).resize_(src.shape)
