@@ -55,133 +55,53 @@ def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
 
 def _get_view_ops(view: Tensor) -> list:
-  """
-  Extract the sequence of movement operations that define a view.
-  Returns a list of UOps in the order they should be applied (oldest first).
-  """
-  actual_base = canonical_base(view)
-  chain: list = []
-  cur = view.uop
-  actual_base_uop = actual_base.uop
-  visited = set()
-  
+  actual_base_uop = canonical_base(view).uop
+  chain, cur, visited = [], view.uop, set()
   while cur is not actual_base_uop:
-    if id(cur) in visited:
-      break
+    if id(cur) in visited or len(cur.src) == 0: break
     visited.add(id(cur))
-    
-    if cur.op in MOVEMENT_OPS:
-      chain.append(cur)
-      cur = cur.src[0]
-      continue
-    if len(cur.src) == 0:
-      break
+    if cur.op in MOVEMENT_OPS: chain.append(cur)
     cur = cur.src[0]
-  
   return list(reversed(chain))
 
 def _apply_view_ops(target: Tensor, ops: list) -> Tensor:
-  """Apply a sequence of movement operations to a tensor."""
   ret = target
-  for u in ops:
-    ret = MOVEMENT_OPS[u.op](ret, u)
+  for u in ops: ret = MOVEMENT_OPS[u.op](ret, u)
   return ret
 
 def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
-  """
-  Replay the view operations from `view` onto `target` tensor.
-  
-  This extracts the movement operations that define `view` relative to its actual base,
-  then applies those same operations to `target`. The key is that `target` may be a 
-  different tensor (e.g., an index tensor) but with the same shape as view's actual base.
-  
-  Special case: If target IS the actual base (same object), but with a different UOp
-  (e.g., after assign), we use the pre-extracted view ops instead of walking the UOp chain.
-  """
-  # Early return if view is the target
-  if view is target or view.uop is target.uop:
-    return view
-  
-  # Get the actual base of the view (if it's a view)
+  if view is target or view.uop is target.uop: return view
   actual_base = canonical_base(view)
-  
-  # Special case: if target is the same object as actual_base, extract and apply ops
-  if target is actual_base:
-    ops = _get_view_ops(view)
-    return _apply_view_ops(target, ops)
-  
-  # If target has different shape from actual base, we can't replay
-  if target.shape != actual_base.shape:
-    return view
-  
-  # Collect movement ops from view back to its actual base and apply to target
-  ops = _get_view_ops(view)
-  return _apply_view_ops(target, ops)
+  if target.shape != actual_base.shape: return view
+  return _apply_view_ops(target, _get_view_ops(view))
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
   val = value.cast(tgt_dtype) if value.dtype != tgt_dtype else value
-  
-  # Fast path: if view matches base exactly, just assign
-  if view is base and view.shape == val.shape:
-    base.assign(val)
-    return
-  
-  # Another fast path: if shapes match and view has no actual view operations
-  if view.shape == base.shape and view.uop is base.uop:
-    base.assign(val)
-    return
-  
-  # Fast path 3: if shapes match even if uops differ (same logical tensor)
   if view.shape == base.shape:
     base.assign(val)
     return
-  print("here")
-  # Slow path: need to use indexing for actual view updates
-  idx_base = (
-      Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32)
-      .reshape(base.shape)
-  )
+  idx_base = Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32).reshape(base.shape)
   idx_view = _replay_view_from_base(idx_base, view).reshape(-1)
   flat_base = base.reshape(base.numel()).contiguous()
-  flat_val  = val.reshape(-1)
-  flat_base[idx_view] = flat_val
-  # Update the base tensor with the modified values
+  flat_base[idx_view] = val.reshape(-1)
   base.assign(flat_base.reshape(base.shape))
+
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
-    # Ensure value has the correct dtype
-    if value.dtype != target.dtype:
-        value = value.cast(target.dtype)
-
-    # Fast path: if target is realized or not a view, just assign
+    val = value.cast(target.dtype) if value.dtype != target.dtype else value
     if target.uop.is_realized or not is_view(target):
-        target.assign(value)
+        target.assign(val)
         return
-
     base = canonical_base(target)
-    
-    # If target is the same as base (no actual view operation), just assign
     if target is base or target.uop is base.uop:
-        target.assign(value)
+        target.assign(val)
         return
-    
-    # Check if there are any derived views to update
     views = derived_views(base)
     if not views:
-        # No other views, can just assign to target directly
-        target.assign(value)
+        target.assign(val)
         return
-    
-    # Complex case: need to update base and replay all views
-    # IMPORTANT: Extract view operations BEFORE modifying base
-    # After base.assign(), the base's UOp changes, which would cause _get_view_ops
-    # to incorrectly include the old base's operations
     view_ops_map = {v: _get_view_ops(v) for v in views}
-    
-    _view_write(base, target, value)
-    
-    # After writing to base via assign, the base's UOp has changed
-    # We need to update all views to reference the new base UOp
+    _view_write(base, target, val)
     for v in views:
         v.replace(_apply_view_ops(base, view_ops_map[v]))
 
@@ -224,26 +144,11 @@ MOVEMENT_OPS = {
   Ops.FLIP: lambda t, u: t.flip(u.marg),
 }
 
-# in place operations with views
-def realize_with_views(self: Tensor, views: list[Tensor]):
-  self.replace(self.realize())
-  base_uop_set = set(self.uop.toposort())
-  for v in views:
-    if v.uop.base.op is Ops.BUFFER_VIEW: continue # skip subbuffer, we just use the real buffer view
-    ret = self
-    for u in v.uop.toposort():
-      if u in base_uop_set: continue  # skip ops that are part of the base tensor
-      if u.op in MOVEMENT_OPS: ret = MOVEMENT_OPS[u.op](ret, u)
-    v.replace(ret)
-  return False
+
 def inplace_fn(outvars: str|list[str]):
   if type(outvars) is str: outvars = [outvars]
   def decorator(fn):
-    sig = inspect.signature(fn)
     def wrapper(*args, **kwargs):
-      bound = sig.bind(*args, **kwargs)
-      outs = [kwargs.get(v, bound.arguments.get(v)) for v in outvars]
-      outs = [unwrap(o) if isinstance(o, torch.Tensor) else o for o in outs]
       ret = fn(*args, **kwargs)
       return ret
     return wrapper
@@ -923,7 +828,6 @@ def _pad_circular(self, padding): return CircularPad.apply(self, padding)
 @torch.library.impl("aten::_pad_circular", "AutogradPrivateUse1")
 def _pad_circular_autograd(self, padding): return CircularPad.apply(self, padding)
 
-
 # this is Tensor.diagonal, but extended for batches and non-square
 @torch.library.impl("aten::diagonal", "privateuseone")
 @wrap_view_op
@@ -936,9 +840,9 @@ def diagonal(self, offset=0, dim1=0, dim2=1):
   diag_len = min(m, n)
   return self.reshape(*batch_shape, m*n).pad(tuple((0,0) for _ in batch_shape) + ((0, diag_len),)).reshape(*batch_shape, diag_len, n+1)[..., :, 0]
 
-@torch.library.impl("aten::diagonal_backward", "privateuseone")
-def diagonal_backward(grad_out, input_sizes, offset, dim1, dim2):
-  # TODO: support batched diagonal_backward for multi-dimensional tensors (currently only works for 2D)
-  if offset != 0 or dim1 != 0 or dim2 != 1: raise NotImplementedError(f"diagonal_backward with {offset=}, {dim1=}, {dim2=} not implemented")
-  n = min(input_sizes[0], input_sizes[1])
-  return wrap(unwrap(grad_out).diag().pad(((0, max(0, input_sizes[0]-n)), (0, max(0, input_sizes[1]-n)))))
+# @torch.library.impl("aten::diagonal_backward", "privateuseone")
+# def diagonal_backward(grad_out, input_sizes, offset, dim1, dim2):
+#   # TODO: support batched diagonal_backward for multi-dimensional tensors (currently only works for 2D)
+#   if offset != 0 or dim1 != 0 or dim2 != 1: raise NotImplementedError(f"diagonal_backward with {offset=}, {dim1=}, {dim2=} not implemented")
+#   n = min(input_sizes[0], input_sizes[1])
+#   return wrap(unwrap(grad_out).diag().pad(((0, max(0, input_sizes[0]-n)), (0, max(0, input_sizes[1]-n)))))
