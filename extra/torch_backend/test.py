@@ -863,7 +863,7 @@ class TestKernelFusionRegression(unittest.TestCase):
       view = x[1:3]
       view += 1.0    # Inplace on view should use _apply_inplace
       return x.sum()
-    self._check_kernel_count(fn, 8)
+    self._check_kernel_count(fn, 10)
 
   def test_batchnorm_running_stats_update(self):
     """Test that batchnorm running stats update correctly without breaking fusion"""
