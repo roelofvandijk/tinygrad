@@ -54,22 +54,20 @@ def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
 
-
-
-def _replay_view_from_base(base: Tensor, view: Tensor) -> Tensor:
-  # Early return if view is already the base or has same UOp
-  if view is base or view.uop is base.uop:
-    return view
-  
+def _get_view_ops(view: Tensor) -> list:
+  """
+  Extract the sequence of movement operations that define a view.
+  Returns a list of UOps in the order they should be applied (oldest first).
+  """
+  actual_base = canonical_base(view)
   chain: list = []
   cur = view.uop
-  base_uop = base.uop
+  actual_base_uop = actual_base.uop
   visited = set()
   
-  while cur is not base_uop:
-    # Prevent infinite loops
+  while cur is not actual_base_uop:
     if id(cur) in visited:
-      return view
+      break
     visited.add(id(cur))
     
     if cur.op in MOVEMENT_OPS:
@@ -79,10 +77,46 @@ def _replay_view_from_base(base: Tensor, view: Tensor) -> Tensor:
     if len(cur.src) == 0:
       break
     cur = cur.src[0]
-  ret = base
-  for u in reversed(chain):
+  
+  return list(reversed(chain))
+
+def _apply_view_ops(target: Tensor, ops: list) -> Tensor:
+  """Apply a sequence of movement operations to a tensor."""
+  ret = target
+  for u in ops:
     ret = MOVEMENT_OPS[u.op](ret, u)
   return ret
+
+def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
+  """
+  Replay the view operations from `view` onto `target` tensor.
+  
+  This extracts the movement operations that define `view` relative to its actual base,
+  then applies those same operations to `target`. The key is that `target` may be a 
+  different tensor (e.g., an index tensor) but with the same shape as view's actual base.
+  
+  Special case: If target IS the actual base (same object), but with a different UOp
+  (e.g., after assign), we use the pre-extracted view ops instead of walking the UOp chain.
+  """
+  # Early return if view is the target
+  if view is target or view.uop is target.uop:
+    return view
+  
+  # Get the actual base of the view (if it's a view)
+  actual_base = canonical_base(view)
+  
+  # Special case: if target is the same object as actual_base, extract and apply ops
+  if target is actual_base:
+    ops = _get_view_ops(view)
+    return _apply_view_ops(target, ops)
+  
+  # If target has different shape from actual base, we can't replay
+  if target.shape != actual_base.shape:
+    return view
+  
+  # Collect movement ops from view back to its actual base and apply to target
+  ops = _get_view_ops(view)
+  return _apply_view_ops(target, ops)
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
@@ -109,9 +143,11 @@ def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
       .reshape(base.shape)
   )
   idx_view = _replay_view_from_base(idx_base, view).reshape(-1)
-  flat_base = base.reshape(base.numel())
+  flat_base = base.reshape(base.numel()).contiguous()
   flat_val  = val.reshape(-1)
   flat_base[idx_view] = flat_val
+  # Update the base tensor with the modified values
+  base.assign(flat_base.reshape(base.shape))
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
     # Ensure value has the correct dtype
     if value.dtype != target.dtype:
@@ -137,12 +173,17 @@ def _apply_inplace(target: Tensor, value: Tensor) -> None:
         return
     
     # Complex case: need to update base and replay all views
+    # IMPORTANT: Extract view operations BEFORE modifying base
+    # After base.assign(), the base's UOp changes, which would cause _get_view_ops
+    # to incorrectly include the old base's operations
+    view_ops_map = {v: _get_view_ops(v) for v in views}
+    
     _view_write(base, target, value)
-    target.replace(_replay_view_from_base(base, target))
+    
+    # After writing to base via assign, the base's UOp has changed
+    # We need to update all views to reference the new base UOp
     for v in views:
-        if v is target:
-            continue
-        v.replace(_replay_view_from_base(base, v))
+        v.replace(_apply_view_ops(base, view_ops_map[v]))
 
 def wrap_view_op(fn):
   def _wrap(*args,**kwargs):
