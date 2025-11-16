@@ -833,8 +833,4 @@ def diagonal(self, offset=0, dim1=0, dim2=1):
   return self.reshape(*batch_shape, m*n).pad(tuple((0,0) for _ in batch_shape) + ((0, diag_len),)).reshape(*batch_shape, diag_len, n+1)[..., :, 0]
 
 # @torch.library.impl("aten::diagonal_backward", "privateuseone")
-# def diagonal_backward(grad_out, input_sizes, offset, dim1, dim2):
-#   # TODO: support batched diagonal_backward for multi-dimensional tensors (currently only works for 2D)
-#   if offset != 0 or dim1 != 0 or dim2 != 1: raise NotImplementedError(f"diagonal_backward with {offset=}, {dim1=}, {dim2=} not implemented")
-#   n = min(input_sizes[0], input_sizes[1])
-#   return wrap(unwrap(grad_out).diag().pad(((0, max(0, input_sizes[0]-n)), (0, max(0, input_sizes[1]-n)))))
+
