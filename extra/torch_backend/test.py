@@ -790,7 +790,6 @@ class TestKernelFusionRegression(unittest.TestCase):
         return torch.nn.functional.relu(conv(x))
     self._check_kernel_count(fn, 9)
 
-
   def test_batchnorm_fusion(self):
     def fn():
       x = torch.randn(2, 3, 16, 16, device=device)
@@ -820,6 +819,61 @@ class TestKernelFusionRegression(unittest.TestCase):
       x = torch.randn(1, 8, 16, 16, device=device)
       return torch.nn.functional.max_pool2d(x * 2.0, 2)
     self._check_kernel_count(fn, 6)
+
+  def test_residual_add_relu_fusion(self):
+    def fn():
+      x = torch.randn(1, 8, 16, 16, device=device)
+      identity = torch.randn(1, 8, 16, 16, device=device)
+      out = x + identity
+      return torch.nn.functional.relu(out)
+    self._check_kernel_count(fn, 8)
+
+  def test_inplace_add_relu_fusion(self):
+    def fn():
+      x = torch.randn(1, 16, 32, 32, device=device)
+      y = torch.randn(1, 16, 32, 32, device=device)
+      x += y
+      return torch.nn.functional.relu(x)
+    self._check_kernel_count(fn, 8)
+
+  def test_conv_bn_add_relu_fusion(self):
+    def fn():
+      x = torch.randn(1, 8, 16, 16, device=device)
+      identity = torch.randn(1, 8, 16, 16, device=device)
+      conv = torch.nn.Conv2d(8, 8, 3, padding=1, bias=False).to(device)
+      bn = torch.nn.BatchNorm2d(8).to(device)
+      bn.eval()
+      with torch.no_grad():
+        out = bn(conv(x))
+        out += identity  # Residual connection
+        return torch.nn.functional.relu(out)
+    self._check_kernel_count(fn, 23)
+
+  def test_multiple_inplace_ops_fusion(self):
+    def fn():
+      x = torch.randn(64, 64, device=device)
+      x += 1.0
+      x *= 2.0
+      return torch.nn.functional.relu(x)
+    self._check_kernel_count(fn, 6)
+
+  def test_view_inplace_no_fusion_break(self):
+    def fn():
+      x = torch.randn(4, 64, device=device)
+      view = x[1:3]
+      view += 1.0    # Inplace on view should use _apply_inplace
+      return x.sum()
+    self._check_kernel_count(fn, 8)
+
+  def test_batchnorm_running_stats_update(self):
+    """Test that batchnorm running stats update correctly without breaking fusion"""
+    def fn():
+      x = torch.randn(2, 8, 8, 8, device=device)
+      bn = torch.nn.BatchNorm2d(8).to(device)
+      bn.train()
+      with torch.no_grad():
+        return bn(x)
+    self._check_kernel_count(fn, 16)
 
 # class TestKernelRegression(unittest.TestCase):
   

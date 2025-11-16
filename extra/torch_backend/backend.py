@@ -266,64 +266,12 @@ for i in [
 def index_tensor(x, y):
   return wrap(unwrap(x)[[unwrap(_y.to(x.device)) if _y is not None else slice(None) for _y in y]])
 
-@torch.library.impl("aten::zero_", "privateuseone")
-@inplace_fn("x")
-def zero_(x):
-  if TORCH_DEBUG: print(f"zero_ {x.shape}")
-  tt = unwrap(x)
-  _apply_inplace(tt, tt.zeros_like())
-  return wrap(tt)
-
-@torch.library.impl("aten::fill_.Scalar", "privateuseone")
-@inplace_fn("x")
-def fill_scalar(x, y):
-  if TORCH_DEBUG: print(f"fill_.Scalar {x.shape} {y}")
-  tt = unwrap(x)
-  _apply_inplace(tt, tt.full_like(y))
-  return wrap(tt)
-
-@torch.library.impl("aten::add_.Tensor", "privateuseone")
-@inplace_fn("self")
-def add_tensor_(self, other, alpha: float = 1.0):
-  self_t = unwrap(self)
-  other_t = unwrap(other) if isinstance(other, torch.Tensor) else Tensor(other, device=self_t.device, dtype=self_t.dtype)
-  # For non-views, replace UOp directly to allow fusion
-  if not is_view(self_t):
-    self_t.replace(self_t + other_t * alpha)
-  else:
-    _apply_inplace(self_t, self_t + other_t * alpha)
-  return wrap(self_t)
-
-@torch.library.impl("aten::add_.Scalar", "privateuseone")
-@inplace_fn("self")
-def add_scalar_(self, other, alpha: float = 1.0):
-  self_t = unwrap(self)
-  if not is_view(self_t):
-    self_t.replace(self_t + other * alpha)
-  else:
-    _apply_inplace(self_t, self_t + other * alpha)
-  return wrap(self_t)
-
-@torch.library.impl("aten::mul_.Tensor", "privateuseone")
-@inplace_fn("self")
-def mul_tensor_(self, other):
-  self_t = unwrap(self)
-  other_t = unwrap(other) if isinstance(other, torch.Tensor) else Tensor(other, device=self_t.device, dtype=self_t.dtype)
-  if not is_view(self_t):
-    self_t.replace(self_t * other_t)
-  else:
-    _apply_inplace(self_t, self_t * other_t)
-  return wrap(self_t)
-
-@torch.library.impl("aten::mul_.Scalar", "privateuseone")
-@inplace_fn("self")
-def mul_scalar_(self, other):
-  self_t = unwrap(self)
-  if not is_view(self_t):
-    self_t.replace(self_t * other)
-  else:
-    _apply_inplace(self_t, self_t * other)
-  return wrap(self_t)
+# Helper for inplace operations that use replace for non-views
+def _inplace_op(t, new_value):
+  # t is already unwrapped (tinygrad Tensor) when called from wrap_fxn lambdas
+  if not is_view(t): t.replace(new_value)
+  else: _apply_inplace(t, new_value)
+  return t
 
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
 def _local_scalar_dense(tensor): return unwrap(tensor).item()
@@ -746,6 +694,13 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.__ilshift__.Scalar": inplace_fn("x")(lambda x,y: x.assign(x*(2**y))),
   "aten.__rshift__.Scalar": lambda x,y: x//(2**y),
   "aten.__irshift__.Scalar": inplace_fn("x")(lambda x,y: x.assign(x//(2**y))),
+  # inplace ops using replace for fusion
+  "aten.zero_": inplace_fn("x")(lambda x: _inplace_op(x, x.zeros_like())),
+  "aten.fill_.Scalar": inplace_fn("x")(lambda x, y: _inplace_op(x, x.full_like(y))),
+  "aten.add_.Tensor": inplace_fn("self")(lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)),
+  "aten.add_.Scalar": inplace_fn("self")(lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)),
+  "aten.mul_.Tensor": inplace_fn("self")(lambda self, other: _inplace_op(self, self * other)),
+  "aten.mul_.Scalar": inplace_fn("self")(lambda self, other: _inplace_op(self, self * other)),
   # relu doesn't have an out form?
   "aten.relu": Tensor.relu,
   "aten.relu_": inplace_fn("x")(lambda x: x.assign(x.relu())),
