@@ -54,11 +54,24 @@ def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
 
+
+
 def _replay_view_from_base(base: Tensor, view: Tensor) -> Tensor:
+  # Early return if view is already the base or has same UOp
+  if view is base or view.uop is base.uop:
+    return view
+  
   chain: list = []
   cur = view.uop
   base_uop = base.uop
+  visited = set()
+  
   while cur is not base_uop:
+    # Prevent infinite loops
+    if id(cur) in visited:
+      return view
+    visited.add(id(cur))
+    
     if cur.op in MOVEMENT_OPS:
       chain.append(cur)
       cur = cur.src[0]
@@ -67,33 +80,70 @@ def _replay_view_from_base(base: Tensor, view: Tensor) -> Tensor:
       break
     cur = cur.src[0]
   ret = base
-  try:
-    for u in reversed(chain):
-      ret = MOVEMENT_OPS[u.op](ret, u)
-  except Exception as e:
-    print("replay error", base.shape, view.shape, [(u.op, getattr(u, 'arg', None), getattr(u, 'shape', None)) for u in reversed(chain)])
-    raise
+  for u in reversed(chain):
+    ret = MOVEMENT_OPS[u.op](ret, u)
   return ret
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
   val = value.cast(tgt_dtype) if value.dtype != tgt_dtype else value
+  
+  # Fast path: if view matches base exactly, just assign
   if view is base and view.shape == val.shape:
     base.assign(val)
     return
-  idx_base = Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32).reshape(base.shape)
+  
+  # Another fast path: if shapes match and view has no actual view operations
+  if view.shape == base.shape and view.uop is base.uop:
+    base.assign(val)
+    return
+  
+  # Fast path 3: if shapes match even if uops differ (same logical tensor)
+  if view.shape == base.shape:
+    base.assign(val)
+    return
+  
+  # Slow path: need to use indexing for actual view updates
+  idx_base = (
+      Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32)
+      .reshape(base.shape)
+  )
   idx_view = _replay_view_from_base(idx_base, view).reshape(-1)
   flat_base = base.reshape(base.numel())
-  flat_val = val.reshape(-1)
+  flat_val  = val.reshape(-1)
   flat_base[idx_view] = flat_val
-
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
-  base = canonical_base(target)
-  _view_write(base, target, value)
-  target.replace(_replay_view_from_base(base, target))
-  for v in derived_views(base):
-    if v is target: continue
-    v.replace(_replay_view_from_base(base, v))
+    # Ensure value has the correct dtype
+    if value.dtype != target.dtype:
+        value = value.cast(target.dtype)
+
+    # Fast path: if target is realized or not a view, just assign
+    if target.uop.is_realized or not is_view(target):
+        target.assign(value)
+        return
+
+    base = canonical_base(target)
+    
+    # If target is the same as base (no actual view operation), just assign
+    if target is base or target.uop is base.uop:
+        target.assign(value)
+        return
+    
+    # Check if there are any derived views to update
+    views = derived_views(base)
+    if not views:
+        # No other views, can just assign to target directly
+        target.assign(value)
+        return
+    
+    # Complex case: need to update base and replay all views
+    _view_write(base, target, value)
+    target.replace(_replay_view_from_base(base, target))
+    for v in views:
+        if v is target:
+            continue
+        v.replace(_replay_view_from_base(base, v))
+
 def wrap_view_op(fn):
   def _wrap(*args,**kwargs):
     args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
@@ -286,7 +336,7 @@ def is_contiguous_strides(base:Tensor, size, stride, storage_offset):
 @wrap_view_op
 def _as_strided(tensor:Tensor, size, stride, storage_offset=0):
   # use movement ops for simple cases (view), gather for complex strides (copy)
-  base = getattr(tensor, "_as_strided_base", canonical_base(tensor)).flatten()
+  base = canonical_base(tensor).flatten()
   if is_contiguous_strides(base, size, stride, storage_offset): result = as_strided_view(base, size, stride, storage_offset)
   else: result = as_strided_gather(base, size, stride, storage_offset)
   result._as_strided_base = base
@@ -466,10 +516,16 @@ def copy_(self, src, non_blocking=False):
   if src.is_tiny and self.is_tiny:
     to_device = _from_torch_device(self.device)
     src_t, dest_t = unwrap(src), unwrap(self)
-    if not is_view(dest_t): dest_t = dest_t.realize()
+    # Realize non-views first to materialize them
+    if not is_view(dest_t): 
+      dest_t = dest_t.realize()
     if TORCH_DEBUG:
-      print("copy_ tiny->tiny", dest_t.shape, "from", src_t.shape, "is_view", is_view(dest_t))
-    _apply_inplace(dest_t, src_t.cast(cast_dtype).to(to_device))
+      print("copy_ tiny->tiny", dest_t.shape, "from", src_t.shape, "is_view", is_view(dest_t), "is_realized", dest_t.uop.is_realized)
+    # After realize, just assign directly - don't use _apply_inplace for realized tensors
+    if dest_t.uop.is_realized:
+      dest_t.assign(src_t.cast(cast_dtype).to(to_device))
+    else:
+      _apply_inplace(dest_t, src_t.cast(cast_dtype).to(to_device))
     return self
   elif src.is_tiny and self.is_cpu:
     self.resize_(src.numel()).resize_(src.shape)
@@ -646,9 +702,14 @@ tiny_backend_out = {**{f"aten.{x}.out":getattr(Tensor,x) for x in simple_tensor_
   "aten.prod.int_out": Tensor.prod,
   "aten.scatter.src_out": Tensor.scatter,
   # NOTE: axis=[] in torch means all, change tinygrad?
-  "aten.sum.IntList_out": lambda self,axis,keepdim=False,dtype=None:
-    self.sum(axis if axis is None or len(axis) else None, keepdim,
-                         dtype = _from_torch_dtype(dtype) if dtype is not None else None),
+  "aten.sum.IntList_out": lambda self, dim, keepdim=False, dtype=None: (
+      self.sum(
+          # torch semantics: dim=None or dim == [] -> reduce over all dims
+          None if (dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0)) else dim,
+          keepdim=keepdim,
+          dtype=_from_torch_dtype(dtype) if dtype is not None else None,
+      )
+  ),
 }}
 
 # we add the "out" here
