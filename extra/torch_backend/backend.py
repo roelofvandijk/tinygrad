@@ -52,19 +52,13 @@ aten = torch.ops.aten
 def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
+def _get_view_ops(view):
+    return getattr(view, "_view_ops", [])
 
-def _get_view_ops(view: Tensor) -> list:
-  actual_base_uop = canonical_base(view).uop
-  ops, cur = [], view.uop
-  while cur is not actual_base_uop and len(cur.src) > 0:
-    if cur.op in MOVEMENT_OPS: ops.append(cur)
-    cur = cur.src[0]
-  return list(reversed(ops))
-
-def _apply_view_ops(target: Tensor, ops: list) -> Tensor:
-  for u in ops: target = MOVEMENT_OPS[u.op](target, u)
-  return target
-
+def _apply_view_ops(target, ops):
+    for fn, args, kwargs in ops:
+        target = fn(target, *args, **kwargs)
+    return target
 def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
   if view is target or view.uop is target.uop: return view
   actual_base = canonical_base(view)
@@ -102,17 +96,62 @@ def _apply_inplace(target: Tensor, value: Tensor) -> None:
     v.replace(_apply_view_ops(base, view_ops_map[v]))
 
 def wrap_view_op(fn):
-  def _wrap(*args,**kwargs):
-    args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
-    kwargs = {k:unwrap(v) if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()}
-    ret = fn(*args,**kwargs)
-    if ret is None: raise NotImplementedError("view operation returned None")
-    ret._view_base = base = canonical_base(args[0])
-    if not hasattr(base, "_views"): base._views = set()
-    base._views.add(weakref.ref(ret))
-    return wrap(ret)
-  return _wrap
+  """
+  Decorator for view-like ops (reshape, expand, transpose, etc).
 
+  Responsibilities:
+  - unwrap torch.Tensors -> tinygrad.Tensor before calling `fn`
+  - call the tinygrad view op (`fn`)
+  - set up view metadata:
+      * _view_base      : canonical base tensor
+      * _view_base_uop  : base.uop (for sanity / debugging)
+      * base._views     : weakrefs to all derived views
+      * _view_ops       : sequence of view operations from base to this view
+  - wrap the tinygrad.Tensor result back to a torch.Tensor
+  """
+  @functools.wraps(fn)
+  def _wrap(*args, **kwargs):
+    # unwrap any torch.Tensor arguments to tinygrad.Tensor
+    t_args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
+    t_kwargs = {
+      k: unwrap(v) if isinstance(v, torch.Tensor) else v
+      for k, v in kwargs.items()
+    }
+
+    # run the actual tinygrad view op
+    ret = fn(*t_args, **t_kwargs)
+    if ret is None:
+      raise NotImplementedError("view operation returned None")
+    if not isinstance(ret, Tensor):
+      raise RuntimeError(
+        f"view operation {fn.__name__} must return a tinygrad.Tensor, got {type(ret)}"
+      )
+
+    # canonical base of this view chain
+    base = canonical_base(t_args[0])
+
+    # mark this tensor as a view of `base`
+    ret._view_base = base
+    ret._view_base_uop = base.uop
+
+    # track all derived views from this base
+    if not hasattr(base, "_views"):
+      base._views = set()
+    base._views.add(weakref.ref(ret))
+
+    # track the *logical* view chain for this tensor:
+    #  - parent_ops: view ops from base -> parent
+    #  - op       : this new view step
+    parent = t_args[0]
+    parent_ops = list(getattr(parent, "_view_ops", []))
+    op = (fn, t_args[1:], t_kwargs)   # (view_fn, args_without_self, kwargs)
+    parent_ops.append(op)
+    ret._view_ops = parent_ops
+
+    # finally wrap tinygrad.Tensor -> torch.Tensor
+    return wrap(ret)
+
+  return _wrap
 view_ops = {
   "aten.view": Tensor.reshape,
   "aten._unsafe_view": Tensor.reshape,  # when are views unsafe, and do we care?
@@ -129,16 +168,6 @@ view_ops = {
   }
 
 for k,v in view_ops.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_view_op(v))
-
-# TODO do we want Ops.MULTI here?
-MOVEMENT_OPS = {
-  Ops.RESHAPE: lambda t, u: t.reshape(u.shape),
-  Ops.EXPAND: lambda t, u: t.expand(u.shape),
-  Ops.SHRINK: lambda t, u: t.shrink(u.marg),
-  Ops.PAD: lambda t, u: t.pad(u.marg),
-  Ops.PERMUTE: lambda t, u: t.permute(u.marg),
-  Ops.FLIP: lambda t, u: t.flip(u.marg),
-}
 
 
 # *** bad functions on CPU ***
