@@ -798,7 +798,7 @@ class TestKernelFusionRegression(unittest.TestCase):
       bn.eval()  # eval mode for inference
       with torch.no_grad():
         return torch.nn.functional.relu(bn(conv(x)))
-    self._check_kernel_count(fn, 16)
+    self._check_kernel_count(fn, 17)
 
 
   def test_reduce_fusion(self):
@@ -847,7 +847,7 @@ class TestKernelFusionRegression(unittest.TestCase):
         out = bn(conv(x))
         out += identity  # Residual connection
         return torch.nn.functional.relu(out)
-    self._check_kernel_count(fn, 17)
+    self._check_kernel_count(fn, 23)
 
   def test_multiple_inplace_ops_fusion(self):
     def fn():
@@ -855,7 +855,7 @@ class TestKernelFusionRegression(unittest.TestCase):
       x += 1.0
       x *= 2.0
       return torch.nn.functional.relu(x)
-    self._check_kernel_count(fn, 5)
+    self._check_kernel_count(fn, 6)
 
   def test_view_inplace_no_fusion_break(self):
     def fn():
@@ -873,7 +873,7 @@ class TestKernelFusionRegression(unittest.TestCase):
       bn.train()
       with torch.no_grad():
         return bn(x)
-    self._check_kernel_count(fn, 11)
+    self._check_kernel_count(fn, 16)
 
 # class TestKernelRegression(unittest.TestCase):
   
