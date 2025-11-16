@@ -25,12 +25,11 @@ def calculate_storage_offset(x: Tensor) -> int:
   offset = 0
   for u in x.uop.toposort():
     if u.op == Ops.SHRINK:
-      u_strides = strides_for_shape(u.src[0].shape)
-      for i, (start, _) in enumerate(u.marg): offset += start * u_strides[i]
+      for i, (start, _) in enumerate(u.marg): offset += start * strides_for_shape(u.src[0].shape)[i]
   return offset
 
 def wrap(x: Tensor) -> torch.Tensor:
-  x._strides = strides_for_shape(x.shape) # always recalculate
+  x._strides = strides_for_shape(x.shape)
   if not hasattr(x, '_storage_offset'): x._storage_offset = calculate_storage_offset(x)
   return mod.wrap(x, _to_torch_dtype(x.dtype), _to_torch_device(x.device).index)
 
@@ -56,18 +55,15 @@ def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", s
 
 def _get_view_ops(view: Tensor) -> list:
   actual_base_uop = canonical_base(view).uop
-  chain, cur, visited = [], view.uop, set()
-  while cur is not actual_base_uop:
-    if id(cur) in visited or len(cur.src) == 0: break
-    visited.add(id(cur))
-    if cur.op in MOVEMENT_OPS: chain.append(cur)
+  ops, cur = [], view.uop
+  while cur is not actual_base_uop and len(cur.src) > 0:
+    if cur.op in MOVEMENT_OPS: ops.append(cur)
     cur = cur.src[0]
-  return list(reversed(chain))
+  return list(reversed(ops))
 
 def _apply_view_ops(target: Tensor, ops: list) -> Tensor:
-  ret = target
-  for u in ops: ret = MOVEMENT_OPS[u.op](ret, u)
-  return ret
+  for u in ops: target = MOVEMENT_OPS[u.op](target, u)
+  return target
 
 def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
   if view is target or view.uop is target.uop: return view
@@ -145,19 +141,9 @@ MOVEMENT_OPS = {
 }
 
 
-def inplace_fn(outvars: str|list[str]):
-  if type(outvars) is str: outvars = [outvars]
-  def decorator(fn):
-    def wrapper(*args, **kwargs):
-      ret = fn(*args, **kwargs)
-      return ret
-    return wrapper
-  return decorator
-
 # *** bad functions on CPU ***
 
 @torch.library.impl("aten::_index_put_impl_", "privateuseone")
-@inplace_fn("self")
 def _index_put_impl_(self, indices, values, accumulate=False, unsafe=False):
   # TODO: move to tinygrad
   ret = aten._index_put_impl_(self.cpu(), [x.cpu() if isinstance(x, torch.Tensor) else None for x in indices], values.cpu(), accumulate, unsafe).to(self.device)
@@ -224,9 +210,8 @@ def _local_scalar_dense(tensor): return unwrap(tensor).item()
 
 def as_strided_view(base:Tensor, size, stride, storage_offset):
   non_broadcast_size = tuple(s for s, st in zip(size, stride) if st != 0)
-  if all(st != 0 for st in stride): return base.shrink(((storage_offset, storage_offset + prod(size)),)).reshape(size)  # no broadcast
-  return base.shrink(((storage_offset, storage_offset + prod(non_broadcast_size)),)) \
-             .reshape(tuple(s if st != 0 else 1 for s, st in zip(size, stride))).expand(size)
+  if all(st != 0 for st in stride): return base.shrink(((storage_offset, storage_offset + prod(size)),)).reshape(size)
+  return base.shrink(((storage_offset, storage_offset + prod(non_broadcast_size)),)).reshape(tuple(s if st != 0 else 1 for s, st in zip(size, stride))).expand(size)
 
 def as_strided_gather(base:Tensor, size, stride, storage_offset):
   indices = Tensor.full(size, storage_offset, dtype=dtypes.int32, device=base.device)
@@ -234,18 +219,13 @@ def as_strided_gather(base:Tensor, size, stride, storage_offset):
     if st != 0: indices += (Tensor.arange(sz, device=base.device, dtype=dtypes.int32) * st).reshape((1,) * dim + (sz,) + (1,) * (len(size) - dim - 1))
   return base[indices.flatten()].reshape(size)
 
-def is_contiguous_strides(base:Tensor, size, stride, storage_offset):
-  # check if stride pattern matches row-major layout (can use pure movement ops, stay view)
-  non_broadcast_stride = tuple(st for st in stride if st != 0)
-  non_broadcast_size = tuple(s for s, st in zip(size, stride) if st != 0)
-  return non_broadcast_stride == strides_for_shape(non_broadcast_size) and storage_offset + prod(size) <= base.shape[0]
-
 @wrap_view_op
 def _as_strided(tensor:Tensor, size, stride, storage_offset=0):
-  # use movement ops for simple cases (view), gather for complex strides (copy)
   base = canonical_base(tensor).flatten()
-  if is_contiguous_strides(base, size, stride, storage_offset): result = as_strided_view(base, size, stride, storage_offset)
-  else: result = as_strided_gather(base, size, stride, storage_offset)
+  non_broadcast_stride = tuple(st for st in stride if st != 0)
+  non_broadcast_size = tuple(s for s, st in zip(size, stride) if st != 0)
+  is_contiguous = non_broadcast_stride == strides_for_shape(non_broadcast_size) and storage_offset + prod(size) <= base.shape[0]
+  result = as_strided_view(base, size, stride, storage_offset) if is_contiguous else as_strided_gather(base, size, stride, storage_offset)
   result._as_strided_base = base
   return result
 
@@ -386,7 +366,6 @@ for i,pre in enumerate(["", "bi", "tri"]):
   torch.library.impl(f"aten::_upsample_nearest_exact{i+1}d", "privateuseone")(functools.partial(upsample, mode="nearest-exact"))
 
 @torch.library.impl("aten::scatter_add.out", "privateuseone")
-@inplace_fn("out")
 def scatter_add(self, dim, index, src, out):
   self, index, src, out = unwrap(self), unwrap(index), unwrap(src), unwrap(out)
   if self.shape == ():
@@ -441,14 +420,12 @@ def copy_(self, src, non_blocking=False):
 
 
 @torch.library.impl("aten::cat.out", "privateuseone")
-@inplace_fn("out")
 def cat_out(tensors, dim=0, out=None):
   out_t = unwrap(out)
   _apply_inplace(out_t, Tensor.cat(*[unwrap(x) for x in tensors], dim=dim))
   return wrap(out_t)
 
 @torch.library.impl("aten::topk.values", "privateuseone")
-@inplace_fn(["values", "indices"])
 def topk_values(input, k, dim=None, largest=True, sorted=True, values=None, indices=None):
   out_values, out_indices = unwrap(input).topk(k, dim if dim is not None else -1, largest, sorted)
   val_t, idx_t = unwrap(values), unwrap(indices)
@@ -457,7 +434,6 @@ def topk_values(input, k, dim=None, largest=True, sorted=True, values=None, indi
   return wrap(out_values), wrap(out_indices)
 
 @torch.library.impl("aten::sort.values_stable", "privateuseone")
-@inplace_fn(["values", "indices"])
 def sort_values(input, dim=-1, descending=False, stable=True, values=None, indices=None):
   out_values, out_indices = unwrap(input).sort(dim, descending)
   val_t, idx_t = unwrap(values), unwrap(indices)
@@ -615,7 +591,6 @@ tiny_backend_out = {**{f"aten.{x}.out":getattr(Tensor,x) for x in simple_tensor_
 
 # we add the "out" here
 def wrap_out(f):
-  @inplace_fn("out")
   def _wrap_out(*args, **kwargs):
     out = kwargs.pop('out')
     assigned = f(*args, **kwargs)
@@ -634,22 +609,22 @@ def _fill_tensor_tensor(self: Tensor, value: Tensor) -> Tensor:
 tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.remainder.Scalar_Tensor": lambda x,y: x%y,
   "aten.floor_divide": lambda x,y: x//y,
-  "aten.floor_divide_.Tensor": inplace_fn("x")(lambda x,y: x.assign(x//y)),
+  "aten.floor_divide_.Tensor": lambda x,y: x.assign(x//y),
   # TODO: use tinygrad methods, but they require x to be unsigned
   "aten.__lshift__.Scalar": lambda x,y: x*(2**y),
-  "aten.__ilshift__.Scalar": inplace_fn("x")(lambda x,y: x.assign(x*(2**y))),
+  "aten.__ilshift__.Scalar": lambda x,y: x.assign(x*(2**y)),
   "aten.__rshift__.Scalar": lambda x,y: x//(2**y),
-  "aten.__irshift__.Scalar": inplace_fn("x")(lambda x,y: x.assign(x//(2**y))),
+  "aten.__irshift__.Scalar": lambda x,y: x.assign(x//(2**y)),
   # inplace ops using replace for fusion
-  "aten.zero_": inplace_fn("x")(lambda x: _inplace_op(x, x.zeros_like())),
-  "aten.fill_.Scalar": inplace_fn("x")(lambda x, y: _inplace_op(x, x.full_like(y))),
-  "aten.add_.Tensor": inplace_fn("self")(lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)),
-  "aten.add_.Scalar": inplace_fn("self")(lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)),
-  "aten.mul_.Tensor": inplace_fn("self")(lambda self, other: _inplace_op(self, self * other)),
-  "aten.mul_.Scalar": inplace_fn("self")(lambda self, other: _inplace_op(self, self * other)),
+  "aten.zero_": lambda x: _inplace_op(x, x.zeros_like()),
+  "aten.fill_.Scalar": lambda x, y: _inplace_op(x, x.full_like(y)),
+  "aten.add_.Tensor": lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha),
+  "aten.add_.Scalar": lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha),
+  "aten.mul_.Tensor": lambda self, other: _inplace_op(self, self * other),
+  "aten.mul_.Scalar": lambda self, other: _inplace_op(self, self * other),
   # relu doesn't have an out form?
   "aten.relu": Tensor.relu,
-  "aten.relu_": inplace_fn("x")(lambda x: x.assign(x.relu())),
+  "aten.relu_": lambda x: x.assign(x.relu()),
   "aten.mean": Tensor.mean,
   "aten.mean.dim": Tensor.mean,
   "aten.min": Tensor.min,
@@ -670,19 +645,17 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.repeat": Tensor.repeat,
   "aten._softmax": lambda self,dim,half_to_float: self.softmax(dim),
   "aten._log_softmax": lambda self,dim,half_to_float: self.log_softmax(dim),
-  "aten.random_": inplace_fn("self")(lambda self:
-    self.assign(Tensor.randint(*self.shape, low=dtypes.min(self.dtype), high=dtypes.max(self.dtype), device=self.device, dtype=self.dtype))),
-  "aten.random_.from": inplace_fn("self")(lambda self, from_, to:
-    self.assign(Tensor.randint(*self.shape, low=from_, high=to, device=self.device, dtype=self.dtype))),
-  "aten.uniform_": inplace_fn("self")(lambda self, low=0, high=1: self.assign(Tensor.uniform(*self.shape, low=low, high=high, dtype=self.dtype))),
-  "aten.normal_": inplace_fn("self")(lambda self, mean=0, std=1: self.assign(Tensor.normal(*self.shape, mean=mean, std=std, dtype=self.dtype))),
+  "aten.random_": lambda self: self.assign(Tensor.randint(*self.shape, low=dtypes.min(self.dtype), high=dtypes.max(self.dtype), device=self.device, dtype=self.dtype)),
+  "aten.random_.from": lambda self, from_, to: self.assign(Tensor.randint(*self.shape, low=from_, high=to, device=self.device, dtype=self.dtype)),
+  "aten.uniform_": lambda self, low=0, high=1: self.assign(Tensor.uniform(*self.shape, low=low, high=high, dtype=self.dtype)),
+  "aten.normal_": lambda self, mean=0, std=1: self.assign(Tensor.normal(*self.shape, mean=mean, std=std, dtype=self.dtype)),
   # these don't work in out form, they have size 0
   "aten.abs": Tensor.abs,
   "aten.logical_not": Tensor.logical_not,
-  "aten.logical_or_": inplace_fn("x")(lambda x, y: x.assign(x | y)),
+  "aten.logical_or_": lambda x, y: x.assign(x | y),
   "aten.multinomial": Tensor.multinomial,
-  "aten.masked_fill_.Scalar": inplace_fn("self")(lambda self, mask, value: self.assign(self.masked_fill(mask, value))),
-  "aten.masked_fill_.Tensor": inplace_fn("self")(lambda self, mask, value: self.assign(self.masked_fill(mask, value))),
+  "aten.masked_fill_.Scalar": lambda self, mask, value: self.assign(self.masked_fill(mask, value)),
+  "aten.masked_fill_.Tensor": lambda self, mask, value: self.assign(self.masked_fill(mask, value)),
   "aten.masked_fill.Scalar": Tensor.masked_fill,
   "aten.masked_fill.Tensor": Tensor.masked_fill,
   "aten.masked_select": Tensor.masked_select,
@@ -696,7 +669,7 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.asinh": Tensor.asinh,
   "aten.mul": Tensor.mul,
   "aten.atanh": Tensor.atanh,
-  "aten.fill_.Tensor": inplace_fn("self")(_fill_tensor_tensor),
+  "aten.fill_.Tensor": _fill_tensor_tensor,
   "aten.flip": Tensor.flip,
   "aten.scatter_reduce.two": Tensor.scatter_reduce,
   "aten.squeeze_.dim": lambda self, dim: self.replace(self.squeeze(dim), allow_shape_mismatch=True), # TODO: inplace view op, here?
