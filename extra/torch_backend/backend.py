@@ -707,11 +707,6 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.unfold": Tensor.unfold,
 }}
 
-def _wrap_output(out):
-  if isinstance(out, Tensor): return wrap(out)
-  elif isinstance(out, tuple): return tuple(wrap(x) for x in out)
-  else: raise RuntimeError(f"unknown output type {type(out)}")
-
 def wrap_fxn(k,f):
   def nf(*args, **kwargs):
     if TORCH_DEBUG:
@@ -719,7 +714,10 @@ def wrap_fxn(k,f):
                           {k:v.shape if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()})
     args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
     kwargs = {k:unwrap(v) if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()}
-    return _wrap_output(f(*args, **kwargs))
+    out = f(*args, **kwargs)
+    if isinstance(out, Tensor): return wrap(out)
+    elif isinstance(out, tuple): return tuple(wrap(x) for x in out)
+    else: raise RuntimeError(f"unknown output type {type(out)}")
   return nf
 
 for k,v in tiny_backend.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_fxn(k,v))
@@ -731,7 +729,6 @@ if TORCH_DEBUG:
   from torch.utils._python_dispatch import TorchDispatchMode
   class DispatchLog(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-      #print(f"Dispatch Log: {func}(*{args}, **{kwargs})")
       print(f"Dispatch Log: {func}")
       return func(*args, **(kwargs or {}))
   (_dispatch_log:=DispatchLog()).__enter__() # NOTE: must be kept alive
