@@ -801,24 +801,23 @@ def native_batch_norm_backward(grad_out, input, weight, running_mean, running_va
 
 # still ugly -> is there a better way?
 # aten::pad_circular1d does not exist
-# aten::_pad_circular used under the hood but registering that doesn't work either
 # only place that needs an explicit AutogradPrivateUse1 registration, this can't be the best way
-class CircularPad(torch.autograd.Function):
+class _PadCircular(torch.autograd.Function):
   @staticmethod
-  def forward(ctx, input, pad):
+  def forward(ctx, input, padding):
     ctx.save_for_backward(input)
-    ctx.pad = pad
-    return wrap(unwrap(input).pad(pad, mode="circular"))
+    ctx.padding = padding
+    return pad_forward(input, padding, mode="circular")
   @staticmethod
   def backward(ctx, grad_output):
     input, = ctx.saved_tensors
-    return wrap(unwrap(input).pad(ctx.pad, mode="circular").gradient(unwrap(input), gradient=unwrap(grad_output))[0]), None
+    return pad_backward(grad_output, input, ctx.padding, mode="circular"), None
 
 @torch.library.impl("aten::_pad_circular", "privateuseone")
-def _pad_circular(self, padding): return CircularPad.apply(self, padding)
+def _pad_circular(self, padding): return _PadCircular.apply(self, padding)
 
 @torch.library.impl("aten::_pad_circular", "AutogradPrivateUse1")
-def _pad_circular_autograd(self, padding): return CircularPad.apply(self, padding)
+def _pad_circular_autograd(self, padding): return _PadCircular.apply(self, padding)
 
 # this is Tensor.diagonal, but extended for batches and non-square
 @torch.library.impl("aten::diagonal", "privateuseone")
