@@ -1,3 +1,163 @@
+# Kernel Fusion Optimization in Torch Backend
+
+## Problem: Inplace Operations Breaking Fusion
+
+The torch backend was preventing kernel fusion by forcing premature execution of operations through `.realize()` and `.assign()` calls. This caused operations that should fuse together (like batchnorm + ReLU, or residual add + ReLU) to execute as separate kernels.
+
+### Root Cause
+
+PyTorch uses inplace operations extensively (e.g., `+=`, `*=`, `.zero_()`, `.fill_()`). The naive implementation of these operations used `.assign()`, which creates `UOp.ASSIGN` (now `Ops.AFTER`) nodes. These ASSIGN operations become kernel boundaries in tinygrad's scheduler, preventing fusion with subsequent operations.
+
+**Key insight**: ASSIGN operations force synchronization points because they write to a buffer that subsequent operations read from. The scheduler must execute the ASSIGN kernel before any kernel that reads its output.
+
+### Example: ResNet Residual Block
+
+```python
+# Before optimization - 3 kernels:
+out = conv_bn(x)      # Kernel 1: conv+bn fused
+out += identity       # Kernel 2: add (uses .assign())
+out = relu(out)       # Kernel 3: relu (separate!)
+
+# After optimization - 2 kernels:
+out = conv_bn(x)      # Kernel 1: conv+bn fused
+out += identity       # Uses .replace() - stays lazy!
+out = relu(out)       # Kernel 2: add+relu fused!
+```
+
+## Solution: Use `.replace()` for Non-View Tensors
+
+The fix is to use `.replace()` instead of `.assign()` for **non-view tensors** in inplace operations:
+
+```python
+# Before (creates fusion barrier):
+def add_tensor_(self, other, alpha=1.0):
+  self_t = unwrap(self)
+  _apply_inplace(self_t, self_t + other * alpha)  # Uses .assign()
+  return wrap(self_t)
+
+# After (allows fusion):
+def add_tensor_(self, other, alpha=1.0):
+  self_t = unwrap(self)
+  if not is_view(self_t):
+    self_t.replace(self_t + other * alpha)  # Replaces UOp directly
+  else:
+    _apply_inplace(self_t, self_t + other * alpha)  # Still use assign for views
+  return wrap(self_t)
+```
+
+### Why This Works
+
+- **`.replace(new_uop)`**: Updates the tensor's UOp to point to the new computation graph. The computation stays **lazy** and can fuse with subsequent operations.
+- **`.assign(value)`**: Creates an explicit write operation that must execute before anything reads from it. This is necessary for views but creates barriers for regular tensors.
+
+## Implementation
+
+### Helper Function
+
+```python
+def _inplace_op(t, new_value):
+  # t is already unwrapped (tinygrad Tensor) when called from wrap_fxn lambdas
+  if not is_view(t): t.replace(new_value)  # Fast path: allows fusion
+  else: _apply_inplace(t, new_value)        # Slow path: for views
+  return t
+```
+
+### Operations Fixed
+
+Applied to these inplace operations in `tiny_backend` dict:
+- `aten.zero_`: `lambda x: _inplace_op(x, x.zeros_like())`
+- `aten.fill_.Scalar`: `lambda x, y: _inplace_op(x, x.full_like(y))`
+- `aten.add_.Tensor`: `lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)`
+- `aten.add_.Scalar`: `lambda self, other, alpha=1.0: _inplace_op(self, self + other * alpha)`
+- `aten.mul_.Tensor`: `lambda self, other: _inplace_op(self, self * other)`
+- `aten.mul_.Scalar`: `lambda self, other: _inplace_op(self, self * other)`
+
+## Results
+
+### Before Optimization
+```
+*** METAL 231 [...] ['add', 'rsqrt', 'conv2d', 'batchnorm', 'relu']
+*** METAL 232 [...] ['add', 'rsqrt', 'conv2d', 'batchnorm', '__add__']
+*** METAL 233 [...] ['relu']  # ❌ ReLU executing separately
+```
+
+### After Optimization
+```
+*** METAL 224 [...] ['add', 'rsqrt', 'conv2d', 'batchnorm', 'relu']
+*** METAL 225 [...] ['add', 'rsqrt', 'conv2d', 'batchnorm', '__add__', 'relu']  # ✅ ReLU fused!
+```
+
+ReLU now fuses with the residual addition, reducing kernel count and improving performance.
+
+## When NOT to Apply This Optimization
+
+### 1. Views Require `.assign()`
+
+Views share underlying storage with base tensors. Using `.replace()` on a view would break the connection:
+
+```python
+x = torch.randn(10)
+y = x[5:]  # y is a view of x
+y += 1     # Must update the shared storage via .assign()
+```
+
+### 2. Running Statistics in BatchNorm
+
+```python
+# These MUST use .assign() - they're intentional side effects
+running_mean_t.assign((1 - momentum) * running_mean_t + momentum * batch_mean.detach())
+running_var_t.assign((1 - momentum) * running_var_t + momentum * batch_var.detach())
+```
+
+These are **intended** synchronization points. The running statistics need to be materialized and stored.
+
+### 3. Output Form Operations
+
+Operations like `cat.out`, `topk.values`, `sort.values` that write to pre-allocated output tensors should continue using `_apply_inplace` which internally uses `.assign()`. These are explicit user requests for in-place updates.
+
+## Understanding the Trade-offs
+
+### The Fundamental Tension
+
+- **PyTorch semantics**: Inplace operations must modify existing tensors
+- **Kernel fusion**: Requires keeping operations lazy in the computation graph
+
+### How `.replace()` Resolves This
+
+`.replace()` maintains PyTorch semantics (the tensor object still refers to the result) while keeping the computation lazy (the UOp is updated but not executed).
+
+### Scheduler Behavior
+
+In tinygrad's scheduler:
+1. `Ops.AFTER` (ASSIGN) creates edges in the kernel dependency graph
+2. Each ASSIGN becomes a potential kernel boundary
+3. Operations can only fuse if they're in the same kernel
+4. By avoiding unnecessary ASSIGN ops, we allow the scheduler to fuse more operations
+
+## Performance Impact
+
+Kernel fusion provides:
+- **Reduced kernel launches**: Lower overhead from GPU kernel invocations
+- **Better memory locality**: Intermediate results stay in registers/cache
+- **Increased arithmetic intensity**: More compute per memory access
+
+For ResNet-style architectures, the critical fusions are:
+1. Conv → BatchNorm → ReLU
+2. Residual Add → ReLU
+
+Both of these now work correctly with the optimization.
+
+## Future Improvements
+
+To get even more fusion would require:
+1. **Lazy ASSIGN scheduling**: Delay materializing ASSIGN operations until necessary
+2. **Cross-ASSIGN fusion**: Allow scheduler to fuse operations across ASSIGN boundaries when safe
+3. **Smart barrier insertion**: Only create barriers when there are actual data dependencies
+
+These would require changes to tinygrad's core scheduler, not just the torch backend.
+
+---
+
 # Deeper Architectural Changes for Better Kernel Fusion in Torch Backend
 
 ## The Core Problem
