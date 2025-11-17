@@ -74,19 +74,20 @@ def _reshape_target_shape(shape:tuple[int, ...], args) -> tuple[int, ...]|None:
     if s is None:
       if i >= len(shape): return None
       s = shape[i]
-    elif not isinstance(s, int):
-      return None
+    if not isinstance(s, int): return None
     if s == -1:
       if infer_idx != -1: return None
       infer_idx = len(new_shape)
     new_shape.append(s)
-  size = prod(shape)
-  infer_val = 1
+  total = prod(shape)
   if infer_idx != -1:
-    infer_val = size//prod(abs(x) for x in new_shape if x not in (-1, 1))
-    new_shape[infer_idx] = infer_val
-  if prod(abs(x) for x in new_shape) != size: return None
-  return tuple(abs(s) for s in new_shape)
+    known = prod(x for x in new_shape if x != -1)
+    if known == 0:
+      if total != 0: return None
+      new_shape[infer_idx] = 0
+    else: new_shape[infer_idx] = total // known
+  if prod(new_shape) != total: return None
+  return tuple(new_shape)
 
 def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> bool:
   ops = _get_view_ops(view)
@@ -122,10 +123,11 @@ def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
   val = value.cast(target.dtype) if value.dtype != target.dtype else value
   base = canonical_base(target)
-  if target.uop.is_realized or (target is base and not getattr(base, "_views", None)):
+  views = derived_views(base)
+  if target.uop.is_realized and (target is base and not views):
     target.assign(val)
     return
-  if not (views:=derived_views(base)):
+  if not views:
     target.assign(val)
     return
   view_ops_map = {v: _get_view_ops(v) for v in views}
@@ -330,6 +332,7 @@ def convolution_backward_overrideable(grad_out, input, weight, stride, padding, 
   targets = [t for t, m in zip([input_t, weight_t, bias_t], output_mask) if m]
   grads = out.gradient(*targets, gradient=grad_out_t)
   return tuple([wrap(grads.pop(0)) if m else None for m in output_mask])
+
 @torch.library.impl("aten::slice.Tensor", "privateuseone")
 @wrap_view_op
 def slice_tensor(self, dim=0, start=None, end=None, step=1):
