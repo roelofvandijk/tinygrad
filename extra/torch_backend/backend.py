@@ -6,7 +6,7 @@ import functools
 import weakref
 from tinygrad import Tensor, dtypes, Device
 from tinygrad.uop.ops import Ops
-from tinygrad.helpers import getenv, prod, strides_for_shape
+from tinygrad.helpers import getenv, prod, strides_for_shape, argfix
 import torch.lib
 TORCH_DEBUG = getenv("TORCH_DEBUG")
 import torch, pathlib, math, operator, inspect
@@ -65,12 +65,65 @@ def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
   if target.shape != actual_base.shape: return view
   return _apply_view_ops(target, _get_view_ops(view))
 
+_RESHAPE_OP = Tensor.reshape
+_IDENTITY_VIEW_OPS = {Tensor.detach}
+
+def _reshape_target_shape(current_shape:tuple[int, ...], args) -> tuple[int, ...]|None:
+  req = argfix(*args)
+  if len(req) == 0: return None
+  new_shape: list[int] = []
+  infer_idx = -1
+  for i, s in enumerate(req):
+    if s is None:
+      if i >= len(current_shape): return None
+      s = current_shape[i]
+    if not isinstance(s, int): return None
+    if s == -1:
+      if infer_idx != -1: return None
+      infer_idx = len(new_shape)
+      new_shape.append(-1)
+    else:
+      new_shape.append(s)
+  if infer_idx != -1:
+    known = prod(x for x in new_shape if x != -1)
+    if known == 0: return None
+    inferred = prod(current_shape) // known
+    new_shape[infer_idx] = inferred
+  if prod(new_shape) != prod(current_shape): return None
+  return tuple(new_shape)
+
+def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> bool:
+  ops = _get_view_ops(view)
+  if not ops: return False
+  reshape_shapes = [base.shape]
+  current_shape = base.shape
+  for fn, args, _ in ops:
+    if fn is _RESHAPE_OP:
+      if (next_shape := _reshape_target_shape(current_shape, args)) is None: return False
+      reshape_shapes.append(next_shape)
+      current_shape = next_shape
+    elif fn in _IDENTITY_VIEW_OPS:
+      continue
+    else:
+      return False
+  if current_shape != view.shape: return False
+  shape_idx = len(reshape_shapes) - 2
+  out = val.contiguous().realize()
+  for fn, args, _ in reversed(ops):
+    if fn is _RESHAPE_OP:
+      prev_shape = reshape_shapes[shape_idx]
+      out = out.reshape(prev_shape)
+      shape_idx -= 1
+  base.assign(out)
+  return True
+
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
   val = value.cast(tgt_dtype) if value.dtype != tgt_dtype else value
   if view.shape == base.shape:
     base.assign(val)
     return
+  if _try_simple_reshape_view_write(base, view, val): return
   idx_base = Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32).reshape(base.shape)
   idx_view = _replay_view_from_base(idx_base, view).reshape(-1)
   flat_base = base.reshape(base.numel()).contiguous()
@@ -79,19 +132,20 @@ def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
 
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
   val = value.cast(target.dtype) if value.dtype != target.dtype else value
-  if target.uop.is_realized or not is_view(target):
+  has_viewers = bool(getattr(canonical_base(target), "_views", set()))
+  if target.uop.is_realized or (not is_view(target) and not has_viewers):
     target.assign(val)
     return
   base = canonical_base(target)
-  if target is base or target.uop is base.uop:
-    target.assign(val)
-    return
   views = derived_views(base)
   if not views:
     target.assign(val)
     return
   view_ops_map = {v: _get_view_ops(v) for v in views}
-  _view_write(base, target, val)
+  if target is base or target.uop is base.uop:
+    base.assign(val)
+  else:
+    _view_write(base, target, val)
   for v in views:
     v.replace(_apply_view_ops(base, view_ops_map[v]))
 
@@ -168,6 +222,7 @@ view_ops = {
   }
 
 for k,v in view_ops.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_view_op(v))
+_IDENTITY_VIEW_OPS.add(view_ops["aten.alias"])
 
 
 # *** bad functions on CPU ***
@@ -229,8 +284,10 @@ def index_tensor(x, y):
 
 # Helper for inplace operations that use replace for non-views
 def _inplace_op(t, new_value):
-  if not is_view(t): t.replace(new_value)
-  else: _apply_inplace(t, new_value)
+  if not is_view(t) and not getattr(canonical_base(t), "_views", set()):
+    t.replace(new_value)
+  else:
+    _apply_inplace(t, new_value)
   return t
 
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
@@ -829,4 +886,3 @@ def diagonal(self, offset=0, dim1=0, dim2=1):
   return self.reshape(*batch_shape, m*n).pad(tuple((0,0) for _ in batch_shape) + ((0, diag_len),)).reshape(*batch_shape, diag_len, n+1)[..., :, 0]
 
 # @torch.library.impl("aten::diagonal_backward", "privateuseone")
-
