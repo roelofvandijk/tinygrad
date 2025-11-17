@@ -9,7 +9,7 @@ from tinygrad.uop.ops import Ops
 from tinygrad.helpers import getenv, prod, strides_for_shape, argfix
 import torch.lib
 TORCH_DEBUG = getenv("TORCH_DEBUG")
-import torch, pathlib, math, operator, inspect
+import torch, pathlib, math, operator
 torch.autograd.grad_mode.set_multithreading_enabled(False)
 from tinygrad.dtype import _from_torch_dtype, _to_torch_dtype
 
@@ -66,8 +66,6 @@ def _apply_view_ops(target, ops):
   for fn, args, kwargs in ops: target = fn(target, *args, **kwargs)
   return target
 
-_RESHAPE_OP = Tensor.reshape
-
 def _reshape_target_shape(shape:tuple[int, ...], args) -> tuple[int, ...]|None:
   req, new_shape, infer_idx = argfix(*args), [], -1
   if not req: return None
@@ -92,17 +90,17 @@ def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> b
   if not ops: return False
   shapes = [base.shape]
   for fn, args, _ in ops:
-    if fn is _RESHAPE_OP:
+    if fn is Tensor.reshape:
       next_shape = _reshape_target_shape(shapes[-1], args)
       if next_shape is None: return False
       shapes.append(next_shape)
   if shapes[-1] != view.shape: return False
-  out, idx = val.contiguous().realize(), len(shapes)-2
+  idx = len(shapes)-2
   for fn, *_ in reversed(ops):
-    if fn is _RESHAPE_OP:
-      out = out.reshape(shapes[idx])
+    if fn is Tensor.reshape:
+      val = val.reshape(shapes[idx])
       idx -= 1
-  base.assign(out)
+  base.assign(val)
   return True
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
@@ -124,8 +122,7 @@ def _apply_inplace(target: Tensor, value: Tensor) -> None:
   if target.uop.is_realized or (target is base and not getattr(base, "_views", None)):
     target.assign(val)
     return
-  views = derived_views(base)
-  if not views: 
+  if not (views:=derived_views(base)):
     target.assign(val)
     return
   view_ops_map = {v: _get_view_ops(v) for v in views}
@@ -342,7 +339,6 @@ def convolution_overrideable(input, weight, bias, stride, padding, dilation, tra
   if TORCH_DEBUG >= 1:
     print(f"convolution {input.shape=} {weight.shape=} {stride=} {padding=} {dilation=} {transposed=} {output_padding=} {groups=}")
   input, weight, bias = unwrap(input), unwrap(weight), unwrap(bias) if bias is not None else None
-  # TODO: fix test_biased_conv2d fails without realize()
   conv_fn = input.conv2d if not transposed else input.conv_transpose2d
   kwargs = dict(groups=groups, stride=stride, dilation=dilation, padding=padding)
   if transposed: kwargs['output_padding'] = output_padding
@@ -352,23 +348,19 @@ def convolution_overrideable(input, weight, bias, stride, padding, dilation, tra
 def convolution_backward_overrideable(grad_out, input, weight, stride, padding, dilation, transposed, output_padding, groups, output_mask):
   if TORCH_DEBUG >= 1:
     print(f"convolution_backward {input.shape=} {weight.shape=} {stride=} {padding=} {dilation=} {transposed=} {output_padding=} {groups=}")
-  
   # Unwrap and detach to avoid building on top of existing graph
   grad_out_t = unwrap(grad_out).detach()
   input_t = unwrap(input).detach()
   weight_t = unwrap(weight).detach()
-  
   bias_shape = weight_t.shape[1] * groups if transposed else weight_t.shape[0]
   bias_t = Tensor.zeros(bias_shape, device=input_t.device, dtype=input_t.dtype)
-  
-  if not transposed: 
-    out = input_t.conv2d(weight_t, bias_t if output_mask[2] else None, groups=groups, stride=stride, dilation=dilation, padding=padding)
-  else: 
-    out = input_t.conv_transpose2d(weight_t, bias_t if output_mask[2] else None, groups=groups, stride=stride, dilation=dilation, padding=padding, output_padding=output_padding)
+  kwargs = {'groups': groups, 'stride': stride, 'dilation': dilation, 'padding': padding}
+  if transposed: kwargs['output_padding'] = output_padding
+  conv_fn = input_t.conv2d if not transposed else input_t.conv_transpose2d
+  out = conv_fn(weight_t, bias_t if output_mask[2] else None, **kwargs)
 
   targets = [t for t, m in zip([input_t, weight_t, bias_t], output_mask) if m]
   grads = out.gradient(*targets, gradient=grad_out_t)
-  
   return tuple([wrap(grads.pop(0)) if m else None for m in output_mask])
 @torch.library.impl("aten::slice.Tensor", "privateuseone")
 @wrap_view_op
