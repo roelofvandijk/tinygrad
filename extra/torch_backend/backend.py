@@ -225,12 +225,9 @@ for i in [
 def index_tensor(x, y):
   return wrap(unwrap(x)[[unwrap(_y.to(x.device)) if _y is not None else slice(None) for _y in y]])
 
-# Helper for inplace operations that use replace for non-views
 def _inplace_op(t, new_value):
-  if not is_view(t) and not getattr(canonical_base(t), "_views", set()):
-    t.replace(new_value)
-  else:
-    _apply_inplace(t, new_value)
+  if not is_view(t) and not getattr(canonical_base(t), "_views", set()): t.replace(new_value)
+  else: _apply_inplace(t, new_value)
   return t
 
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
@@ -812,9 +809,6 @@ def diagonal(self, offset=0, dim1=0, dim2=1):
   if offset != 0: raise NotImplementedError(f"diagonal with {offset=} not implemented")
   dim1, dim2 = dim1 % self.ndim, dim2 % self.ndim
   if dim1 != self.ndim - 2 or dim2 != self.ndim - 1: raise NotImplementedError(f"diagonal with {dim1=}, {dim2=} not implemented, only last two dims supported")
-  # this is Tensor.diagonal, but extended for batches and non-square
   batch_shape, m, n = self.shape[:-2], self.shape[-2], self.shape[-1]
   diag_len = min(m, n)
   return self.reshape(*batch_shape, m*n).pad(tuple((0,0) for _ in batch_shape) + ((0, diag_len),)).reshape(*batch_shape, diag_len, n+1)[..., :, 0]
-
-# @torch.library.impl("aten::diagonal_backward", "privateuseone")
