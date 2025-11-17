@@ -939,29 +939,38 @@ class TestTorchBackendInplace(unittest.TestCase):
     d += torch.arange(4, device=device)
     np.testing.assert_array_equal(a.cpu(), torch.arange(4).cpu())
 
-# class TestKernelRegression(unittest.TestCase):
+class TestKernelRegression(unittest.TestCase):
   
-#   def test_resnet18_kernel_count(self):
-#     import subprocess
-
-#     result = subprocess.run(
-#       [sys.executable, 'extra/torch_backend/example.py'],
-#       env={**os.environ, 'PYTHONPATH': '.', 'DEBUG': '2'},
-#       capture_output=True,
-#       text=True,
-#       cwd=str(pathlib.Path(__file__).parent.parent.parent)
-#     )
+  def test_resnet18_kernel_count(self):
+    from PIL import Image
+    import torchvision
+    import torchvision.transforms as transforms
     
-#     # DEBUG output goes to stdout, not stderr
-#     metal_lines = [line for line in result.stdout.split('\n') if line.startswith('*** METAL')]
-#     kernel_count = len(metal_lines)
+    # Run ResNet18 inference directly
+    GlobalCounters.reset()
     
-#     self.assertGreater(kernel_count, 0, "No kernels, test failed")
-#     expected_kernels = 92
-#     expectation = f"ResNet18 kernels are {kernel_count} vs {expected_kernels} expected."
-#     if kernel_count < expected_kernels:
-#       warnings.warn(f"{expectation} Expectation can be lowered.", UserWarning)
-#     self.assertLessEqual(kernel_count, expected_kernels, f"{expectation}")
+    img = Image.open(pathlib.Path(__file__).parent.parent.parent / "test/models/efficientnet/Chicken.jpg").convert('RGB')
+    transform = transforms.Compose([
+      transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
+      transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    img = transform(img).unsqueeze(0).to(device)
+    
+    model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
+    if getenv("EVAL", 1): model.eval()
+    model = model.to(device)
+    out = model(img).detach().cpu().numpy()
+    
+    # Verify output is correct
+    self.assertEqual(out.argmax(), 7, "ResNet18 output should be class 7 (cock)")
+    
+    kernel_count = GlobalCounters.kernel_count
+    self.assertGreater(kernel_count, 0, "No kernels, test failed")
+    expected_kernels = 229
+    expectation = f"ResNet18 kernels are {kernel_count} vs {expected_kernels} expected."
+    if kernel_count < expected_kernels:
+      warnings.warn(f"{expectation} Expectation can be lowered.", UserWarning)
+    self.assertLessEqual(kernel_count, expected_kernels, f"{expectation}")
 
 
 if __name__ == "__main__":
