@@ -56,7 +56,8 @@ def _get_view_ops(view):
   base = canonical_base(view)
   ops=[]
   while view is not base:
-    parent, step = getattr(view, "_view_parent", None), getattr(view, "_view_step", None)
+    parent = getattr(view, "_view_parent", None)
+    step = getattr(view, "_view_step", None)
     if parent is None or step is None: break
     ops.append(step)
     view = parent
@@ -73,17 +74,19 @@ def _reshape_target_shape(shape:tuple[int, ...], args) -> tuple[int, ...]|None:
     if s is None:
       if i >= len(shape): return None
       s = shape[i]
-    if not isinstance(s, int): return None
+    elif not isinstance(s, int):
+      return None
     if s == -1:
       if infer_idx != -1: return None
       infer_idx = len(new_shape)
-      new_shape.append(-1)
-    else: new_shape.append(s)
+    new_shape.append(s)
+  size = prod(shape)
+  infer_val = 1
   if infer_idx != -1:
-    known = prod(x for x in new_shape if x != -1)
-    if not known: return None
-    new_shape[infer_idx] = prod(shape)//known
-  return tuple(new_shape) if prod(new_shape)==prod(shape) else None
+    infer_val = size//prod(abs(x) for x in new_shape if x not in (-1, 1))
+    new_shape[infer_idx] = infer_val
+  if prod(abs(x) for x in new_shape) != size: return None
+  return tuple(abs(s) for s in new_shape)
 
 def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> bool:
   ops = _get_view_ops(view)
@@ -131,49 +134,21 @@ def _apply_inplace(target: Tensor, value: Tensor) -> None:
   for v in views: v.replace(_apply_view_ops(base, view_ops_map[v]))
 
 def wrap_view_op(fn):
-  """
-  Decorator for view-like ops (reshape, expand, transpose, etc).
-
-  Responsibilities:
-  - unwrap torch.Tensors -> tinygrad.Tensor before calling `fn`
-  - call the tinygrad view op (`fn`)
-  - set up view metadata:
-      * _view_base      : canonical base tensor
-      * _view_base_uop  : base.uop (for sanity / debugging)
-      * base._views     : weakrefs to all derived views
-      * _view_ops       : sequence of view operations from base to this view
-  - wrap the tinygrad.Tensor result back to a torch.Tensor
-  """
   @functools.wraps(fn)
   def _wrap(*args, **kwargs):
-    # unwrap any torch.Tensor arguments to tinygrad.Tensor
     t_args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
-    t_kwargs = {
-      k: unwrap(v) if isinstance(v, torch.Tensor) else v
-      for k, v in kwargs.items()
-    }
-
-    # run the actual tinygrad view op
+    t_kwargs = {k: unwrap(v) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
     ret = fn(*t_args, **t_kwargs)
-    if ret is None:
-      raise NotImplementedError("view operation returned None")
-    if not isinstance(ret, Tensor):
-      raise RuntimeError(
-        f"view operation {fn.__name__} must return a tinygrad.Tensor, got {type(ret)}"
-      )
-
-    # canonical base of this view chain
+    if ret is None: raise NotImplementedError("view operation returned None")
+    if not isinstance(ret, Tensor): raise RuntimeError(f"view operation {fn.__name__} must return a tinygrad.Tensor, got {type(ret)}")
     base = canonical_base(t_args[0])
-
-    ret._view_base, ret._view_base_uop = base, base.uop
+    ret._view_base = base
     base._views = getattr(base, "_views", set())
     base._views.add(weakref.ref(ret))
     ret._view_parent, ret._view_step = t_args[0], (fn, t_args[1:], t_kwargs)
-
-    # finally wrap tinygrad.Tensor -> torch.Tensor
     return wrap(ret)
-
   return _wrap
+
 view_ops = {
   "aten.view": Tensor.reshape,
   "aten._unsafe_view": Tensor.reshape,  # when are views unsafe, and do we care?
@@ -259,24 +234,17 @@ def _inplace_op(t, new_value):
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
 def _local_scalar_dense(tensor): return unwrap(tensor).item()
 
-def as_strided_view(base:Tensor, size, stride, storage_offset):
-  non_broadcast_size = tuple(s for s, st in zip(size, stride) if st != 0)
-  if all(st != 0 for st in stride): return base.shrink(((storage_offset, storage_offset + prod(size)),)).reshape(size)
-  return base.shrink(((storage_offset, storage_offset + prod(non_broadcast_size)),)).reshape(tuple(s if st != 0 else 1 for s, st in zip(size, stride))).expand(size)
-
-def as_strided_gather(base:Tensor, size, stride, storage_offset):
-  indices = Tensor.full(size, storage_offset, dtype=dtypes.int32, device=base.device)
-  for dim, (sz, st) in enumerate(zip(size, stride)):
-    if st != 0: indices += (Tensor.arange(sz, device=base.device, dtype=dtypes.int32) * st).reshape((1,) * dim + (sz,) + (1,) * (len(size) - dim - 1))
-  return base[indices.flatten()].reshape(size)
-
 @wrap_view_op
 def _as_strided(tensor:Tensor, size, stride, storage_offset=0):
-  base = canonical_base(tensor).flatten()
-  non_broadcast_stride = tuple(st for st in stride if st != 0)
-  non_broadcast_size = tuple(s for s, st in zip(size, stride) if st != 0)
-  is_contiguous = non_broadcast_stride == strides_for_shape(non_broadcast_size) and storage_offset + prod(size) <= base.shape[0]
-  result = as_strided_view(base, size, stride, storage_offset) if is_contiguous else as_strided_gather(base, size, stride, storage_offset)
+  base = getattr(tensor, "_as_strided_base", canonical_base(tensor)).flatten()
+  if prod(size) == 1: return base[storage_offset].reshape(size)
+  indices = Tensor.zeros(size, dtype=dtypes.int32, device=base.device) + storage_offset
+  for dim, (sz, st) in enumerate(zip(size, stride)):
+    if st != 0:
+      dim_range = Tensor.arange(sz, device=base.device, dtype=dtypes.int32) * st
+      shape_for_broadcast = [1] * dim + [sz] + [1] * (len(size) - dim - 1)
+      indices = indices + dim_range.reshape(shape_for_broadcast)
+  result = base[indices.flatten()].reshape(size)
   result._as_strided_base = base
   return result
 
