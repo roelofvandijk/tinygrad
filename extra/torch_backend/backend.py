@@ -53,11 +53,13 @@ def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
 def _get_view_ops(view):
-  base = canonical_base(view); ops=[]
+  base = canonical_base(view)
+  ops=[]
   while view is not base:
     parent, step = getattr(view, "_view_parent", None), getattr(view, "_view_step", None)
     if parent is None or step is None: break
-    ops.append(step); view = parent
+    ops.append(step)
+    view = parent
   return ops[::-1]
 
 def _apply_view_ops(target, ops):
@@ -76,7 +78,8 @@ def _reshape_target_shape(shape:tuple[int, ...], args) -> tuple[int, ...]|None:
     if not isinstance(s, int): return None
     if s == -1:
       if infer_idx != -1: return None
-      infer_idx = len(new_shape); new_shape.append(-1)
+      infer_idx = len(new_shape)
+      new_shape.append(-1)
     else: new_shape.append(s)
   if infer_idx != -1:
     known = prod(x for x in new_shape if x != -1)
@@ -97,8 +100,10 @@ def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> b
   out, idx = val.contiguous().realize(), len(shapes)-2
   for fn, *_ in reversed(ops):
     if fn is _RESHAPE_OP:
-      out = out.reshape(shapes[idx]); idx -= 1
-  base.assign(out); return True
+      out = out.reshape(shapes[idx])
+      idx -= 1
+  base.assign(out)
+  return True
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
@@ -117,9 +122,12 @@ def _apply_inplace(target: Tensor, value: Tensor) -> None:
   val = value.cast(target.dtype) if value.dtype != target.dtype else value
   base = canonical_base(target)
   if target.uop.is_realized or (target is base and not getattr(base, "_views", None)):
-    target.assign(val); return
+    target.assign(val)
+    return
   views = derived_views(base)
-  if not views: target.assign(val); return
+  if not views: 
+    target.assign(val)
+    return
   view_ops_map = {v: _get_view_ops(v) for v in views}
   if target is base or target.uop is base.uop: base.assign(val)
   else: _view_write(base, target, val)
