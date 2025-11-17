@@ -53,69 +53,52 @@ def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
 def _get_view_ops(view):
-    return getattr(view, "_view_ops", [])
+  base = canonical_base(view); ops=[]
+  while view is not base:
+    parent, step = getattr(view, "_view_parent", None), getattr(view, "_view_step", None)
+    if parent is None or step is None: break
+    ops.append(step); view = parent
+  return ops[::-1]
 
 def _apply_view_ops(target, ops):
-    for fn, args, kwargs in ops:
-        target = fn(target, *args, **kwargs)
-    return target
-def _replay_view_from_base(target: Tensor, view: Tensor) -> Tensor:
-  if view is target or view.uop is target.uop: return view
-  actual_base = canonical_base(view)
-  if target.shape != actual_base.shape: return view
-  return _apply_view_ops(target, _get_view_ops(view))
+  for fn, args, kwargs in ops: target = fn(target, *args, **kwargs)
+  return target
 
 _RESHAPE_OP = Tensor.reshape
-_IDENTITY_VIEW_OPS = {Tensor.detach}
 
-def _reshape_target_shape(current_shape:tuple[int, ...], args) -> tuple[int, ...]|None:
-  req = argfix(*args)
-  if len(req) == 0: return None
-  new_shape: list[int] = []
-  infer_idx = -1
-  for i, s in enumerate(req):
+def _reshape_target_shape(shape:tuple[int, ...], args) -> tuple[int, ...]|None:
+  req, new_shape, infer_idx = argfix(*args), [], -1
+  if not req: return None
+  for i,s in enumerate(req):
     if s is None:
-      if i >= len(current_shape): return None
-      s = current_shape[i]
+      if i >= len(shape): return None
+      s = shape[i]
     if not isinstance(s, int): return None
     if s == -1:
       if infer_idx != -1: return None
-      infer_idx = len(new_shape)
-      new_shape.append(-1)
-    else:
-      new_shape.append(s)
+      infer_idx = len(new_shape); new_shape.append(-1)
+    else: new_shape.append(s)
   if infer_idx != -1:
     known = prod(x for x in new_shape if x != -1)
-    if known == 0: return None
-    inferred = prod(current_shape) // known
-    new_shape[infer_idx] = inferred
-  if prod(new_shape) != prod(current_shape): return None
-  return tuple(new_shape)
+    if not known: return None
+    new_shape[infer_idx] = prod(shape)//known
+  return tuple(new_shape) if prod(new_shape)==prod(shape) else None
 
 def _try_simple_reshape_view_write(base: Tensor, view: Tensor, val: Tensor) -> bool:
   ops = _get_view_ops(view)
   if not ops: return False
-  reshape_shapes = [base.shape]
-  current_shape = base.shape
+  shapes = [base.shape]
   for fn, args, _ in ops:
     if fn is _RESHAPE_OP:
-      if (next_shape := _reshape_target_shape(current_shape, args)) is None: return False
-      reshape_shapes.append(next_shape)
-      current_shape = next_shape
-    elif fn in _IDENTITY_VIEW_OPS:
-      continue
-    else:
-      return False
-  if current_shape != view.shape: return False
-  shape_idx = len(reshape_shapes) - 2
-  out = val.contiguous().realize()
-  for fn, args, _ in reversed(ops):
+      next_shape = _reshape_target_shape(shapes[-1], args)
+      if next_shape is None: return False
+      shapes.append(next_shape)
+  if shapes[-1] != view.shape: return False
+  out, idx = val.contiguous().realize(), len(shapes)-2
+  for fn, *_ in reversed(ops):
     if fn is _RESHAPE_OP:
-      prev_shape = reshape_shapes[shape_idx]
-      out = out.reshape(prev_shape)
-      shape_idx -= 1
-  base.assign(out)
-  return True
+      out = out.reshape(shapes[idx]); idx -= 1
+  base.assign(out); return True
 
 def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
   tgt_dtype = base.dtype
@@ -125,29 +108,22 @@ def _view_write(base: Tensor, view: Tensor, value: Tensor) -> None:
     return
   if _try_simple_reshape_view_write(base, view, val): return
   idx_base = Tensor.arange(base.numel(), device=base.device, dtype=dtypes.int32).reshape(base.shape)
-  idx_view = _replay_view_from_base(idx_base, view).reshape(-1)
+  idx_view = _apply_view_ops(idx_base, _get_view_ops(view)).reshape(-1)
   flat_base = base.reshape(base.numel()).contiguous()
   flat_base[idx_view] = val.reshape(-1)
   base.assign(flat_base.reshape(base.shape))
 
 def _apply_inplace(target: Tensor, value: Tensor) -> None:
   val = value.cast(target.dtype) if value.dtype != target.dtype else value
-  has_viewers = bool(getattr(canonical_base(target), "_views", set()))
-  if target.uop.is_realized or (not is_view(target) and not has_viewers):
-    target.assign(val)
-    return
   base = canonical_base(target)
+  if target.uop.is_realized or (target is base and not getattr(base, "_views", None)):
+    target.assign(val); return
   views = derived_views(base)
-  if not views:
-    target.assign(val)
-    return
+  if not views: target.assign(val); return
   view_ops_map = {v: _get_view_ops(v) for v in views}
-  if target is base or target.uop is base.uop:
-    base.assign(val)
-  else:
-    _view_write(base, target, val)
-  for v in views:
-    v.replace(_apply_view_ops(base, view_ops_map[v]))
+  if target is base or target.uop is base.uop: base.assign(val)
+  else: _view_write(base, target, val)
+  for v in views: v.replace(_apply_view_ops(base, view_ops_map[v]))
 
 def wrap_view_op(fn):
   """
@@ -184,23 +160,10 @@ def wrap_view_op(fn):
     # canonical base of this view chain
     base = canonical_base(t_args[0])
 
-    # mark this tensor as a view of `base`
-    ret._view_base = base
-    ret._view_base_uop = base.uop
-
-    # track all derived views from this base
-    if not hasattr(base, "_views"):
-      base._views = set()
+    ret._view_base, ret._view_base_uop = base, base.uop
+    base._views = getattr(base, "_views", set())
     base._views.add(weakref.ref(ret))
-
-    # track the *logical* view chain for this tensor:
-    #  - parent_ops: view ops from base -> parent
-    #  - op       : this new view step
-    parent = t_args[0]
-    parent_ops = list(getattr(parent, "_view_ops", []))
-    op = (fn, t_args[1:], t_kwargs)   # (view_fn, args_without_self, kwargs)
-    parent_ops.append(op)
-    ret._view_ops = parent_ops
+    ret._view_parent, ret._view_step = t_args[0], (fn, t_args[1:], t_kwargs)
 
     # finally wrap tinygrad.Tensor -> torch.Tensor
     return wrap(ret)
@@ -222,8 +185,6 @@ view_ops = {
   }
 
 for k,v in view_ops.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_view_op(v))
-_IDENTITY_VIEW_OPS.add(view_ops["aten.alias"])
-
 
 # *** bad functions on CPU ***
 
