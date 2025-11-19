@@ -1181,7 +1181,10 @@ class RewriteContext:
     on_stack = {root}  # all UOps either on the stack or in self.replace, i.e. dont have to be placed again
     REWRITE_STACK_LIMIT = getenv("REWRITE_STACK_LIMIT", 250000)
     while stack:
-      if len(stack) > REWRITE_STACK_LIMIT: raise RuntimeError("infinite loop in graph_rewrite (stack too big)")
+      try:
+        _ = stack[REWRITE_STACK_LIMIT+1]
+        raise RuntimeError("infinite loop in graph_rewrite (stack too big)")
+      except IndexError: pass
       n, stage, new_n = stack.pop()
       if n in self.replace: continue  # skip any nodes we have seen
       if stage == 0:
