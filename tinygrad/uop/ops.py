@@ -1113,7 +1113,7 @@ class TrackedPatternMatcher(PatternMatcher):
       if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
       st = time.perf_counter()
       if early_reject:
-        # if ler is None: ler = {u.op for u in uop.src}
+        if ler is None: ler = {u.op for u in uop.src}
         if not early_reject.issubset({u.op for u in uop.src}):
           match_stats[p][2] += time.perf_counter()-st
           continue
