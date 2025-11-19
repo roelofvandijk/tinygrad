@@ -1015,7 +1015,7 @@ class PatternMatcher:
   def rewrite(self, uop:UOp, ctx=None) -> UOp|None:
     ler = {u.op for u in uop.src}
     for _,match,early_reject in self.pdict.get(uop.op, []):
-      if not early_reject.issubset(ler): continue
+      if early_reject and (not ler or not early_reject.issubset(ler)): continue
       if (ret:=match(uop, ctx)) is not None and ret is not uop: return ret
     return None
 
@@ -1103,7 +1103,7 @@ class TrackedPatternMatcher(PatternMatcher):
     for p,match,early_reject in self.pdict.get(uop.op, []):
       if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
       st = time.perf_counter()
-      if not early_reject.issubset(ler):
+      if early_reject and (not ler or not early_reject.issubset(ler)):
         match_stats[p][2] += time.perf_counter()-st
         continue
       match_stats[p][1] += 1
