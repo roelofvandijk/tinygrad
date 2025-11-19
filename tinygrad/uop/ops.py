@@ -695,13 +695,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.op is Ops.ADD: return self.src[0].is_increasing() and self.src[1].is_increasing()
     if self.op in (Ops.MUL, Ops.IDIV) and self.src[1].op is Ops.CONST and self.src[1].arg >= 0: return self.src[0].is_increasing()
     return False  # False if not sure
-  @functools.cached_property
+  @functools.cache
   def const_factor(self) -> int:
     """largest known int that divides self"""
     # TODO: for negatives it's not the largest
     if self.op is Ops.CONST: return self.arg
     if self.op is Ops.VCONST: return math.gcd(*self.arg)
-    if self.op is Ops.ADD: return math.gcd(self.src[0].const_factor, self.src[1].const_factor)
+    if self.op is Ops.ADD: return math.gcd(self.src[0].const_factor(), self.src[1].const_factor())
     if self.op is Ops.MUL: return self.src[0].arg if self.src[0].op is Ops.CONST else self.src[1].arg if self.src[1].op is Ops.CONST else 1
     return 1
   @functools.cache
@@ -720,7 +720,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   @staticmethod
   @functools.cache
   def gcd(*uops: UOp) -> UOp:
-    terms, factors = zip(*[(u.divides(f:=u.const_factor),f) for u in uops])
+    terms, factors = zip(*[(u.divides(f:=u.const_factor()),f) for u in uops])
     count = functools.reduce(operator.and_, [collections.Counter(term.split_uop(Ops.MUL)) for term in terms])
     return math.prod([*count.elements(), terms[0].const_like(math.gcd(*factors))])  # put the const at the top
   @functools.cache
