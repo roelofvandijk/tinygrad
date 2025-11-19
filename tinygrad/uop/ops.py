@@ -694,14 +694,16 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.op is Ops.ADD: return self.src[0].is_increasing() and self.src[1].is_increasing()
     if self.op in (Ops.MUL, Ops.IDIV) and self.src[1].op is Ops.CONST and self.src[1].arg >= 0: return self.src[0].is_increasing()
     return False  # False if not sure
+  @functools.cached_property
   def const_factor(self) -> int:
     """largest known int that divides self"""
     # TODO: for negatives it's not the largest
     if self.op is Ops.CONST: return self.arg
     if self.op is Ops.VCONST: return math.gcd(*self.arg)
-    if self.op is Ops.ADD: return math.gcd(self.src[0].const_factor(), self.src[1].const_factor())
+    if self.op is Ops.ADD: return math.gcd(self.src[0].const_factor, self.src[1].const_factor)
     if self.op is Ops.MUL: return self.src[0].arg if self.src[0].op is Ops.CONST else self.src[1].arg if self.src[1].op is Ops.CONST else 1
     return 1
+  @functools.cache
   def divides(self, v:int) -> UOp|None:
     if v==1: return self
     if self.op is Ops.CONST: return self.const_like(self.arg//v) if self.arg%v == 0 else None
@@ -711,13 +713,16 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       if (d0:=self.src[0].divides(v)) is not None: return d0 * self.src[1]
       if (d1:=self.src[1].divides(v)) is not None: return self.src[0] * d1
     return None # generic None if we aren't sure
+  @functools.cache
   def pop_const(self, op=Ops.ADD) -> tuple[UOp, ConstType]:
     return (self.src[0], self.src[1].arg) if self.op is op and self.src[1].op is Ops.CONST else (self, identity_element(op, self.dtype))
   @staticmethod
+  @functools.cache
   def gcd(*uops: UOp) -> UOp:
-    terms, factors = zip(*[(u.divides(f:=u.const_factor()),f) for u in uops])
+    terms, factors = zip(*[(u.divides(f:=u.const_factor),f) for u in uops])
     count = functools.reduce(operator.and_, [collections.Counter(term.split_uop(Ops.MUL)) for term in terms])
     return math.prod([*count.elements(), terms[0].const_like(math.gcd(*factors))])  # put the const at the top
+  @functools.cache
   def divide_exact(self, v:UOp) -> UOp|None:
     if self is v: return self.const_like(1)
     if v.op is Ops.CONST: return self.divides(v.arg)

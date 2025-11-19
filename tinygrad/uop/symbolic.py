@@ -119,8 +119,8 @@ symbolic_simple = propagate_invalid + PatternMatcher([
 # ******** phase 2 builds on phase 1, it includes the old "symbolic", rules that match deeper ********
 
 def lt_folding(x:UOp, c:int) -> UOp|None:
-  p, np = partition(x.split_uop(Ops.ADD), lambda u: u.const_factor() == 1)
-  if np and (d:=math.gcd(*[u.const_factor() for u in np], c)) > 1 and 0 <= sum(u.vmin for u in p) and sum(u.vmax for u in p) < d:
+  p, np = partition(x.split_uop(Ops.ADD), lambda u: u.const_factor == 1)
+  if np and (d:=math.gcd(*[u.const_factor for u in np], c)) > 1 and 0 <= sum(u.vmin for u in p) and sum(u.vmax for u in p) < d:
     return unwrap(UOp.sum(*np).divides(d))<(c//d)
   return None
 
