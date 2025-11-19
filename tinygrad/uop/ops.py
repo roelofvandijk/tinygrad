@@ -114,8 +114,7 @@ class recursive_property(property):
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin import OpMixin
 
-# NOTE: this should be frozen, but frozen is slower
-@dataclass(eq=False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class UOp(OpMixin, metaclass=UOpMetaClass):
   op:Ops
   dtype:DType = dtypes.void
@@ -197,6 +196,14 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
 
   @recursive_property
   def _shape(self) -> tuple[sint, ...]|None:
+    # elementwise ops keep the shape the same. all inputs with shape must match
+    if self.op in (GroupOp.Elementwise-{Ops.BITCAST}).union({Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.STORE}):
+      # TODO: remove this hack for 3 op assign
+      input_shapes = [x._shape for x in (self.src[:2] if self.op is Ops.ASSIGN else self.src) if x._shape is not None]
+      if len(input_shapes) == 0: return None
+      if not all_same(input_shapes): raise RuntimeError(f"shape mismatch at {self.op}: {input_shapes}")
+      return input_shapes[0]
+
     match self.op:
       # late ops don't have shape
       case Ops.UNIQUE | Ops.DEVICE | Ops.RANGE | Ops.LOAD | Ops.IF | Ops.BARRIER | Ops.CUSTOM | Ops.CUSTOMI | \
@@ -274,14 +281,6 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
             raise ValueError(f"invalid type for axis: {axis_arg}")
           return tuple(1 if i in axis_arg else s for i,s in enumerate(ps))
 
-    # elementwise ops keep the shape the same. all inputs with shape must match
-    if self.op in (GroupOp.Elementwise-{Ops.BITCAST}).union({Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.STORE}):
-      # TODO: remove this hack for 3 op assign
-      input_shapes = [x._shape for x in (self.src[:2] if self.op is Ops.ASSIGN else self.src) if x._shape is not None]
-      if len(input_shapes) == 0: return None
-      if not all_same(input_shapes): raise RuntimeError(f"shape mismatch at {self.op}: {input_shapes}")
-      return input_shapes[0]
-
     # all Ops must be explicitly handled
     raise NotImplementedError(f"no shape handling for {self.op} with {self.dtype}")
 
@@ -321,6 +320,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
 
   # *** uop evaluation ***
 
+  @functools.cache
   def simplify(self, tracked=False, full_symbolic=True):
     # late import!
     from tinygrad.uop.symbolic import symbolic, commutative
@@ -373,6 +373,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       return perm.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx if not isinstance(x, slice)], ptr=True)
     else:
       return self.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx])
+  @functools.cache
   def const_like(self, b:ConstLike):
     # constants can optionally have a DEVICE source
     return UOp.const(self.dtype, b, device=self._device, shape=self._shape)
