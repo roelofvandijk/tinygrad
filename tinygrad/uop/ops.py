@@ -114,8 +114,7 @@ class recursive_property(property):
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin import OpMixin
 
-# NOTE: this should be frozen, but frozen is slower
-@dataclass(eq=False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class UOp(OpMixin, metaclass=UOpMetaClass):
   op:Ops
   dtype:DType = dtypes.void
@@ -197,6 +196,14 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
 
   @recursive_property
   def _shape(self) -> tuple[sint, ...]|None:
+    # elementwise ops keep the shape the same. all inputs with shape must match
+    if self.op in (GroupOp.Elementwise-{Ops.BITCAST}).union({Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.STORE}):
+      # TODO: remove this hack for 3 op assign
+      input_shapes = [x._shape for x in (self.src[:2] if self.op is Ops.ASSIGN else self.src) if x._shape is not None]
+      if len(input_shapes) == 0: return None
+      if not all_same(input_shapes): raise RuntimeError(f"shape mismatch at {self.op}: {input_shapes}")
+      return input_shapes[0]
+
     match self.op:
       # late ops don't have shape
       case Ops.UNIQUE | Ops.DEVICE | Ops.RANGE | Ops.LOAD | Ops.IF | Ops.BARRIER | Ops.CUSTOM | Ops.CUSTOMI | \
@@ -274,14 +281,6 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
             raise ValueError(f"invalid type for axis: {axis_arg}")
           return tuple(1 if i in axis_arg else s for i,s in enumerate(ps))
 
-    # elementwise ops keep the shape the same. all inputs with shape must match
-    if self.op in (GroupOp.Elementwise-{Ops.BITCAST}).union({Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.STORE}):
-      # TODO: remove this hack for 3 op assign
-      input_shapes = [x._shape for x in (self.src[:2] if self.op is Ops.ASSIGN else self.src) if x._shape is not None]
-      if len(input_shapes) == 0: return None
-      if not all_same(input_shapes): raise RuntimeError(f"shape mismatch at {self.op}: {input_shapes}")
-      return input_shapes[0]
-
     # all Ops must be explicitly handled
     raise NotImplementedError(f"no shape handling for {self.op} with {self.dtype}")
 
@@ -321,6 +320,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
 
   # *** uop evaluation ***
 
+  @functools.cache
   def simplify(self, tracked=False, full_symbolic=True):
     # late import!
     from tinygrad.uop.symbolic import symbolic, commutative
@@ -373,6 +373,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       return perm.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx if not isinstance(x, slice)], ptr=True)
     else:
       return self.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx])
+  @functools.cache
   def const_like(self, b:ConstLike):
     # constants can optionally have a DEVICE source
     return UOp.const(self.dtype, b, device=self._device, shape=self._shape)
@@ -407,21 +408,33 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def contract(self, *rngs:UOp):
     assert all(x.arg[-1] == AxisType.UPCAST for x in rngs), "all contract ranges must be upcast"
     return UOp(Ops.CONTRACT, dtype=self.dtype.vec(prod([x.vmax+1 for x in rngs])), src=(self,), arg=tuple((x.arg[0], x.vmax+1) for x in rngs))
+  @functools.cache
   def alu(self, op, *src:UOp, **kwargs):
     out_dtype = (self, *src)[-1].dtype
     if op in {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}: out_dtype = dtypes.bool.vec(out_dtype.count) if out_dtype.count > 1 else dtypes.bool
     return UOp(op, out_dtype, (self,)+src, **kwargs)
   @staticmethod
   def const(dtype:DType, b:ConstLike, device:str|tuple[str, ...]|None=None, shape:tuple[sint, ...]|None=None, src=None, unique:bool|int=False):
+    # Don't use cache when unique=True because each call needs a fresh unique ID
+    if unique or not isinstance(unique, bool):
+      if isinstance(b, UOp): return b.unbind()[0] if b.op is Ops.BIND else b
+      if isinstance(b, tuple) and all_same(b): b = b[0]
+      if isinstance(b, float) and math.isnan(b): b = math.nan
+      ret = UOp(Ops.VCONST if isinstance(b, tuple) else Ops.CONST, dtype, arg=dtypes.as_const(b, dtype), src=() if src is None else (src,))
+      if device is not None: ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device), UOp.unique(None if unique is True else unique)))
+      else: raise RuntimeError("unique consts only with DEVICE")
+      if shape is not None: ret = ret.reshape((1,)*len(shape)).expand(shape)
+      return ret
+    # Use cached version for non-unique consts
+    return UOp._const_cached(dtype, b, device, shape, src)
+  @staticmethod
+  @functools.cache
+  def _const_cached(dtype:DType, b:ConstLike, device:str|tuple[str, ...]|None=None, shape:tuple[sint, ...]|None=None, src=None):
     if isinstance(b, UOp): return b.unbind()[0] if b.op is Ops.BIND else b
-    if isinstance(b, tuple) and all_same(b): b = b[0]  # doesn't have to be a VCONST if they are all the same
-    # NOTE: float('nan') != float('nan'), so we canonicalize here
+    if isinstance(b, tuple) and all_same(b): b = b[0]
     if isinstance(b, float) and math.isnan(b): b = math.nan
     ret = UOp(Ops.VCONST if isinstance(b, tuple) else Ops.CONST, dtype, arg=dtypes.as_const(b, dtype), src=() if src is None else (src,))
-    if device is not None:
-      if unique or not isinstance(unique, bool): ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device), UOp.unique(None if unique is True else unique)))
-      else: ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device),))
-    elif unique or not isinstance(unique, bool): raise RuntimeError("unique consts only with DEVICE")
+    if device is not None: ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device),))
     if shape is not None: ret = ret.reshape((1,)*len(shape)).expand(shape)
     return ret
   @staticmethod
@@ -692,6 +705,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.op is Ops.ADD: return self.src[0].is_increasing() and self.src[1].is_increasing()
     if self.op in (Ops.MUL, Ops.IDIV) and self.src[1].op is Ops.CONST and self.src[1].arg >= 0: return self.src[0].is_increasing()
     return False  # False if not sure
+  @functools.cache
   def const_factor(self) -> int:
     """largest known int that divides self"""
     # TODO: for negatives it's not the largest
@@ -700,6 +714,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.op is Ops.ADD: return math.gcd(self.src[0].const_factor(), self.src[1].const_factor())
     if self.op is Ops.MUL: return self.src[0].arg if self.src[0].op is Ops.CONST else self.src[1].arg if self.src[1].op is Ops.CONST else 1
     return 1
+  @functools.cache
   def divides(self, v:int) -> UOp|None:
     if v==1: return self
     if self.op is Ops.CONST: return self.const_like(self.arg//v) if self.arg%v == 0 else None
@@ -709,13 +724,16 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       if (d0:=self.src[0].divides(v)) is not None: return d0 * self.src[1]
       if (d1:=self.src[1].divides(v)) is not None: return self.src[0] * d1
     return None # generic None if we aren't sure
+  @functools.cache
   def pop_const(self, op=Ops.ADD) -> tuple[UOp, ConstType]:
     return (self.src[0], self.src[1].arg) if self.op is op and self.src[1].op is Ops.CONST else (self, identity_element(op, self.dtype))
   @staticmethod
+  @functools.cache
   def gcd(*uops: UOp) -> UOp:
     terms, factors = zip(*[(u.divides(f:=u.const_factor()),f) for u in uops])
     count = functools.reduce(operator.and_, [collections.Counter(term.split_uop(Ops.MUL)) for term in terms])
     return math.prod([*count.elements(), terms[0].const_like(math.gcd(*factors))])  # put the const at the top
+  @functools.cache
   def divide_exact(self, v:UOp) -> UOp|None:
     if self is v: return self.const_like(1)
     if v.op is Ops.CONST: return self.divides(v.arg)
@@ -919,6 +937,7 @@ class UPat(OpMixin):
   def cvar(name:str|None=None, dtype:DType|tuple[DType, ...]|None=None, vec=True, arg=None):
     return UPat((Ops.CONST,Ops.VCONST) if vec else Ops.CONST, dtype, name=name, arg=arg)
   @staticmethod
+  @functools.cache
   def const(dtype:DType|tuple[DType, ...]|None, b:ConstType|InvalidType): return UPat(Ops.CONST, dtype=dtype, arg=b)
 
   # lil helper
@@ -939,7 +958,7 @@ class UPat(OpMixin):
   def contiguous(self, *args, **kwargs): return UPat(Ops.CONTIGUOUS, dtype=self.dtype, src=(self,)+args, **kwargs)
   def after(self, *src:UPat, **kwargs): return UPat(Ops.AFTER, self.dtype, (self,)+src, **kwargs)
   def end(self, *src:UPat, **kwargs): return UPat(Ops.END, self.dtype, (self,)+src, **kwargs)
-
+  @functools.cache
   def const_like(self, b:ConstLike): return UPat.const(self.dtype, cast(ConstType, b))
   def alu(self, op:Ops, *src:UPat):
     asrc = (self,)+src
@@ -1011,9 +1030,11 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher) -> PatternMatcher: return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None) -> UOp|None:
-    ler = {u.op for u in uop.src}
+    ler = None
     for _,match,early_reject in self.pdict.get(uop.op, []):
-      if not early_reject.issubset(ler): continue
+      if early_reject:
+        if ler is None: ler = {u.op for u in uop.src}
+        if not early_reject.issubset(ler): continue
       if (ret:=match(uop, ctx)) is not None and ret is not uop: return ret
     return None
 
@@ -1097,13 +1118,15 @@ def profile_matches(fxn:Callable):
 class TrackedPatternMatcher(PatternMatcher):
   def rewrite(self, uop:UOp, ctx=None) -> UOp|None:
     ret = None
-    ler = {u.op for u in uop.src}
+    ler = None
     for p,match,early_reject in self.pdict.get(uop.op, []):
       if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
       st = time.perf_counter()
-      if not early_reject.issubset(ler):
-        match_stats[p][2] += time.perf_counter()-st
-        continue
+      if early_reject:
+        if ler is None: ler = {u.op for u in uop.src}
+        if not early_reject.issubset({u.op for u in uop.src}):
+          match_stats[p][2] += time.perf_counter()-st
+          continue
       match_stats[p][1] += 1
       try: ret = match(uop, ctx)
       except Exception:
