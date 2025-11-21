@@ -339,8 +339,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   # determine what ranges this is in
   @recursive_property
   def _ranges(self) -> dict[UOp, None]:
-    ret: dict[UOp, None] = {}
-    for s in self.src: ret.update(s.ranges)
+    ret: dict[UOp, None] = {x:None for s in self.src for x in s.ranges}
     for er in self.ended_ranges:
       if er.op is Ops.RANGE:
         # if it's a single RANGE, we don't flow through it.
