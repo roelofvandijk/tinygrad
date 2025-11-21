@@ -96,7 +96,35 @@ class UOpMetaClass(type):
 # some uops map to other stuff
 buffers:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary() # this maps BUFFER uops to their device Buffers
 all_metadata:weakref.WeakKeyDictionary[UOp, tuple[Metadata, ...]] = weakref.WeakKeyDictionary() # TODO: should this be here?
-
+class WeakUOpCache:
+  def __init__(self):
+    self.single: weakref.WeakKeyDictionary[UOp, weakref.ReferenceType] = weakref.WeakKeyDictionary()
+    self.uop_sub: weakref.WeakKeyDictionary[UOp, weakref.WeakKeyDictionary[UOp, weakref.ReferenceType]] = weakref.WeakKeyDictionary()
+    self.other_sub: weakref.WeakKeyDictionary[UOp, dict[Any, weakref.ReferenceType]] = weakref.WeakKeyDictionary()
+  def get(self, key:UOp, subkey:Any=None) -> UOp|None:
+    if subkey is None:
+      ref = self.single.get(key)
+      return ref() if ref is not None else None
+    if isinstance(subkey, UOp):
+      inner = self.uop_sub.get(key)
+      ref = None if inner is None else inner.get(subkey)
+      return ref() if ref is not None else None
+    inner = self.other_sub.get(key)
+    ref = None if inner is None else inner.get(subkey)
+    return ref() if ref is not None else None
+  def set(self, key:UOp, value:UOp, subkey:Any=None):
+    if subkey is None:
+      self.single[key] = weakref.ref(value)
+      return
+    if isinstance(subkey, UOp):
+      inner = self.uop_sub.setdefault(key, weakref.WeakKeyDictionary())
+      inner[subkey] = weakref.ref(value)
+      return
+    inner = self.other_sub.setdefault(key, {})
+    inner[subkey] = weakref.ref(value)
+  def clear(self):
+    self.single.clear(); self.uop_sub.clear(); self.other_sub.clear()
+_simplify_cache = WeakUOpCache()
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
 _NOT_FOUND = object()
 class recursive_property(property):
@@ -324,8 +352,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def simplify(self, tracked=False):
     # late import!
     from tinygrad.uop.symbolic import symbolic
+    if not tracked:
+      if (ret:=_simplify_cache.get(self)) is not None: return ret
     with Context(TRACK_MATCH_STATS=0 if not tracked else TRACK_MATCH_STATS.value):
-      return graph_rewrite(self, symbolic, name="simplify")
+      ret = graph_rewrite(self, symbolic, name="simplify")
+    if not tracked: _simplify_cache.set(self, ret)
+    return ret
+
   def ssimplify(self) -> UOp|ConstType: return ret.arg if (ret:=self.simplify()).op is Ops.CONST else ret
   def sintify(self) -> sint: return self.arg if self.op is Ops.CONST else self
   def _eval(self, dtype, expected_type:Type[T]) -> T:
