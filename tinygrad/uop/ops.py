@@ -96,6 +96,9 @@ class UOpMetaClass(type):
 # some uops map to other stuff
 buffers:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary() # this maps BUFFER uops to their device Buffers
 all_metadata:weakref.WeakKeyDictionary[UOp, tuple[Metadata, ...]] = weakref.WeakKeyDictionary() # TODO: should this be here?
+class _CacheNone: pass
+_CACHE_NONE = _CacheNone()
+
 class WeakUOpCache:
   def __init__(self):
     self.single: weakref.WeakKeyDictionary[UOp, weakref.ReferenceType] = weakref.WeakKeyDictionary()
@@ -104,24 +107,31 @@ class WeakUOpCache:
   def get(self, key:UOp, subkey:Any=None) -> UOp|None:
     if subkey is None:
       ref = self.single.get(key)
-      return ref() if ref is not None else None
+      if ref is None: return None
+      ret = ref()
+      return None if ret is _CACHE_NONE else ret
     if isinstance(subkey, UOp):
       inner = self.uop_sub.get(key)
       ref = None if inner is None else inner.get(subkey)
-      return ref() if ref is not None else None
+      if ref is None: return None
+      ret = ref()
+      return None if ret is _CACHE_NONE else ret
     inner = self.other_sub.get(key)
     ref = None if inner is None else inner.get(subkey)
-    return ref() if ref is not None else None
-  def set(self, key:UOp, value:UOp, subkey:Any=None):
+    if ref is None: return None
+    ret = ref()
+    return None if ret is _CACHE_NONE else ret
+  def set(self, key:UOp, value:UOp|None, subkey:Any=None, allow_none:bool=False):
+    if value is None and not allow_none: return
     if subkey is None:
-      self.single[key] = weakref.ref(value)
+      self.single[key] = weakref.ref(_CACHE_NONE if value is None else value)
       return
     if isinstance(subkey, UOp):
       inner = self.uop_sub.setdefault(key, weakref.WeakKeyDictionary())
-      inner[subkey] = weakref.ref(value)
+      inner[subkey] = weakref.ref(_CACHE_NONE if value is None else value)
       return
     inner = self.other_sub.setdefault(key, {})
-    inner[subkey] = weakref.ref(value)
+    inner[subkey] = weakref.ref(_CACHE_NONE if value is None else value)
   def clear(self):
     self.single.clear(); self.uop_sub.clear(); self.other_sub.clear()
 _simplify_cache = WeakUOpCache()
