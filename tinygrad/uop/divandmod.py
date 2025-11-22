@@ -8,6 +8,15 @@ from tinygrad.helpers import cdiv, cmod, CORRECT_DIVMOD_FOLDING, unwrap
 def fold_divmod_general(d: UOp, correct_divmod_folding: bool) -> UOp|None:
   x, y = d.src
 
+  def combine_terms(terms:list[UOp], const_term:int=0) -> UOp:
+    total: UOp|None = None
+    for term in terms:
+      total = term if total is None else total + term
+    if const_term != 0 or total is None:
+      const_uop = x.const_like(const_term)
+      total = const_uop if total is None else total + const_uop
+    return total
+
   # cancel_divmod: simple cancel div/mod case when the range of the numerator lies within a single denominator interval
   x_min, x_max, y_min, y_max = x.vmin, x.vmax, y.vmin, y.vmax
   assert isinstance(x_min, int) and isinstance(x_max, int) and isinstance(y_min, int) and isinstance(y_max, int)
@@ -45,9 +54,23 @@ def fold_divmod_general(d: UOp, correct_divmod_folding: bool) -> UOp|None:
     # fold_divmod_congruence: fold if a is congruent to an expression whose range is between 0 and c
     if not (x.vmin<0 and correct_divmod_folding):
       rems = [min((r:=f%c), r-c, key=abs) for f in factors]
-      if (rem:=sum(r*v for r,v in zip(rems,terms))+const%c).vmin//c==rem.vmax//c:
-        if d.op is Ops.MOD: return rem - rem.vmin//c*c
-        return sum((f-r)//c * v for f,r,v in zip(factors,rems,terms)) + (const-const%c+rem.vmin//c*c)//c
+      const_mod = const % c
+      rem_min = rem_max = const_mod
+      weighted_terms: list[tuple[int,UOp]] = []
+      for r,v in zip(rems, terms):
+        if r == 0: continue
+        weighted_terms.append((r, v))
+        lo, hi = (v.vmin, v.vmax) if r >= 0 else (v.vmax, v.vmin)
+        rem_min += r*lo
+        rem_max += r*hi
+      rem_min_floor, rem_max_floor = rem_min//c, rem_max//c
+      if rem_min_floor == rem_max_floor:
+        if d.op is Ops.MOD:
+          rem_expr = combine_terms([r*v for r,v in weighted_terms], const_mod)
+          if rem_min_floor == 0: return rem_expr
+          return rem_expr - x.const_like(rem_min_floor*c)
+        quot_terms = [((f-r)//c)*v for f,r,v in zip(factors,rems,terms) if (f-r)//c]
+        return combine_terms(quot_terms, (const-const_mod+rem_min_floor*c)//c)
 
     # gcd_with_remainder: factor out common gcd from numerator
     # Note: this rule uses uops_no_const to exclude the additive constant from the GCD calculation
