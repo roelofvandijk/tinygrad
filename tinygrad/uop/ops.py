@@ -96,9 +96,50 @@ class UOpMetaClass(type):
 # some uops map to other stuff
 buffers:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary() # this maps BUFFER uops to their device Buffers
 all_metadata:weakref.WeakKeyDictionary[UOp, tuple[Metadata, ...]] = weakref.WeakKeyDictionary() # TODO: should this be here?
+class _CacheNone: pass
+_CACHE_NONE = _CacheNone()
 
+class WeakUOpCache:
+  def __init__(self):
+    self.single: weakref.WeakKeyDictionary[UOp, weakref.ReferenceType] = weakref.WeakKeyDictionary()
+    self.uop_sub: weakref.WeakKeyDictionary[UOp, weakref.WeakKeyDictionary[UOp, weakref.ReferenceType]] = weakref.WeakKeyDictionary()
+    self.other_sub: weakref.WeakKeyDictionary[UOp, dict[Any, weakref.ReferenceType]] = weakref.WeakKeyDictionary()
+  def get(self, key:UOp, subkey:Any=None) -> UOp|None:
+    if subkey is None:
+      ref = self.single.get(key)
+      if ref is None: return None
+      ret = ref()
+      return None if ret is _CACHE_NONE else ret
+    if isinstance(subkey, UOp):
+      inner = self.uop_sub.get(key)
+      ref = None if inner is None else inner.get(subkey)
+      if ref is None: return None
+      ret = ref()
+      return None if ret is _CACHE_NONE else ret
+    inner = self.other_sub.get(key)
+    ref = None if inner is None else inner.get(subkey)
+    if ref is None: return None
+    ret = ref()
+    return None if ret is _CACHE_NONE else ret
+  def set(self, key:UOp, value:UOp|None, subkey:Any=None, allow_none:bool=False):
+    if value is None and not allow_none: return
+    if subkey is None:
+      self.single[key] = weakref.ref(_CACHE_NONE if value is None else value)
+      return
+    if isinstance(subkey, UOp):
+      inner = self.uop_sub.setdefault(key, weakref.WeakKeyDictionary())
+      inner[subkey] = weakref.ref(_CACHE_NONE if value is None else value)
+      return
+    inner = self.other_sub.setdefault(key, {})
+    inner[subkey] = weakref.ref(_CACHE_NONE if value is None else value)
+  def clear(self):
+    self.single.clear(); self.uop_sub.clear(); self.other_sub.clear()
+_simplify_cache = WeakUOpCache()
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
 _NOT_FOUND = object()
+_CONST_LIKE_DEVICE_OPS = frozenset({Ops.BUFFER, Ops.BUFFERIZE, Ops.BUFFER_VIEW, Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG,
+  Ops.COPY, Ops.STORE, Ops.LOAD, Ops.ALLREDUCE, Ops.MULTI, Ops.MSELECT, Ops.MSTACK, Ops.KERNEL})
+_CONST_LIKE_SHAPE_OPS = (_CONST_LIKE_DEVICE_OPS | GroupOp.All | frozenset({Ops.REDUCE_AXIS, Ops.WMMA}))
 class recursive_property(property):
   def __init__(self, fxn):
     self.fxn = fxn
@@ -301,8 +342,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   # determine what ranges this is in
   @recursive_property
   def _ranges(self) -> dict[UOp, None]:
-    ret: dict[UOp, None] = {}
-    for s in self.src: ret.update(s.ranges)
+    ret: dict[UOp, None] = {x:None for s in self.src for x in s.ranges}
     for er in self.ended_ranges:
       if er.op is Ops.RANGE:
         # if it's a single RANGE, we don't flow through it.
@@ -324,8 +364,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def simplify(self, tracked=False):
     # late import!
     from tinygrad.uop.symbolic import symbolic
+    if not tracked:
+      if (ret:=_simplify_cache.get(self)) is not None: return ret
     with Context(TRACK_MATCH_STATS=0 if not tracked else TRACK_MATCH_STATS.value):
-      return graph_rewrite(self, symbolic, name="simplify")
+      ret = graph_rewrite(self, symbolic, name="simplify")
+    if not tracked: _simplify_cache.set(self, ret)
+    return ret
+
   def ssimplify(self) -> UOp|ConstType: return ret.arg if (ret:=self.simplify()).op is Ops.CONST else ret
   def sintify(self) -> sint: return self.arg if self.op is Ops.CONST else self
   def _eval(self, dtype, expected_type:Type[T]) -> T:
@@ -374,8 +419,28 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     else:
       return self.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx])
   def const_like(self, b:ConstLike):
-    # constants can optionally have a DEVICE source
-    return UOp.const(self.dtype, b, device=self._device, shape=self._shape)
+    # constants can optionally inherit DEVICE/shape; avoid expensive property walks when possible
+    device_cache = self.__dict__.get("_RECURSIVE_PROPERTY__device", _NOT_FOUND)
+    if device_cache is _NOT_FOUND:
+      device = self._device if self.op in _CONST_LIKE_DEVICE_OPS else None
+    else:
+      device = device_cache
+    shape_cache = self.__dict__.get("_RECURSIVE_PROPERTY__shape", _NOT_FOUND)
+    if shape_cache is _NOT_FOUND:
+      if self.op in _CONST_LIKE_SHAPE_OPS:
+        try:
+          shape = self._shape
+        except RuntimeError:
+          shape = None
+      else:
+        shape = None
+    else:
+      shape = shape_cache
+    if shape is not None and device is None:
+      # reshaping needs the scalar const to have a device-backed shape
+      cached_device = self.__dict__.get("_RECURSIVE_PROPERTY__device", _NOT_FOUND)
+      device = cached_device if cached_device is not _NOT_FOUND else self._device
+    return UOp.const(self.dtype, b, device=device, shape=shape)
   def broadcast(self, count:int):
     assert self.dtype.vcount == 1
     if count == 1: return self
@@ -1011,9 +1076,11 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher) -> PatternMatcher: return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None) -> UOp|None:
-    ler = {u.op for u in uop.src}
+    ler = None
     for _,match,early_reject in self.pdict.get(uop.op, []):
-      if not early_reject.issubset(ler): continue
+      if early_reject:
+        if ler is None: ler = {u.op for u in uop.src}
+        if not early_reject.issubset(ler): continue
       if (ret:=match(uop, ctx)) is not None and ret is not uop: return ret
     return None
 
@@ -1097,13 +1164,15 @@ def profile_matches(fxn:Callable):
 class TrackedPatternMatcher(PatternMatcher):
   def rewrite(self, uop:UOp, ctx=None) -> UOp|None:
     ret = None
-    ler = {u.op for u in uop.src}
+    ler = None
     for p,match,early_reject in self.pdict.get(uop.op, []):
       if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
       st = time.perf_counter()
-      if not early_reject.issubset(ler):
-        match_stats[p][2] += time.perf_counter()-st
-        continue
+      if early_reject:
+        if ler is None: ler = {u.op for u in uop.src}
+        if not early_reject.issubset(ler):
+          match_stats[p][2] += time.perf_counter()-st
+          continue
       match_stats[p][1] += 1
       try: ret = match(uop, ctx)
       except Exception:
