@@ -137,6 +137,9 @@ class WeakUOpCache:
 _simplify_cache = WeakUOpCache()
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
 _NOT_FOUND = object()
+_CONST_LIKE_DEVICE_OPS = frozenset({Ops.BUFFER, Ops.BUFFERIZE, Ops.BUFFER_VIEW, Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG,
+  Ops.COPY, Ops.STORE, Ops.LOAD, Ops.ALLREDUCE, Ops.MULTI, Ops.MSELECT, Ops.MSTACK, Ops.KERNEL})
+_CONST_LIKE_SHAPE_OPS = (_CONST_LIKE_DEVICE_OPS | GroupOp.All | frozenset({Ops.REDUCE_AXIS, Ops.WMMA}))
 class recursive_property(property):
   def __init__(self, fxn):
     self.fxn = fxn
@@ -416,8 +419,28 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     else:
       return self.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx])
   def const_like(self, b:ConstLike):
-    # constants can optionally have a DEVICE source
-    return UOp.const(self.dtype, b, device=self._device, shape=self._shape)
+    # constants can optionally inherit DEVICE/shape; avoid expensive property walks when possible
+    device_cache = self.__dict__.get("_RECURSIVE_PROPERTY__device", _NOT_FOUND)
+    if device_cache is _NOT_FOUND:
+      device = self._device if self.op in _CONST_LIKE_DEVICE_OPS else None
+    else:
+      device = device_cache
+    shape_cache = self.__dict__.get("_RECURSIVE_PROPERTY__shape", _NOT_FOUND)
+    if shape_cache is _NOT_FOUND:
+      if self.op in _CONST_LIKE_SHAPE_OPS:
+        try:
+          shape = self._shape
+        except RuntimeError:
+          shape = None
+      else:
+        shape = None
+    else:
+      shape = shape_cache
+    if shape is not None and device is None:
+      # reshaping needs the scalar const to have a device-backed shape
+      cached_device = self.__dict__.get("_RECURSIVE_PROPERTY__device", _NOT_FOUND)
+      device = cached_device if cached_device is not _NOT_FOUND else self._device
+    return UOp.const(self.dtype, b, device=device, shape=shape)
   def broadcast(self, count:int):
     assert self.dtype.vcount == 1
     if count == 1: return self
