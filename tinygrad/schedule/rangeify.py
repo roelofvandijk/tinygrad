@@ -2,13 +2,15 @@ from dataclasses import dataclass, field
 import itertools
 from tinygrad.dtype import dtypes, PtrDType, ImageDType, AddrSpace
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, _substitute, ssimplify, KernelInfo
-from tinygrad.uop.ops import track_rewrites, graph_rewrite, identity_element, sint, AxisType, BottomUpGate, Kernel, _remove_all_tags, range_str
+from tinygrad.uop.ops import track_rewrites, graph_rewrite, graph_rewrite_map, identity_element, sint, AxisType, BottomUpGate, Kernel
+from tinygrad.uop.ops import _remove_all_tags, range_str
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import argsort, prod, all_same, pluralize, getenv, flatten, dedup, all_int, DEBUG, SPLIT_REDUCEOP, DEBUG_RANGEIFY
 from tinygrad.helpers import PCONTIG, partition, get_single_element, unwrap, disable_gc
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.codegen.opt import Opt
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, ALWAYS_CONTIGUOUS, IndexingContext, apply_movement_op
+from tinygrad.schedule.multi import multi_pm
 
 # creation can recurse a lot
 import sys
@@ -541,9 +543,15 @@ replace_contiguous = PatternMatcher([
 @disable_gc()
 @track_rewrites(lambda _,ret: f"Schedule {pluralize('Kernel', len([u for u in UOp.sink(*ret.values()).toposort() if u.op is Ops.KERNEL]))}", True)
 def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
+
   if getenv("VIZ"): graph_rewrite(sink, PatternMatcher([]), name="View Input Graph")
+  multi_map = graph_rewrite_map(sink, multi_pm, name="multi_pm")
+  if getenv("VIZ"): graph_rewrite(multi_map.get(sink, sink), PatternMatcher([]), name="View Post Multi AST")
+  multi_rev_map = {v:k for k,v in multi_map.items()}
+  multi_sink = multi_map.get(sink, sink)
+
   uop_list: list[UOp] = []
-  tsink = graph_rewrite(sink, add_tags, ctx=uop_list, bottom_up=True, name="number the uops")
+  tsink = graph_rewrite(multi_sink, add_tags, ctx=uop_list, bottom_up=True, name="number the uops")
 
   tsink = graph_rewrite(tsink, pm_mops+earliest_rewrites+replace_contiguous, ctx={}, name="earliest rewrites")
 
@@ -590,5 +598,7 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
     assert tag is not None
     for a in tag:
       if a is None: continue
-      becomes_map[uop_list[int(a)]] = s
+      becomes_map[multi_rev_map.get(uop_list[int(a)], uop_list[int(a)])] = s
+  for orig, multi in multi_map.items():
+    becomes_map.setdefault(orig, multi)
   return becomes_map
