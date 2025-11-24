@@ -1236,12 +1236,14 @@ class RewriteContext:
 
   def cached_pm_rewrite(self, x:UOp) -> UOp|None:
     if (ret:=self.pm_cache.get(x,SENTINEL)) is not SENTINEL: return ret
-    ret = self.pm_cache[x] = unwrap(self.pm).rewrite(x, self.ctx)
+    if x.op not in unwrap(self.pm).pdict: return None
+    if (ret:=unwrap(self.pm).rewrite(x, self.ctx)) is not None: self.pm_cache[x] = ret
     return ret
 
   def cached_bpm_rewrite(self, x:UOp) -> UOp|None:
     if (ret:=self.bpm_cache.get(x,SENTINEL)) is not SENTINEL: return ret
-    ret = self.bpm_cache[x] = unwrap(self.bpm).rewrite(x, self.ctx)
+    if x.op not in unwrap(self.bpm).pdict: return None
+    if (ret:=unwrap(self.bpm).rewrite(x, self.ctx)) is not None: self.bpm_cache[x] = ret
     return ret
 
   def unified_rewrite(self, root:UOp) -> UOp:
