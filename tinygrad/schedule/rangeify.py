@@ -9,6 +9,7 @@ from tinygrad.helpers import PCONTIG, partition, get_single_element, unwrap, dis
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.codegen.opt import Opt
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, ALWAYS_CONTIGUOUS, IndexingContext, apply_movement_op
+from tinygrad.schedule.multi import get_multi_map
 
 # creation can recurse a lot
 import sys
@@ -542,8 +543,11 @@ replace_contiguous = PatternMatcher([
 @track_rewrites(lambda _,ret: f"Schedule {pluralize('Kernel', len([u for u in UOp.sink(*ret.values()).toposort() if u.op is Ops.KERNEL]))}", True)
 def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
   if getenv("VIZ"): graph_rewrite(sink, PatternMatcher([]), name="View Input Graph")
+  multi_map = get_multi_map(sink)
+  multi_rev_map = {v:k for k,v in multi_map.items()}
+  multi_sink = multi_map.get(sink, sink)
   uop_list: list[UOp] = []
-  tsink = graph_rewrite(sink, add_tags, ctx=uop_list, bottom_up=True, name="number the uops")
+  tsink = graph_rewrite(multi_sink, add_tags, ctx=uop_list, bottom_up=True, name="number the uops")
 
   tsink = graph_rewrite(tsink, pm_mops+earliest_rewrites+replace_contiguous, ctx={}, name="earliest rewrites")
 
@@ -591,4 +595,9 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
     for a in tag:
       if a is None: continue
       becomes_map[uop_list[int(a)]] = s
-  return becomes_map
+  final_map: dict[UOp, UOp] = {}
+  for uop, repl in becomes_map.items():
+    final_map[multi_rev_map.get(uop, uop)] = repl
+  for orig, multi in multi_map.items():
+    final_map.setdefault(orig, multi)
+  return final_map
