@@ -31,6 +31,9 @@ def is_packed(dt:DType, odt:DType|None = None) -> bool:
 wgsl_matcher = PatternMatcher([
   (UPat((Ops.CMPLT, Ops.XOR), src=(UPat(name="a", dtype=dtypes.bool), UPat.var("b")), name="c"),
    lambda a,b,c: a.cast(dtypes.int).alu(c.op, b.cast(dtypes.int)).cast(dtypes.bool)),
+  # webgpu doesn't support 64-bit ints, cast them down
+  (UPat(Ops.CAST, dtype=dtypes.uint64, name="x"), lambda x: x.src[0].cast(dtypes.uint32)),
+  (UPat(Ops.CAST, dtype=dtypes.int64, name="x"), lambda x: x.src[0].cast(dtypes.int32)),
   # TODO: load alt value doesnt have to be a const
   (UPat.load(UPat.var("b"), UPat.cvar("c"), allow_any_len=True, name="l"),
    lambda l,b,c: packed_load(l,b,l.dtype,c.cast(dtypes.uint32)) if is_packed(l.dtype, b.dtype) else None),
