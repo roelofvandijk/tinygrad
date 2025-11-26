@@ -284,7 +284,9 @@ def uop_given_valid(valid:UOp, uop:UOp, try_simplex=True) -> UOp:
     bounds[expr][int(is_upper)] = c
 
   # simplify uop given that valid is True
+  uop_topo = uop.toposort() if try_simplex else set()
   all_candidates = []
+  orig_uop = uop
   for i,(expr,v) in enumerate(bounds.items()):
     v0, v1 = (expr.vmin if v[0] is None else v[0], expr.vmax if v[1] is None else v[1])
     # try checking the whole clause
@@ -298,18 +300,26 @@ def uop_given_valid(valid:UOp, uop:UOp, try_simplex=True) -> UOp:
         candidates.append([(Xi, UOp.variable(f"fake{i}", 1, Xi.vmax, Xi.dtype)) for Xi in expr.split_uop(Ops.ADD)])
 
       for candidate in candidates:
+        if len(candidate) == 1 and len(candidates) == 1: continue
+        if not any(X in uop_topo for X,_ in candidate): continue
         # if every branch in candidate gives the same simplified uop, we can rewrite the uop
         newuops = [uop.substitute({X:newX}) for X,newX in candidate]
         if any(u is uop for u in newuops): continue  # if any branch doesnt appear in uop, skip
-        newuops = [u.simplify().substitute({newX:X}).simplify() for (X,newX),u in zip(candidate,newuops)]
+        if all_same(newuops): continue
+        newuops = [u.simplify().substitute({newX:X for X,newX in candidate}).simplify() for (X,newX),u in zip(candidate,newuops)]
         if all_same(newuops): uop = newuops[0]
         elif uop.op is Ops.VECTORIZE and len(uop.src) == 2:
           if all_same([uops.src[0] for uops in newuops]): uop = uop.replace(src=(newuops[0].src[0], uop.src[1]))
           if all_same([uops.src[1] for uops in newuops]): uop = uop.replace(src=(uop.src[0], newuops[0].src[1]))
 
-  # try all the valids together (but only the whole expressions)
-  if (s_uop:=uop.substitute(sub_dict:=dict(all_candidates))) is not uop:
-    uop = s_uop.simplify().substitute({newX:X for X,newX in sub_dict.items()}).simplify()
+  # try all the valids together (but only the whole expressions) - skip if simplex already changed uop
+  # also skip entirely if none of the expressions appear in the uop
+  if uop is orig_uop and all_candidates:
+    filtered_candidates = [(expr,newX) for expr,newX in all_candidates if expr in uop_topo]
+    if 0 < len(filtered_candidates) <= 3 and len(uop_topo) <= 256 and (s_uop:=uop.substitute(sub_dict:=dict(filtered_candidates))) is not uop:
+      simplified_s_uop = s_uop.simplify()
+      if simplified_s_uop is s_uop: pass
+      else: uop = simplified_s_uop.substitute({newX:X for X,newX in sub_dict.items()}).simplify()
   return uop
 
 def _valid_priority(v: UOp, valids:list[UOp]):
