@@ -1,10 +1,14 @@
 from tinygrad.dtype import DType, PtrDType, dtypes, AddrSpace
+from tinygrad.uop import GroupOp
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite, extra_pm
 from tinygrad.helpers import strip_parens
 
 def sign_extend(val:UOp, sext_am:int):
-  return (UOp.where((val >> (sext_am - 1)) > 0, UOp.const(dtypes.uint32, 0xffffffff) << sext_am, UOp.const(dtypes.uint32, 0)) \
+  # ensure the shift result stays as uint32 (webgpu doesn't support 64-bit ints)
+  shl_const = UOp.const(dtypes.uint32, 0xffffffff) << sext_am
+  if shl_const.dtype != dtypes.uint32: shl_const = shl_const.cast(dtypes.uint32)
+  return (UOp.where((val >> (sext_am - 1)) > 0, shl_const, UOp.const(dtypes.uint32, 0)) \
         | val.bitcast(dtypes.uint32)).bitcast(dtypes.int)
 
 # store for char: buf[idx/4] <- (var << (idx%4)*8))
@@ -37,8 +41,15 @@ wgsl_matcher = PatternMatcher([
   (UPat.load(UPat.var("b"), name='l', allow_any_len=True), lambda l,b: packed_load(l, b, l.dtype) if is_packed(l.dtype, b.dtype) else None),
   (UPat.store(UPat.var("bidx"), UPat.var("var"), allow_any_len=True),
    lambda bidx,var: packed_store(bidx,var) if is_packed(var.dtype, bidx.dtype) else None),
-  (UPat.var("a") << UPat.var("b"),lambda a,b:(a.bitcast(dtypes.uint32)<<b.cast(dtypes.uint32)).bitcast(a.dtype) if b.dtype!=dtypes.uint32 else None),
+  # shift: bitcast to uint32, shift, then cast back (but never to 64-bit types since webgpu doesn't support them)
+  (UPat.var("a") << UPat.var("b"),
+   lambda a,b: (a.bitcast(dtypes.uint32)<<b.cast(dtypes.uint32)).cast(
+     a.dtype if a.dtype not in (dtypes.uint64, dtypes.int64) else dtypes.uint32) if b.dtype!=dtypes.uint32 else None),
   (UPat.var("x") >> UPat.var("y"), lambda x,y: UOp(Ops.SHR, x.dtype, (x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
+  # webgpu doesn't support 64-bit ints - convert all 64-bit ops to 32-bit (LAST to avoid recursive matching)
+  (UPat(GroupOp.All, dtype=(dtypes.uint64, dtypes.int64), name="x"),
+   lambda x: x.replace(dtype=dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32,
+                       src=tuple(s.cast(dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32) for s in x.src))),
   ]) + extra_pm
 
 class WGSLRenderer(CStyleLanguage):
