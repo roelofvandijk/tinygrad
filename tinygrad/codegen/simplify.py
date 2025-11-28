@@ -1,5 +1,5 @@
 import itertools
-from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, _substitute, range_start, ImageDType
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, range_start, ImageDType
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import partition, dedup
 from tinygrad.dtype import dtypes
@@ -28,17 +28,31 @@ def simplify_merge_adjacent(u:UOp) -> UOp|None:
         s0, s1 = r0.src[0], r1.src[0]
         # do the merge
         new_range = r0.replace(src=(s0*s1,))
-        nidx = graph_rewrite(u, _substitute+symbolic+pm_flatten_range, ctx={r0:new_range//s1, r1:new_range%s1},
-                             name=f"check_merge_{r0.arg[0]}_{r1.arg[0]}")
+        subs = {r0: new_range//s1, r1: new_range%s1}
+        replace: dict[UOp, UOp] = {}
+        for n in u.toposort():
+          if n in subs:
+            replace[n] = subs[n]
+            continue
+          new_src = tuple(replace.get(x, x) for x in n.src)
+          if new_src == n.src:
+            replace[n] = n
+            continue
+          nn = n.replace(src=new_src)
+          if nn.op in range_start and (nflat:=flatten_range(nn)) is not None: nn = nflat
+          replace[n] = nn
+        nidx = replace[u]
 
         # check if it simplifies
         if count_divmod(nidx) <= count_divmod(u):
           u = nidx
   return u
 
-pm_simplify_ranges = PatternMatcher([
+_pm_simplify_ranges = PatternMatcher([
   (UPat((Ops.END, Ops.REDUCE), name="u"), simplify_merge_adjacent),
 ])
+
+pm_simplify_ranges = _pm_simplify_ranges + pm_flatten_range + symbolic
 
 def mark_range_mod(ctx, r:UOp, c:UOp):
   if r not in ctx and r.src[0].op is Ops.CONST and r.src[0].divides(c.arg) is not None: ctx[r] = c
