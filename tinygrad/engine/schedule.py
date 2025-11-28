@@ -1,11 +1,11 @@
 import time
 from typing import cast
 from dataclasses import dataclass, field, replace
-from collections import deque
-from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass
+from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass, print_uops
 from tinygrad.uop.spec import type_verify, tensor_spec
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.helpers import Metadata, DEBUG, cpu_profile, TracingKey, SPEC, flatten
+from tinygrad.codegen.late.linearizer import linearize
 
 # **** ScheduleItem return type
 
@@ -20,53 +20,22 @@ class ScheduleItem:
 # **** schedule linearizer
 
 def create_schedule_with_vars(sched_sink:UOp) -> tuple[list[ScheduleItem], dict[str, int]]:
-  with cpu_profile(TracingKey("toposort sched_sink")):
-    # construct the KERNEL children graph based on assigns
-    children: dict[UOp, list[UOp]] = {}
-    in_degree: dict[UOp, int] = {}
+  with cpu_profile(TracingKey("linearize sched_sink")):
     var_vals: dict[str, int] = {}
     for u in sched_sink.toposort():
-      if u.op is Ops.RANGE:
-        in_degree.setdefault(u, 0)
-        continue
-      if u.op is not Ops.AFTER or u.src[1].op is Ops.RANGE: continue
-      k = u.src[1]
-      in_degree.setdefault(k, 0)
-      for s in k.src[0].src if k.op is Ops.END else k.src:
-        if s.op is Ops.AFTER:
-          children.setdefault(s.src[1], []).append(k)
-          in_degree[k] += 1
-        elif s.op in {Ops.MSELECT, Ops.MSTACK}:
-          for ss in s.src:
-            if ss.op is Ops.MSELECT: ss = ss.src[0]
-            if ss.op is not Ops.BUFFER:
-              assert ss.op is Ops.AFTER, f"ss.op is not AFTER, it's {ss.op}"
-              children.setdefault(ss.src[1], []).append(k)
-              in_degree[k] += 1
-        elif s.op is Ops.BUFFER:
-          pass  # a BUFFER is already realized, nothing to do here
-        elif s.op is Ops.BIND:
-          # for RANGE this is in fixedvars
-          if s.src[1].op is not Ops.RANGE:
-            var, val = s.unbind()
-            assert var.expr not in var_vals or var_vals[var.expr] == val, f"bind mismatch on {var}, {var_vals[var.expr]} != {val}"
-            var_vals[var.expr] = val
-        else:
-          raise RuntimeError(f"input to kernel must be AFTER or BUFFER, not {s.op}")
+      if u.op is Ops.BIND and u.src[1].op is not Ops.RANGE:
+        var, val = u.unbind()
+        assert var.expr not in var_vals or var_vals[var.expr] == val, f"bind mismatch on {var}, {var_vals[var.expr]} != {val}"
+        var_vals[var.expr] = val
 
-  with cpu_profile(TracingKey("linearize to ScheduleItem")):
-    queue: deque[UOp] = deque()
-    for k,v in in_degree.items():
-      if v == 0: queue.append(k)
+    lst = linearize(sched_sink, tuple_order=False)
+    if DEBUG >= 2: print_uops(lst)
 
+  with cpu_profile(TracingKey("build schedule")):
     schedule: list[ScheduleItem|UOp] = []
-    while len(queue):
-      k = rk = queue.popleft()
-      if k.op is Ops.END: k = k.src[0]
-      if k.op is Ops.RANGE: schedule.append(k)
-      elif k.op is Ops.KERNEL:
+    for k in lst:
+      if k.op is Ops.KERNEL:
         ast = k.arg.ast
-        # create subbuffers if needed
         if ast.op is Ops.BUFFER_VIEW:
           base = k.src[1].buf_uop.buffer
           assert isinstance(base, Buffer), "base can't be MultiBuffer"
@@ -79,14 +48,9 @@ def create_schedule_with_vars(sched_sink:UOp) -> tuple[list[ScheduleItem], dict[
           for i,bufs in enumerate(zip(*[x.bufs for x in cast(tuple[MultiBuffer, ...], ubufs)])):
             schedule.append(ScheduleItem(ast, bufs, k.arg.metadata, {dnums[0].expr:i} if len(dnums) else {}, bound_ranges=bound_ranges))
         else:
-          # ONE -> ONE
           schedule.append(ScheduleItem(ast, cast(tuple[Buffer, ...], ubufs), k.arg.metadata, bound_ranges=bound_ranges))
-        if rk.op is Ops.END: schedule.append(rk)
-      else:
-        raise RuntimeError(f"can't schedule {k.op}")
-      for x in children.get(rk, []):
-        in_degree[x] -= 1
-        if in_degree[x] == 0: queue.append(x)
+      elif k.op in (Ops.RANGE, Ops.END):
+        schedule.append(k)
 
   with cpu_profile(TracingKey("expand ranges")):
     real_schedule: list[ScheduleItem] = []

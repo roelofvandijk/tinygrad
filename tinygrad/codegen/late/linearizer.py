@@ -4,12 +4,13 @@ from collections import defaultdict
 from tinygrad.uop.ops import PatternMatcher, UOp, Ops, UPat, multirange_str
 from tinygrad.helpers import prod, getenv, TUPLE_ORDER
 
-def linearize(sink:UOp) -> list[UOp]:
+def linearize(sink:UOp, tuple_order=TUPLE_ORDER) -> list[UOp]:
   # this is a toposort with priority
   lst = list(sink.toposort())
   consumers: defaultdict[UOp, list[UOp]] = defaultdict(list)
   in_degree:dict[UOp, int] = {}
   out_degree:dict[UOp, int] = {}
+  extra_parents: defaultdict[UOp, list[UOp]] = defaultdict(list)
   priorities:dict[UOp, tuple[int, int, Any]] = {}
 
   # get consumers and assign priorities
@@ -38,15 +39,28 @@ def linearize(sink:UOp) -> list[UOp]:
       case _: priority = 0            # everything else has priority 0
     priorities[u] = (run_count, priority, extra)
 
+
+  # WAR hazard: if kernel writes to buffer that another kernel reads from (directly), writer must wait
+  # TODO: this should be in rangeify?
+  kernels = [(u.src[1], u.buf_uop) for u in lst if u.op is Ops.AFTER and u.src[1].op is Ops.KERNEL]
+  for k, _ in kernels:
+    reads = {s for s in k.src if s.op is Ops.BUFFER}
+    for k2, dest2 in kernels:
+      if k2 is k: continue
+      if dest2 in reads and k2 not in consumers[k]:  # k2 writes to something k reads
+        consumers[k].append(k2)
+        out_degree[k] += 1
+        extra_parents[k2].append(k)
+
   # number the uops in "ideal" order
-  nkey = {u:i for i,u in enumerate(sorted(lst, key=lambda x: priorities[x]+(x.tuplize if TUPLE_ORDER else ())))}
+  nkey = {u:i for i,u in enumerate(sorted(lst, key=lambda x: priorities[x]+(x.tuplize if tuple_order else ())))}
 
   # then force them to be toposorted in as close to the ideal order as possible
   heap = [(-nkey[sink], sink)]
   newlst = []
   while heap:
     newlst.append(u:=heapq.heappop(heap)[1])
-    for v in u.src:
+    for v in u.src + tuple(extra_parents[u]):
       out_degree[v] -= 1
       if out_degree[v] == 0: heapq.heappush(heap, (-nkey[v],v))
   newlst = newlst[::-1]
