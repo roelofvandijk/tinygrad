@@ -1,4 +1,5 @@
 from tinygrad.dtype import DType, PtrDType, dtypes, AddrSpace
+from tinygrad.uop import GroupOp
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite, extra_pm
 from tinygrad.helpers import strip_parens
@@ -35,7 +36,8 @@ wgsl_matcher = PatternMatcher([
   (UPat((Ops.CMPLT, Ops.XOR), src=(UPat(name="a", dtype=dtypes.bool), UPat.var("b")), name="c"),
    lambda a,b,c: a.cast(dtypes.int).alu(c.op, b.cast(dtypes.int)).cast(dtypes.bool)),
   # webgpu doesn't support 64-bit ints - convert all 64-bit ops to 32-bit
-  (UPat(dtype=(dtypes.uint64, dtypes.int64), name="x"),
+  (UPat((*GroupOp.Elementwise, Ops.LOAD, Ops.CONST, Ops.VCONST, Ops.INDEX, Ops.GEP, Ops.VECTORIZE),
+        dtype=(dtypes.uint64, dtypes.int64), name="x"),
    lambda x: x.replace(dtype=dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32,
                        src=tuple(s.cast(dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32) for s in x.src))),
   # TODO: load alt value doesnt have to be a const
