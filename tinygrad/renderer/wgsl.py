@@ -34,9 +34,10 @@ def is_packed(dt:DType, odt:DType|None = None) -> bool:
 wgsl_matcher = PatternMatcher([
   (UPat((Ops.CMPLT, Ops.XOR), src=(UPat(name="a", dtype=dtypes.bool), UPat.var("b")), name="c"),
    lambda a,b,c: a.cast(dtypes.int).alu(c.op, b.cast(dtypes.int)).cast(dtypes.bool)),
-  # webgpu doesn't support 64-bit ints, cast them down
-  (UPat(Ops.CAST, dtype=dtypes.uint64, name="x"), lambda x: x.src[0].cast(dtypes.uint32)),
-  (UPat(Ops.CAST, dtype=dtypes.int64, name="x"), lambda x: x.src[0].cast(dtypes.int32)),
+  # webgpu doesn't support 64-bit ints - convert all 64-bit ops to 32-bit
+  (UPat(dtype=(dtypes.uint64, dtypes.int64), name="x"),
+   lambda x: x.replace(dtype=dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32,
+                       src=tuple(s.cast(dtypes.uint32 if x.dtype == dtypes.uint64 else dtypes.int32) for s in x.src))),
   # TODO: load alt value doesnt have to be a const
   (UPat.load(UPat.var("b"), UPat.cvar("c"), allow_any_len=True, name="l"),
    lambda l,b,c: packed_load(l,b,l.dtype,c.cast(dtypes.uint32)) if is_packed(l.dtype, b.dtype) else None),
@@ -44,7 +45,9 @@ wgsl_matcher = PatternMatcher([
   (UPat.store(UPat.var("bidx"), UPat.var("var"), allow_any_len=True),
    lambda bidx,var: packed_store(bidx,var) if is_packed(var.dtype, bidx.dtype) else None),
   # shift: bitcast to uint32, shift, then cast back (but never to 64-bit types since webgpu doesn't support them)
-  (UPat.var("a") << UPat.var("b"),lambda a,b:(a.bitcast(dtypes.uint32)<<b.cast(dtypes.uint32)).cast(a.dtype if a.dtype not in (dtypes.uint64, dtypes.int64) else dtypes.uint32) if b.dtype!=dtypes.uint32 else None),
+  (UPat.var("a") << UPat.var("b"),
+   lambda a,b: (a.bitcast(dtypes.uint32)<<b.cast(dtypes.uint32)).cast(
+     a.dtype if a.dtype not in (dtypes.uint64, dtypes.int64) else dtypes.uint32) if b.dtype!=dtypes.uint32 else None),
   (UPat.var("x") >> UPat.var("y"), lambda x,y: UOp(Ops.SHR, x.dtype, (x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
   ]) + extra_pm
 
