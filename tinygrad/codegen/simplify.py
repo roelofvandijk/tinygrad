@@ -3,6 +3,10 @@ from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, rang
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import partition, dedup
 from tinygrad.dtype import dtypes
+try:
+  from line_profiler import profile
+except ImportError:  # pragma: no cover
+  def profile(fn): return fn
 
 def flatten_range(r:UOp):
   off = range_start[r.op]
@@ -16,47 +20,38 @@ pm_flatten_range = PatternMatcher([
   (UPat((Ops.REDUCE, Ops.STORE, Ops.END), name="r"), flatten_range),
 ])
 
+def substitute_flatten(u:UOp, utopo:list[UOp], subs:dict[UOp, UOp]) -> UOp:
+  replaced: dict[UOp, UOp] = {}
+  for n in utopo:
+    if n in subs:
+      replaced[n] = subs[n]
+      continue
+    new_src = tuple(replaced.get(x, x) for x in n.src)
+    nn = n if new_src == n.src else n.replace(src=new_src)
+    if nn.op in range_start and (nflat:=flatten_range(nn)) is not None: nn = nflat
+    replaced[n] = nn
+  return replaced[u]
+
 def count_divmod(x:UOp): return len([u for u in x.toposort() if u.op in {Ops.IDIV, Ops.MOD}])
 def simplify_merge_adjacent(u:UOp) -> UOp|None:
-  def apply_symbolic(nn:UOp):
-    while (rew:=symbolic.rewrite(nn)) not in {None, nn}: nn = rew
-    return nn
-
+  
   reduce_ranges = [x.ranges for x in u.backward_slice_with_self if x.op is Ops.REDUCE]
+  utopo = list(u.toposort())
+  udivmod = len([n for n in utopo if n.op in {Ops.IDIV, Ops.MOD}])
   # on END we only want to merge adjacent ranges, on REDUCE we want to try all combinations
   for r0, r1 in (zip(u.ended_ranges, u.ended_ranges[1:]) if u.op is Ops.END else itertools.permutations(u.ended_ranges, 2)):
-    # check same type
-    if r0.arg[-1] == r1.arg[-1]:
-      # check if the ranges to merge are in the same reduces
-      if all((r0 in rngs) == (r1 in rngs) for rngs in reduce_ranges):
-        s0, s1 = r0.src[0], r1.src[0]
-        # do the merge
-        new_range = r0.replace(src=(s0*s1,))
-        subs = {r0: apply_symbolic(new_range//s1), r1: apply_symbolic(new_range%s1)}
-        replace: dict[UOp, UOp] = {}
-        for n in (utopo:= u.toposort()):
-          if n in subs:
-            replace[n] = subs[n]
-            continue
-          new_src = tuple(replace.get(x, x) for x in n.src)
-          if new_src == n.src:
-            replace[n] = n
-            continue
-          nn = apply_symbolic(n.replace(src=new_src))
-          if nn.op in range_start and (nflat:=flatten_range(nn)) is not None: nn = nflat
-          replace[n] = nn
-        nidx = replace[u]
-
-        # check if it simplifies
-        udivmod = len([u for u in utopo if u.op in {Ops.IDIV, Ops.MOD}])
-        if count_divmod(nidx) <= udivmod: u = nidx
+    if r0.arg[-1] != r1.arg[-1]: continue
+    if not all((r0 in rngs) == (r1 in rngs) for rngs in reduce_ranges): continue
+    s0, s1 = r0.src[0], r1.src[0]
+    new_range = r0.replace(src=(s0*s1,))
+    nidx = substitute_flatten(u, utopo, {r0: new_range//s1, r1: new_range%s1}).simplify()
+    if (ndivmod:=count_divmod(nidx)) <= udivmod:
+      u, utopo, udivmod = nidx, list(nidx.toposort()), ndivmod
   return u
 
-_pm_simplify_ranges = PatternMatcher([
+pm_simplify_ranges = PatternMatcher([
   (UPat((Ops.END, Ops.REDUCE), name="u"), simplify_merge_adjacent),
 ])
-
-pm_simplify_ranges = _pm_simplify_ranges + pm_flatten_range + symbolic
 
 def mark_range_mod(ctx, r:UOp, c:UOp):
   if r not in ctx and r.src[0].op is Ops.CONST and r.src[0].divides(c.arg) is not None: ctx[r] = c
