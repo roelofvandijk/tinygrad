@@ -18,6 +18,10 @@ pm_flatten_range = PatternMatcher([
 
 def count_divmod(x:UOp): return len([u for u in x.toposort() if u.op in {Ops.IDIV, Ops.MOD}])
 def simplify_merge_adjacent(u:UOp) -> UOp|None:
+  def apply_symbolic(nn:UOp):
+    while (rew:=symbolic.rewrite(nn)) not in {None, nn}: nn = rew
+    return nn
+
   reduce_ranges = [x.ranges for x in u.backward_slice_with_self if x.op is Ops.REDUCE]
   # on END we only want to merge adjacent ranges, on REDUCE we want to try all combinations
   for r0, r1 in (zip(u.ended_ranges, u.ended_ranges[1:]) if u.op is Ops.END else itertools.permutations(u.ended_ranges, 2)):
@@ -28,7 +32,7 @@ def simplify_merge_adjacent(u:UOp) -> UOp|None:
         s0, s1 = r0.src[0], r1.src[0]
         # do the merge
         new_range = r0.replace(src=(s0*s1,))
-        subs = {r0: new_range//s1, r1: new_range%s1}
+        subs = {r0: apply_symbolic(new_range//s1), r1: apply_symbolic(new_range%s1)}
         replace: dict[UOp, UOp] = {}
         for n in (utopo:= u.toposort()):
           if n in subs:
@@ -38,7 +42,7 @@ def simplify_merge_adjacent(u:UOp) -> UOp|None:
           if new_src == n.src:
             replace[n] = n
             continue
-          nn = n.replace(src=new_src)
+          nn = apply_symbolic(n.replace(src=new_src))
           if nn.op in range_start and (nflat:=flatten_range(nn)) is not None: nn = nflat
           replace[n] = nn
         nidx = replace[u]
