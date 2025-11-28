@@ -1241,7 +1241,11 @@ class Tensor(OpMixin):
       self.assign(res).realize()
     else: # no copy, basic setitem
       v = v.cast(res.dtype)._broadcast_to(_broadcast_shape(res.shape, v.shape)).contiguous()
-      res.assign(v).realize()
+      # fast path: direct copy when on same device
+      if res.device == v.device:
+        res._buffer().copyin(v._data())
+      else:
+        res.assign(v).realize()
 
   def gather(self:Tensor, dim:int, index:Tensor) -> Tensor:
     """

@@ -39,19 +39,6 @@ def linearize(sink:UOp, tuple_order=TUPLE_ORDER) -> list[UOp]:
       case _: priority = 0            # everything else has priority 0
     priorities[u] = (run_count, priority, extra)
 
-  # for schedule linearization: when KERNEL reads from AFTER, it depends on that AFTER's KERNEL
-  # TODO: this should be in rangeify?
-  for u in lst:
-    if u.op is Ops.AFTER and u.src[1].op is not Ops.RANGE:
-      k = u.src[1]  # KERNEL or END
-      kernel_srcs = k.src[0].src if k.op is Ops.END else k.src
-      for s in kernel_srcs:
-        if s.op is Ops.AFTER:
-          dep_kernel = s.src[1]
-          if k not in consumers[dep_kernel]:
-            consumers[dep_kernel].append(k)
-            out_degree[dep_kernel] += 1
-            extra_parents[k].append(dep_kernel)
 
   # WAR hazard: if kernel writes to buffer that another kernel reads from (directly), writer must wait
   # TODO: this should be in rangeify?

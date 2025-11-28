@@ -543,6 +543,9 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
   if getenv("VIZ"): graph_rewrite(sink, PatternMatcher([]), name="View Input Graph")
   uop_list: list[UOp] = []
   tsink = graph_rewrite(sink, add_tags, ctx=uop_list, bottom_up=True, name="number the uops")
+  if tsink.op is Ops.SINK and len(tsink.src) == 1 and tsink.src[0].op is Ops.ASSIGN and tsink.src[0].tag is None:
+    uop_list.append(tsink.src[0])
+    tsink = tsink.replace(src=(tsink.src[0].replace(tag=(len(uop_list)-1,)),))
 
   tsink = graph_rewrite(tsink, pm_mops+earliest_rewrites+replace_contiguous, ctx={}, name="earliest rewrites")
 
@@ -555,8 +558,8 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
   # rebuild the sink with all the BUFFERIZEs with tags, this is what's ending up in the tensor graph
   # MSTACK stacks multiple BUFFERIZEs in one tagged tensor
   # if it's not tagged by here, it's out
-  tsink = UOp.sink(*[x for x in tsink.backward_slice if x.base.op in {Ops.BUFFERIZE, Ops.MSTACK, Ops.CONST, Ops.BUFFER, Ops.AFTER} and \
-                     x.tag is not None and len(x.tag)])
+  tsink = UOp.sink(*[x for x in tsink.backward_slice if x.base.op in {Ops.BUFFERIZE, Ops.MSTACK, Ops.CONST, Ops.BUFFER, Ops.AFTER, Ops.ASSIGN} and \
+                     ((x.tag is not None and len(x.tag)) or x.base.op is Ops.ASSIGN)])
 
   if getenv("VIZ"): graph_rewrite(tsink, PatternMatcher([]), name="View Tagged Rangeify")
 
@@ -566,13 +569,19 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
 
   # if a kernel depends on a buffer, and that buffer is later assigned to, make the assign depend on the kernel's assign
   kernel_assign: dict[UOp, UOp] = {}
+  buffer_readers: dict[UOp, list[UOp]] = {}
   assign_rep: dict[UOp, UOp] = {}
   for u in tsink.toposort():
     if u.op is not Ops.AFTER: continue
+    # write-after-read: this write must wait for prior readers
+    if readers:=buffer_readers.get(u.buf_uop, []):
+      assign_rep[u] = u = u.replace(src=u.src+tuple(readers))
     kernel_assign[u.buf_uop] = u
     for s in u.src[1].src:
       # TODO: this is probably broken for MSELECT/MSTACK
-      if s.op is not Ops.BUFFER or s is u.buf_uop or (a:=kernel_assign.get(s)) is None: continue
+      if s.op is not Ops.BUFFER or s is u.buf_uop: continue
+      buffer_readers.setdefault(s, []).append(u)
+      if (a:=kernel_assign.get(s)) is None: continue
       if any(x.op is Ops.AFTER and x.buf_uop is s for x in u.toposort()):
         raise RuntimeError(f"cycle detected in graph, kernel for {u.buf_uop} must either depend on AFTER or BUFFER")
       assign_rep[a] = kernel_assign[s] = a.replace(src=a.src+(u,))
