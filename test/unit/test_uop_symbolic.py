@@ -4,6 +4,7 @@ import z3
 
 from tinygrad.dtype import dtypes, ConstType, DType, Invalid
 from tinygrad.codegen import full_rewrite
+from tinygrad.codegen.simplify import pm_hoist_invariant_add
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite, sym_infer
 from tinygrad.uop.symbolic import sym, commutative
@@ -1060,6 +1061,17 @@ class TestFuzzFailure(unittest.TestCase):
     num = expr.simplify().substitute({v1:v1_val, v2:v2_val, v3:v3_val}).ssimplify()
     rn = expr.substitute({v1:v1_val, v2:v2_val, v3:v3_val}).ssimplify()
     assert num==rn, f"{num} != {rn}"
+
+class TestCodegenSimplify(unittest.TestCase):
+  def test_hoist_invariant_add(self):
+    r = UOp.range(10, 0)
+    a = UOp.const(dtypes.index, 5)
+    b = UOp.const(dtypes.index, 6)
+    expr = a + r + b
+    rewritten = graph_rewrite(expr, pm_hoist_invariant_add, name="hoist")
+    inv_candidate = rewritten.src[0]
+    self.assertFalse(inv_candidate.ranges)
+    self.assertEqual(set(rewritten.ranges), set(r.ranges))
 
 if __name__ == '__main__':
   unittest.main()

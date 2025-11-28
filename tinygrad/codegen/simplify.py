@@ -1,5 +1,5 @@
-import itertools
-from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, _substitute, range_start, ImageDType
+import itertools, functools
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, _substitute, range_start, ImageDType, GroupOp
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import partition, dedup
 from tinygrad.dtype import dtypes
@@ -158,4 +158,30 @@ def cut_store_range(ctx, store:UOp, r:UOp):
 
 pm_split_store = pm_flatten_range+PatternMatcher([
   (UPat(Ops.END, src=(UPat(Ops.STORE, name="store"), UPat.var("r"))), cut_store_range),
+])
+
+def flatten_add_terms(u:UOp):
+  terms = []
+  stack = [u]
+  while stack:
+    v = stack.pop()
+    if v.op is Ops.ADD: stack.extend(v.src)
+    else: terms.append(v)
+  return terms
+
+def hoist_invariant_add(x:UOp):
+  if x.tag == "hoisted_invariant": return None
+  terms = flatten_add_terms(x)
+  full_ranges = {r for t in terms for r in t.ranges}
+  inv_terms = [t for t in terms if set(t.ranges) < full_ranges]
+  if len(inv_terms) == 0 or len(inv_terms) == len(terms): return None
+  var_terms = [t for t in terms if t not in inv_terms]
+  def make_sum(lst):
+    if len(lst) == 1: return lst[0]
+    return sum(lst[1:], lst[0])
+  return (make_sum(inv_terms) + make_sum(var_terms)).rtag("hoisted_invariant")
+
+pm_hoist_invariant_add = PatternMatcher([
+  # separate loop-invariant parts of an add chain so they can be computed outside inner ranges
+  (UPat(Ops.ADD, name="x"), hoist_invariant_add),
 ])
