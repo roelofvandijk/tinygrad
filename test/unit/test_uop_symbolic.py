@@ -4,6 +4,7 @@ import z3
 
 from tinygrad.dtype import dtypes, ConstType, DType, Invalid
 from tinygrad.codegen import full_rewrite
+from tinygrad.codegen.simplify import pm_store_noop
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite, sym_infer
 from tinygrad.uop.symbolic import sym, commutative, pm_simplify_valid
@@ -1080,6 +1081,15 @@ class TestFuzzFailure(unittest.TestCase):
     num = expr.simplify().substitute({v1:v1_val, v2:v2_val, v3:v3_val}).ssimplify()
     rn = expr.substitute({v1:v1_val, v2:v2_val, v3:v3_val}).ssimplify()
     assert num==rn, f"{num} != {rn}"
+
+class TestCodegenSimplify(unittest.TestCase):
+  def test_self_store_becomes_noop(self):
+    buf = UOp.new_buffer("GPU", 1, dtypes.float)
+    idx = buf.index(UOp.const(dtypes.index, 0))
+    ld = idx.load()
+    st = idx.store(ld)
+    rewritten = graph_rewrite(UOp.sink(st), pm_store_noop, name="remove self store")
+    self.assertFalse(any(u.op is Ops.STORE for u in rewritten.toposort()))
 
 if __name__ == '__main__':
   unittest.main()

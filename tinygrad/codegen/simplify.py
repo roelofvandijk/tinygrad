@@ -160,3 +160,9 @@ def cut_store_range(ctx, store:UOp, r:UOp):
 pm_split_store = pm_flatten_range+PatternMatcher([
   (UPat(Ops.END, src=(UPat(Ops.STORE, name="store"), UPat.var("r"))), cut_store_range),
 ])
+
+def store_self_noop(store:UOp, bidx:UOp) -> UOp: return store.replace(op=Ops.NOOP, src=tuple())
+
+pm_store_noop = PatternMatcher([
+  (UPat(Ops.STORE, name="store", src=(UPat.var("bidx"), UPat(Ops.LOAD, src=(UPat.var("bidx"),)))), store_self_noop),
+])
