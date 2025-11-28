@@ -30,7 +30,7 @@ def simplify_merge_adjacent(u:UOp) -> UOp|None:
         new_range = r0.replace(src=(s0*s1,))
         subs = {r0: new_range//s1, r1: new_range%s1}
         replace: dict[UOp, UOp] = {}
-        for n in u.toposort():
+        for n in (utopo:= u.toposort()):
           if n in subs:
             replace[n] = subs[n]
             continue
@@ -44,8 +44,8 @@ def simplify_merge_adjacent(u:UOp) -> UOp|None:
         nidx = replace[u]
 
         # check if it simplifies
-        if count_divmod(nidx) <= count_divmod(u):
-          u = nidx
+        udivmod = len([u for u in utopo if u.op in {Ops.IDIV, Ops.MOD}])
+        if count_divmod(nidx) <= udivmod: u = nidx
   return u
 
 _pm_simplify_ranges = PatternMatcher([
