@@ -18,27 +18,45 @@ pm_flatten_range = PatternMatcher([
 
 def count_divmod(x:UOp): return len([u for u in x.toposort() if u.op in {Ops.IDIV, Ops.MOD}])
 def simplify_merge_adjacent(u:UOp) -> UOp|None:
+  def apply_symbolic(nn:UOp):
+    while (rew:=symbolic.rewrite(nn)) not in {None, nn}: nn = rew
+    return nn
+
   reduce_ranges = [x.ranges for x in u.backward_slice_with_self if x.op is Ops.REDUCE]
-  udivmod = count_divmod(u)
   # on END we only want to merge adjacent ranges, on REDUCE we want to try all combinations
   for r0, r1 in (zip(u.ended_ranges, u.ended_ranges[1:]) if u.op is Ops.END else itertools.permutations(u.ended_ranges, 2)):
     # check same type
-    if r0.arg[-1] != r1.arg[-1]: continue
-    # check if the ranges to merge are in the same reduces
-    if not all((r0 in rngs) == (r1 in rngs) for rngs in reduce_ranges): continue
-    s0, s1 = r0.src[0], r1.src[0]
-    new_range = r0.replace(src=(s0*s1,))
-    nidx = u.substitute({r0: new_range//s1, r1: new_range%s1},
-                        extra_pm=symbolic+pm_flatten_range,
-                        name=f"check_merge_{r0.arg[0]}_{r1.arg[0]}")
-    if (ndivmod:=count_divmod(nidx)) <= udivmod:
-      u, udivmod = nidx, ndivmod
+    if r0.arg[-1] == r1.arg[-1]:
+      # check if the ranges to merge are in the same reduces
+      if all((r0 in rngs) == (r1 in rngs) for rngs in reduce_ranges):
+        s0, s1 = r0.src[0], r1.src[0]
+        # do the merge
+        new_range = r0.replace(src=(s0*s1,))
+        subs = {r0: apply_symbolic(new_range//s1), r1: apply_symbolic(new_range%s1)}
+        replace: dict[UOp, UOp] = {}
+        for n in (utopo:= u.toposort()):
+          if n in subs:
+            replace[n] = subs[n]
+            continue
+          new_src = tuple(replace.get(x, x) for x in n.src)
+          if new_src == n.src:
+            replace[n] = n
+            continue
+          nn = apply_symbolic(n.replace(src=new_src))
+          if nn.op in range_start and (nflat:=flatten_range(nn)) is not None: nn = nflat
+          replace[n] = nn
+        nidx = replace[u]
+
+        # check if it simplifies
+        udivmod = len([u for u in utopo if u.op in {Ops.IDIV, Ops.MOD}])
+        if count_divmod(nidx) <= udivmod: u = nidx
   return u
 
-pm_simplify_ranges = PatternMatcher([
+_pm_simplify_ranges = PatternMatcher([
   (UPat((Ops.END, Ops.REDUCE), name="u"), simplify_merge_adjacent),
 ])
 
+pm_simplify_ranges = _pm_simplify_ranges + pm_flatten_range + symbolic
 
 def mark_range_mod(ctx, r:UOp, c:UOp):
   if r not in ctx and r.src[0].op is Ops.CONST and r.src[0].divides(c.arg) is not None: ctx[r] = c
