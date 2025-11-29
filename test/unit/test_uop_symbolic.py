@@ -1070,6 +1070,32 @@ class TestBounds(unittest.TestCase):
     assert ((alu0+2559)//-4).vmin == -639 and ((alu0+2559)//-4).vmax == 0
     assert (((alu0+2559)//-4)*(-1)).vmin == 0 and (((alu0+2559)//-4)*(-1)).vmax == 639
 
+class TestSignMaskOpt(unittest.TestCase):
+  def test_sign_mask_pow2_minus_1(self):
+    # test (x<0).where(c, 0) → (x >> 31) & c for masks that are 2^n-1
+    for mask in [15, 255, 511, 1023]:  # 2^4-1, 2^8-1, 2^9-1, 2^10-1
+      x = Variable("x", -100, 100)
+      # pattern: (x<0).where(mask, 0)
+      expr = (x<0).where(x.const_like(mask), x.const_like(0))
+      opt = expr.simplify()
+      # verify it optimized to: (x >> 31) & mask
+      assert ">>" in opt.render() and "&" in opt.render(), f"failed to optimize mask={mask}: {opt.render()}"
+      # verify correctness with concrete values
+      for val in [-50, -1, 0, 1, 50]:
+        expected = mask if val < 0 else 0
+        result = opt.substitute({x: x.const_like(val)}).ssimplify()
+        actual = result if isinstance(result, int) else result.arg
+        assert actual == expected, f"mask={mask}, val={val}: {actual} != {expected}"
+
+  def test_sign_mask_not_pow2_minus_1(self):
+    # test that optimization doesn't apply for non-pow2-1 masks
+    x = Variable("x", -100, 100)
+    for not_mask in [10, 100, 512]:  # not 2^n-1
+      expr = (x<0).where(x.const_like(not_mask), x.const_like(0))
+      opt = expr.simplify()
+      # should not optimize to shift-and
+      assert not (">>" in opt.render() and "&" in opt.render()), f"incorrectly optimized non-pow2-1 mask {not_mask}: {opt.render()}"
+
 class TestFuzzFailure(unittest.TestCase):
   def test_fuzz_failure1(self):
     v1=Variable('v1', 0, 8)
