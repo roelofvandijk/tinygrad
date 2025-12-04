@@ -572,15 +572,12 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.PAD | Ops.SHRINK: src_args = list(zip(*arg))
       case Ops.PERMUTE | Ops.FLIP: src_args = []
       case _: raise RuntimeError(f"{op} is not a MovementOp")
-    usrcs = []
-    for arg in src_args:
-      if len(arg) == 0: usrcs.append(UOp(Ops.VECTORIZE, dtypes.index.vec(0)))
-      elif all(isinstance(x, int) for x in arg): usrcs.append(UOp.const(dtypes.index.vec(len(arg)), arg))
-      else: usrcs.append(UOp(Ops.VECTORIZE, dtypes.index.vec(len(arg)), tuple(UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in arg)))
-    if len(usrcs) == 0: ret = UOp(op, self.dtype, (self,), arg)
-    else: ret = UOp(op, self.dtype, (self,)+UOp.sink(*usrcs).simplify().src)
+    def _to_uop(args):
+      src = tuple(UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in args)
+      return UOp(Ops.VECTORIZE, dtypes.index.vec(len(src)), src)
+    ret = UOp(op, self.dtype, (self,) + tuple(_to_uop(a) for a in src_args), tuple(arg))
     # for all movement ops, we check shape property to validity check the movement op
-    if ret.shape == self.shape and same_shape_noop: return self
+    if same_shape_noop and ret.shape == self.shape: return self
     return ret
 
   # in these four, if the shape doesn't change we can return self
