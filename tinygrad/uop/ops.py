@@ -118,6 +118,7 @@ class recursive_property(property):
 
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin import OpMixin
+def sint_to_uop(x:sint, dtype=dtypes.index) -> UOp: return UOp.const(dtype, x) if isinstance(x, int) else x.cast(dtype)
 
 # NOTE: this should be frozen, but frozen is slower
 @dataclass(eq=False, slots=True)
@@ -572,13 +573,10 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.PAD | Ops.SHRINK: src_args = list(zip(*arg))
       case Ops.PERMUTE | Ops.FLIP: src_args = []
       case _: raise RuntimeError(f"{op} is not a MovementOp")
-    def _to_uop(args):
-      src = tuple(UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in args)
-      return UOp(Ops.VECTORIZE, dtypes.index.vec(len(src)), src)
-    ret = UOp(op, self.dtype, (self,) + tuple(_to_uop(a) for a in src_args), tuple(arg))
+    r = UOp(op, self.dtype, (self,) + tuple(UOp(Ops.VECTORIZE, dtypes.index.vec(len(a)), tuple(map(sint_to_uop, a))) for a in src_args), tuple(arg))
     # for all movement ops, we check shape property to validity check the movement op
-    if same_shape_noop and ret.shape == self.shape: return self
-    return ret
+    if same_shape_noop and r.shape == self.shape: return self
+    return r
 
   # in these four, if the shape doesn't change we can return self
   def forced_reshape(self, arg:tuple[sint, ...]): return self._mop(Ops.RESHAPE, arg, same_shape_noop=False)
@@ -1280,8 +1278,6 @@ def graph_rewrite_map(sink:UOp, pm:PatternMatcher, ctx=None, bottom_up=False, na
   if input_map is not None:
     for k,v in input_map.items(): new_map[k] = new_map.get(v,v)
   return new_map
-
-def sint_to_uop(x:sint, dtype=dtypes.index) -> UOp: return UOp.const(dtype, x) if isinstance(x, int) else x.cast(dtype)
 
 def select_dtype(u): return (dtypes.long if u.overflows(dtypes.int32) else dtypes.int).vec(u.dtype.count)
 pm_lower_index_dtype = PatternMatcher([
