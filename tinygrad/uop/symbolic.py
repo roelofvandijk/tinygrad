@@ -67,7 +67,7 @@ symbolic_simple = propagate_invalid + PatternMatcher([
   (UPat.var("x", dtype=dtypes.bool).where(UPat.const(dtypes.bool, True), UPat.const(dtypes.bool, False)), lambda x: x),
   (UPat.var("x", dtype=dtypes.bool).where(UPat.const(dtypes.bool, False), UPat.const(dtypes.bool, True)), lambda x: x.logical_not()),
   # (x<0).where(c, 0) -> (x >> 31) & c for signed ints, branchless modulo mask
-  ((UPat.var("x", dtype=dtypes.sints+(dtypes.index,))<0).where(UPat.cvar("c", vec=False), UPat.const(None, 0)),
+  ((UPat.var("x", dtype=dtypes.sints+(dtypes.index,))<0).where(UPat.cvar("c", dtype=dtypes.sints+(dtypes.index,), vec=False), UPat.const(None, 0)),
    lambda x,c: (x >> (x.dtype.itemsize*8-1)) & c.arg if c.arg > 0 and (c.arg & (c.arg + 1)) == 0 else None),
   (UPat.var("x", dtype=dtypes.ints+(dtypes.bool, dtypes.index)).trunc(), lambda x: x),
   # ** zero folding **
