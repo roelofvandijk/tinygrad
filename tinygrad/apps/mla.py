@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 from tinygrad import Tensor, nn, UOp
 from tinygrad.dtype import dtypes
-from tinygrad.apps.rope import apply_rope_interleaved, YarnParams
+from tinygrad.apps.rope import apply_rope_interleaved
 
 def _topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
   """O(n^2) pairwise comparison topk. 3 kernels vs 29 for bitonic sort. Fine for small n (e.g. 64 experts)."""
@@ -27,16 +27,14 @@ class PerHeadWeights:
     self.weight = Tensor.zeros(n_heads, dim1, dim2)
 
 class MLATransformerBlock:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, norm_eps:float, rope_theta:float, max_context:int,
+  def __init__(self, dim:int, hidden_dim:int, n_heads:int, norm_eps:float, max_context:int,
                q_lora_rank:int, kv_lora_rank:int, qk_nope_head_dim:int, qk_rope_head_dim:int, v_head_dim:int,
                num_experts:int=0, num_experts_per_tok:int=0, n_shared_experts:int=0, moe_hidden_dim:int=0,
-               expert_gating_func:int=0, expert_weights_norm:bool=False, expert_weights_scale:float=1.0,
-               mscale:float=1.0, yarn_scaling_factor:float=1.0, yarn_params:YarnParams|None=None):
+               expert_gating_func:int=0, expert_weights_norm:bool=False, expert_weights_scale:float=1.0, mscale:float=1.0):
     self.n_heads = n_heads
     self.qk_nope_head_dim = qk_nope_head_dim
     self.qk_rope_head_dim = qk_rope_head_dim
     self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
-    self.v_head_dim = v_head_dim
     self.kv_lora_rank = kv_lora_rank
     self.q_lora_rank = q_lora_rank
     self.max_context = max_context
@@ -118,12 +116,11 @@ class MLATransformerBlock:
     attn = attn.transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
 
-  def _feed_forward(self, h: Tensor, start_pos: int|UOp = 0) -> Tensor:
+  def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       router_logits = h_norm.float() @ self.ffn_gate_inp.weight.float().T
-      if self.expert_gating_func == 1: gate_scores = router_logits.softmax(-1)
-      elif self.expert_gating_func == 2: gate_scores = router_logits.sigmoid()
+      if self.expert_gating_func == 2: gate_scores = router_logits.sigmoid()
       elif self.expert_gating_func == 3: gate_scores = router_logits
       else: gate_scores = router_logits.softmax(-1)
       selection_scores = gate_scores + self.exp_probs_b.bias if hasattr(self, 'exp_probs_b') else gate_scores
@@ -144,24 +141,25 @@ class MLATransformerBlock:
     return h + self.ffn_down(gated).float().cast(h.dtype)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos), start_pos).contiguous()
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 def load_mla_params_from_gguf(kv: dict, arch: str) -> dict:
   """Extract MLA architecture params from GGUF metadata. Returns dict of MLA params."""
-  qk_rope_head_dim = kv.get(f'{arch}.rope.dimension_count', 0)
-  key_length = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', 0))
+  ak = lambda s, d=0: kv.get(f'{arch}.{s}', d)
+  qk_rope_head_dim = ak('rope.dimension_count')
+  key_length = ak('attention.key_length_mla', ak('attention.key_length'))
   return {
-    'q_lora_rank': kv.get(f'{arch}.attention.q_lora_rank', 0),
-    'kv_lora_rank': kv.get(f'{arch}.attention.kv_lora_rank', 0),
+    'q_lora_rank': ak('attention.q_lora_rank'),
+    'kv_lora_rank': ak('attention.kv_lora_rank'),
     'qk_rope_head_dim': qk_rope_head_dim,
     'qk_nope_head_dim': key_length - qk_rope_head_dim if key_length > 0 else 0,
-    'v_head_dim': kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', 0)),
-    'n_shared_experts': kv.get(f'{arch}.expert_shared_count', 0),
-    'moe_hidden_dim': kv.get(f'{arch}.expert_feed_forward_length', 0),
-    'leading_dense_blocks': kv.get(f'{arch}.leading_dense_block_count', 0),
-    'expert_gating_func': kv.get(f'{arch}.expert_gating_func', 0) or (2 if arch == 'glm4' else 1),
-    'expert_weights_norm': kv.get(f'{arch}.expert_weights_norm', False),
-    'expert_weights_scale': kv.get(f'{arch}.expert_weights_scale', 1.0),
+    'v_head_dim': ak('attention.value_length_mla', ak('attention.value_length')),
+    'n_shared_experts': ak('expert_shared_count'),
+    'moe_hidden_dim': ak('expert_feed_forward_length'),
+    'leading_dense_blocks': ak('leading_dense_block_count'),
+    'expert_gating_func': ak('expert_gating_func') or (2 if arch == 'glm4' else 1),
+    'expert_weights_norm': ak('expert_weights_norm', False),
+    'expert_weights_scale': ak('expert_weights_scale', 1.0),
   }
 
 def split_kv_b(kv_b: Tensor, n_heads: int, qk_nope_head_dim: int, v_head_dim: int, kv_lora_rank: int) -> tuple[Tensor, Tensor]:

@@ -266,10 +266,10 @@ class Transformer:
       for i in range(num_blocks):
         # First leading_dense_blocks use dense FFN, rest use MoE
         is_dense = i < leading_dense_blocks
-        blk = MLATransformerBlock(dim, hidden_dim, n_heads, norm_eps, rope_theta, max_context,
+        blk = MLATransformerBlock(dim, hidden_dim, n_heads, norm_eps, max_context,
                                             q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
                                             0 if is_dense else num_experts, num_experts_per_tok, n_shared_experts, moe_hidden_dim,
-                                            expert_gating_func, expert_weights_norm, expert_weights_scale, mscale, yarn_scaling_factor, yarn_params)
+                                            expert_gating_func, expert_weights_norm, expert_weights_scale, mscale)
         blk.freqs_cis_cache = freqs_cis_cache  # Share cached frequencies across all blocks
         self.blk.append(blk)
     else:  # Standard attention
