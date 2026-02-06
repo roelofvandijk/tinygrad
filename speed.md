@@ -1,3 +1,49 @@
+## Journal — Feb 7, 2026: Remove Hand-Coded MSL Kernels — Pure Tinygrad Baseline
+
+### Result
+- **deepseek-v2-lite: 19.2 tok/s** (52ms/tok), 840 kernels/tok, 5 ICBs
+- Down from 25 tok/s with MSL kernels — 23% regression from losing hand-coded Metal
+- Fast load time (no Q8 repack, no heavy precomputation)
+- GLM: not yet tested at this baseline
+
+### What We Did
+Removed all hand-coded Metal kernels (metal_q4k.py, metal_q6k.py). Pure tinygrad tensor ops only.
+
+**QuantizedLinear**: Dequant-cache — dequant to fp16 at first use, cache, MV-matched matmul.
+**QuantizedExpertWeights**: On-the-fly — gather selected expert Q4K blocks, fuse dequant with matmul.
+No precomputation for experts (RAM can't handle it for GLM's 17GB).
+
+### Approaches Tried and Rejected
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| Q8 repack (scale*int8) for Linear | 20 tok/s | MV matched but load time ~1min (full dequant+requantize) |
+| Q8 repack for Experts | OOM | Dequanting all 64 experts to fp32 intermediate blows RAM |
+| Q8 chunked per-expert | Too slow | 64 sequential dequant+requantize calls |
+| fp16 dequant-cache for Experts | OOM | 64 experts x O x I x 2 bytes = 30GB+ |
+| .contiguous() split (dequant then fp16 matmul) | 12 tok/s (2x worse!) | Extra 33MB write+read per expert call |
+| Fused dequant+matmul (no .contiguous()) | **19.2 tok/s** | Best option without precomputation |
+
+### Profile (deepseek-v2-lite, 19.2 tok/s)
+
+Top warm-up kernels:
+| Kernel | Calls/tok | Avg us | BW | Description |
+|--------|-----------|--------|-----|-------------|
+| `r_88_32_3_8_4_2_32_8_4_2_32` | 3 | 1373 | 15 GB/s | Fused Q4K MoE gate-up (THE bottleneck) |
+| `r_16_32_6_4_352_4` | 3 | 1265 | 44 GB/s | MoE down proj (dequant-cache fp16) |
+| `r_22_32_4_2048_512_4` | 3 | 665 | 36 GB/s | Large reduce |
+| `r_2048_16_6_176` | 3 | 150 | 80 GB/s | Shared expert (already fast) |
+
+**Key insight**: `r_88_32_3_8_4_2_32_8_4_2_32` runs at 15 GB/s because MV heuristic doesn't match
+fused dequant pattern. Teaching MV to handle `MUL(dequant_chain(INDEX), INDEX)` would fix this.
+
+### Next Step: MV Heuristic Dequant Chain Support
+The #1 kernel at 15 GB/s is fixable. MV heuristic at `heuristic.py:67` requires `MUL(INDEX, INDEX)`.
+Fused dequant creates `MUL(dequant_chain(INDEX), INDEX)`. Fix: (1) walk backward through chains to
+find INDEX, (2) relax range subset check for weight's extra sub-block ranges.
+
+---
+
 ## Journal — Feb 6, 2026 (night 2): Selective .contiguous() Split — 11→14 tok/s (27%)
 
 ### Result
