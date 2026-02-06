@@ -203,10 +203,11 @@ class TransformerBlock:
 
     # TODO: remove these kv cache realizes
     if not hasattr(self, "cache_kv"):
-      cache_dtype = k.dtype if k.dtype == v.dtype else x.dtype
-      self.cache_kv = Tensor.empty((2, B, self.n_kv_heads, self.max_context, self.head_dim), dtype=cache_dtype, device=k.device).contiguous().realize()
-    self.cache_kv[0, :, :, start_pos:start_pos+T, :].assign(k.cast(self.cache_kv.dtype))
-    self.cache_kv[1, :, :, start_pos:start_pos+T, :].assign(v.cast(self.cache_kv.dtype))
+      self.cache_kv = Tensor.empty((2, B, self.n_kv_heads, self.max_context, self.head_dim), dtype=k.dtype, device=k.device).contiguous().realize()
+    if k.dtype != self.cache_kv.dtype: k = k.cast(self.cache_kv.dtype)
+    if v.dtype != self.cache_kv.dtype: v = v.cast(self.cache_kv.dtype)
+    self.cache_kv[0, :, :, start_pos:start_pos+T, :].assign(k)
+    self.cache_kv[1, :, :, start_pos:start_pos+T, :].assign(v)
     k = self.cache_kv[0, :, :, 0:start_pos+T, :]
     v = self.cache_kv[1, :, :, 0:start_pos+T, :]
 
@@ -225,11 +226,11 @@ class TransformerBlock:
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
+    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos))
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
@@ -520,9 +521,9 @@ if __name__ == "__main__":
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
-  # Default to quantized=True for large MoE models (GLM, deepseek) or Q4 models
+  # Default to quantized=True for MLA models with custom Q4K/Q6K kernels
   if args.quantized is None:
-    args.quantized = any(x in args.model.lower() for x in ["glm-", "deepseek-", "q4"])
+    args.quantized = any(args.model.startswith(x) for x in ["glm-", "deepseek-", "youtu-"])
 
   # load the model
   if DEBUG >= 1: print(f"loading {args.model} (quantized={args.quantized})")
