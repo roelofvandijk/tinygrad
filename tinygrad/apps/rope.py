@@ -14,7 +14,7 @@ class YarnParams:
   yarn_log_multiplier: float = 0.0
   ext_factor: float = 1.0
 
-def _yarn_corr_dims(n_dims: int, n_ctx_orig: int, freq_base: float, beta_fast: float, beta_slow: float) -> tuple[float, float]:
+def yarn_corr_dims(n_dims: int, n_ctx_orig: int, freq_base: float, beta_fast: float, beta_slow: float) -> tuple[float, float]:
   if freq_base <= 1.0 or n_ctx_orig <= 0 or n_dims <= 0: return (0.0, float(n_dims - 1))
   log_base = math.log(freq_base)
   two_pi = 2.0 * math.pi
@@ -33,7 +33,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, scaling_fac
 def precompute_freqs_cis_yarn(dim: int, end: int, p: YarnParams) -> Tensor:
   """Precompute RoPE frequencies with YaRN interpolation."""
   freq_scale = 1.0 if p.factor == 0.0 else 1.0 / p.factor
-  corr_start, corr_end = _yarn_corr_dims(dim, p.original_context_length, p.freq_base, p.beta_fast, p.beta_slow)
+  corr_start, corr_end = yarn_corr_dims(dim, p.original_context_length, p.freq_base, p.beta_fast, p.beta_slow)
   mscale = p.attn_factor * (1.0 + 0.1 * math.log(1.0 / freq_scale)) if abs(p.ext_factor) > 1e-9 and freq_scale < 1.0 else p.attn_factor
   dim_indices = Tensor.arange(0, dim, 2)[:(dim // 2)]
   inv_freqs = 1.0 / (p.freq_base ** (dim_indices / dim))
@@ -64,47 +64,36 @@ def apply_rope_interleaved(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
 def load_yarn_params_from_gguf(kv: dict, arch: str, rope_theta: float) -> tuple[YarnParams|None, float, float]:
   """Extract YaRN/RoPE scaling params from GGUF metadata. Returns (yarn_params, mscale, yarn_scaling_factor)."""
-  scaling_factor = kv.get(f'{arch}.rope.scaling.factor', 1.0)
-  scaling_type = kv.get(f'{arch}.rope.scaling.type', None)
-  yarn_log_mul_key = f'{arch}.rope.scaling.yarn_log_multiplier'
-  yarn_log_mul = kv[yarn_log_mul_key] / 0.1 if yarn_log_mul_key in kv else 0.0
-  attn_factor_key = f'{arch}.rope.scaling.attn_factor'
-  attn_factor_present = attn_factor_key in kv
-  attn_factor_raw = kv.get(attn_factor_key, 1.0)
+  rk = lambda s, d=None: kv.get(f'{arch}.rope.scaling.{s}', d)
+  scaling_factor, scaling_type = rk('factor', 1.0), rk('type')
+  raw_log_mul = rk('yarn_log_multiplier')
+  yarn_log_mul = raw_log_mul / 0.1 if raw_log_mul is not None else 0.0
+  attn_factor = rk('attn_factor', 1.0)
 
   if scaling_type == "yarn" or scaling_factor > 1.0:
     freq_scale = (1.0 / scaling_factor) if scaling_factor > 0 else 1.0
-    rope_attn_factor = attn_factor_raw if attn_factor_present else 1.0
 
     # compute yarn_attn_factor (llama.cpp cparams.yarn_attn_factor)
-    if freq_scale >= 1.0:
-      yarn_attn_factor = rope_attn_factor
+    if freq_scale >= 1.0: yarn_attn_factor = attn_factor
     else:
       inv = 1.0 / freq_scale
       get_ms = lambda s, m: 1.0 if s <= 1.0 else (0.1 * m * math.log(s) + 1.0)
       if yarn_log_mul != 0.0:
-        ms_all = yarn_log_mul
-        ms = ms_all if (arch == "deepseek2" and ms_all != 1.0) else 1.0
-        yarn_attn_factor = get_ms(inv, ms) / get_ms(inv, ms_all) * rope_attn_factor
-        if not (arch == "deepseek2" and abs(ms - ms_all) < 1e-6):
+        ms = yarn_log_mul if (arch == "deepseek2" and yarn_log_mul != 1.0) else 1.0
+        yarn_attn_factor = get_ms(inv, ms) / get_ms(inv, yarn_log_mul) * attn_factor
+        if not (arch == "deepseek2" and abs(ms - yarn_log_mul) < 1e-6):
           yarn_attn_factor /= (1.0 + 0.1 * math.log(inv))
       else:
-        yarn_attn_factor = get_ms(inv, 1.0) / (1.0 + 0.1 * math.log(inv)) * rope_attn_factor
+        yarn_attn_factor = get_ms(inv, 1.0) / (1.0 + 0.1 * math.log(inv)) * attn_factor
 
     # compute mscale (attention scaling)
-    if freq_scale >= 1.0:
-      mscale = rope_attn_factor
+    if freq_scale >= 1.0: mscale = attn_factor
     else:
       log_inv = math.log(1.0 / freq_scale)
-      mscale = rope_attn_factor * (1.0 + 0.1 * log_inv) * (1.0 + 0.1 * yarn_log_mul * log_inv)
+      mscale = attn_factor * (1.0 + 0.1 * log_inv) * (1.0 + 0.1 * yarn_log_mul * log_inv)
 
-    yarn_params = YarnParams(
-      freq_base=rope_theta, factor=scaling_factor,
-      original_context_length=kv.get(f'{arch}.rope.scaling.original_context_length', 4096),
-      beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0),
-      beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
-      attn_factor=yarn_attn_factor, yarn_log_multiplier=yarn_log_mul,
-      ext_factor=kv.get(f'{arch}.rope.scaling.yarn_ext_factor', 1.0 if scaling_type == "yarn" else 0.0)
-    )
+    yarn_params = YarnParams(freq_base=rope_theta, factor=scaling_factor, attn_factor=yarn_attn_factor, yarn_log_multiplier=yarn_log_mul,
+      original_context_length=rk('original_context_length', 4096), beta_fast=rk('yarn_beta_fast', 32.0), beta_slow=rk('yarn_beta_slow', 1.0),
+      ext_factor=rk('yarn_ext_factor', 1.0 if scaling_type == "yarn" else 0.0))
     return yarn_params, mscale, scaling_factor
-  return None, attn_factor_raw, 1.0
+  return None, attn_factor, 1.0
