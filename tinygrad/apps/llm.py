@@ -8,6 +8,16 @@ from tinygrad.apps.rope import precompute_freqs_cis, apply_rope, load_yarn_param
 from tinygrad.apps.mla import MLATransformerBlock, load_mla_params_from_gguf, split_kv_b
 from tinygrad.apps.quantized import replace_quantized_modules
 
+# DeepSeek tokenizer patterns (used when preset="deepseek-llm")
+_DEEPSEEK_LETTERS = (
+  r"[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯ"
+  r"Ա-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙ-ὛὝὟ-ώ"
+  r"ᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹ"
+  r"ℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗ"
+  r"Ａ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+"
+)
+_DEEPSEEK_PUNCT = r"\s?[!-/:-~！-／：-～'-‟　-。]+"
+
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
     if preset not in (
@@ -23,18 +33,10 @@ class SimpleTokenizer:
     def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
     if preset == "deepseek-llm":
-      deepseek_letters = (
-        r"[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯ"
-        r"Ա-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙ-ὛὝὟ-ώ"
-        r"ᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹ"
-        r"ℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗ"
-        r"Ａ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+"
-      )
-      deepseek_punct = r"\s?[!-/:-~！-／：-～‘-‟　-。]+"
       self._split_to_word = re.compile("|".join([
         r"[\r\n]",
-        r"\s?" + deepseek_letters,
-        deepseek_punct,
+        r"\s?" + _DEEPSEEK_LETTERS,
+        _DEEPSEEK_PUNCT,
         r"\s+$",
         r"[一-龥ࠀ-一가-퟿]+",
         f"[{r_p_N}]+",
@@ -60,12 +62,9 @@ class SimpleTokenizer:
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
     tok = SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
-    tok.add_bos_token = kv.get("tokenizer.ggml.add_bos_token", True)
-    tok.add_eos_token = kv.get("tokenizer.ggml.add_eos_token", True)
-    tok.add_space_prefix = kv.get("tokenizer.ggml.add_space_prefix", False)
-    tok.clean_spaces = kv.get("tokenizer.ggml.clean_spaces", False)
-    tok.ignore_merges = kv.get("tokenizer.ggml.ignore_merges", False)
-    tok.byte_fallback = kv.get("tokenizer.ggml.byte_fallback", False)
+    for attr, default in [("add_bos_token", True), ("add_eos_token", True), ("add_space_prefix", False),
+                          ("clean_spaces", False), ("ignore_merges", False), ("byte_fallback", False)]:
+      setattr(tok, attr, kv.get(f"tokenizer.ggml.{attr}", default))
     tok.merges = kv.get("tokenizer.ggml.merges", [])
     if tok.merges:
       for idx, merge in enumerate(tok.merges):
@@ -79,35 +78,25 @@ class SimpleTokenizer:
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
-    if self._bpe_ranks:
-      # BPE merge by rank (llama.cpp)
-      while len(parts) > 1:
-        best_rank, best_i = sys.maxsize, -1
-        for i in range(len(parts)-1):
-          rank = self._bpe_ranks.get((parts[i], parts[i+1]), sys.maxsize)
-          if rank < best_rank:
-            best_rank, best_i = rank, i
-        if best_i == -1: break
-        parts[best_i:best_i+2] = [parts[best_i] + parts[best_i+1]]
-    else:
-      # legacy greedy merge
-      while True:
-        i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
-        if i == -1: break
-        parts[i:i+2] = [parts[i] + parts[i+1]]
+    # Merge by rank (BPE) or by token presence (legacy)
+    while len(parts) > 1:
+      best_score, best_i = sys.maxsize, -1
+      for i in range(len(parts)-1):
+        score = self._bpe_ranks.get((parts[i], parts[i+1]), sys.maxsize) if self._bpe_ranks else self._normal_tokens.get(parts[i]+parts[i+1], sys.maxsize)
+        if score < best_score: best_score, best_i = score, i
+      if best_i == -1: break
+      parts[best_i:best_i+2] = [parts[best_i] + parts[best_i+1]]
+    # Handle parts with optional byte fallback
     out: list[int] = []
     for p in parts:
-      tid = self._normal_tokens.get(p)
-      if tid is not None:
+      if (tid := self._normal_tokens.get(p)) is not None:
         out.append(tid)
-        continue
-      if self.byte_fallback:
+      elif self.byte_fallback:
         for b in p:
-          bt = self._normal_tokens.get(bytes([b]))
-          if bt is None: raise RuntimeError("token not found")
+          if (bt := self._normal_tokens.get(bytes([b]))) is None: raise RuntimeError("token not found")
           out.append(bt)
-        continue
-      raise RuntimeError("token not found")
+      else:
+        raise RuntimeError("token not found")
     return out
   def _encode_sentence(self, chunk:str) -> list[int]:
     return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
@@ -118,8 +107,7 @@ class SimpleTokenizer:
     for match in self._split_to_sentence.finditer(text):
       tokens.extend(self._encode_sentence(text[pos:match.start(0)]) + [self._special_tokens[text[match.start(0):match.end(0)]]])
       pos = match.end(0)
-    out = tokens + self._encode_sentence(text[pos:])
-    return out
+    return tokens + self._encode_sentence(text[pos:])
 
   def decode(self, ids:list[int]) -> str:
     return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
@@ -215,9 +203,10 @@ class TransformerBlock:
 
     # TODO: remove these kv cache realizes
     if not hasattr(self, "cache_kv"):
-      self.cache_kv = Tensor.empty((2, B, self.n_kv_heads, self.max_context, self.head_dim), dtype=k.dtype, device=k.device).contiguous().realize()
-    self.cache_kv[0, :, :, start_pos:start_pos+T, :].assign(k)
-    self.cache_kv[1, :, :, start_pos:start_pos+T, :].assign(v)
+      cache_dtype = k.dtype if k.dtype == v.dtype else x.dtype
+      self.cache_kv = Tensor.empty((2, B, self.n_kv_heads, self.max_context, self.head_dim), dtype=cache_dtype, device=k.device).contiguous().realize()
+    self.cache_kv[0, :, :, start_pos:start_pos+T, :].assign(k.cast(self.cache_kv.dtype))
+    self.cache_kv[1, :, :, start_pos:start_pos+T, :].assign(v.cast(self.cache_kv.dtype))
     k = self.cache_kv[0, :, :, 0:start_pos+T, :]
     v = self.cache_kv[1, :, :, 0:start_pos+T, :]
 
@@ -307,20 +296,13 @@ class Transformer:
         quantized_tensors['output.weight'] = quantized_tensors['token_embd.weight']
 
   @staticmethod
-  def _remap_exp_probs_bias(tensors: dict) -> None:
-    """Map GGUF exp_probs_b tensors to tinygrad exp_probs_b.bias naming."""
-    for k in list(tensors.keys()):
-      if re.match(r"blk\.\d+\.exp_probs_b$", k):
-        tensors[f"{k}.bias"] = tensors.pop(k)
-
-  @staticmethod
   def _permute_llama_qk_weights(state_dict: dict, quantized_tensors: dict|None, n_heads: int, n_kv_heads: int) -> None:
     """Permute Q/K weights from interleaved to half-split RoPE layout for llama-style models."""
     # For quantized loading, move attn_q/attn_k back to state_dict so they can be permuted
     if quantized_tensors:
       for name in list(quantized_tensors.keys()):
         if 'attn_q.weight' in name or 'attn_k.weight' in name:
-          blocks, shape, ggml_type = quantized_tensors.pop(name)
+          blocks, shape, ggml_type = quantized_tensors.pop(name)[:3]
           dequant_fn = nn.state.GGML_QUANT_INFO[ggml_type][2]
           state_dict[name] = dequant_fn(blocks).reshape(*shape)
           state_dict[name] = state_dict[name].cast('float16') if getenv("HALF", 1) else state_dict[name]
@@ -369,8 +351,10 @@ class Transformer:
     # Load GGUF and prepare state dict
     kv, state_dict, quantized_tensors = nn.state.gguf_load(gguf.to(None), quantized=quantized)
     Transformer._prepare_state_dict(state_dict, quantized_tensors)
-    Transformer._remap_exp_probs_bias(state_dict)
-    if quantized_tensors: Transformer._remap_exp_probs_bias(quantized_tensors)
+    # Remap GGUF exp_probs_b tensors to tinygrad exp_probs_b.bias naming
+    for d in [state_dict] + ([quantized_tensors] if quantized_tensors else []):
+      for k in list(d.keys()):
+        if re.match(r"blk\.\d+\.exp_probs_b$", k): d[f"{k}.bias"] = d.pop(k)
 
     # Extract architecture metadata
     arch = kv['general.architecture']
@@ -536,20 +520,18 @@ if __name__ == "__main__":
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
-  # Default to quantized=True for large MoE models (GLM, deepseek)
+  # Default to quantized=True for large MoE models (GLM, deepseek) or Q4 models
   if args.quantized is None:
-    args.quantized = args.model.startswith("glm-") or args.model.startswith("deepseek-") or ("Q4" in args.model.upper())
+    args.quantized = any(x in args.model.lower() for x in ["glm-", "deepseek-", "q4"])
 
   # load the model
   if DEBUG >= 1: print(f"loading {args.model} (quantized={args.quantized})")
-  if args.model in models:
-    model_src = models[args.model]
-    if isinstance(model_src, str) and model_src.startswith("http"):
-      local_model = pathlib.Path("models") / pathlib.Path(model_src).name
-      if local_model.is_file(): model_src = local_model.resolve().as_posix()
-  else:
-    model_path = pathlib.Path(args.model)
-    model_src = model_path.resolve().as_posix() if model_path.exists() else args.model
+  model_src = models.get(args.model, args.model)  # Use dict.get with default
+  if isinstance(model_src, str) and model_src.startswith("http"):
+    local = pathlib.Path("models") / pathlib.Path(model_src).name
+    if local.is_file(): model_src = str(local.resolve())
+  elif pathlib.Path(args.model).exists():
+    model_src = str(pathlib.Path(args.model).resolve())
   model, kv = Transformer.from_gguf(Tensor.from_url(model_src), args.max_context, quantized=args.quantized)
   if DEBUG >= 1: print(f"using model {args.model}")
 
