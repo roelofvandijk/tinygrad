@@ -86,6 +86,7 @@ To add missing instruction implementations, add them to `extra/assembly/amd/emu.
 ## Style Notes
 
 - 2-space indentation, 150 char line limit
+- **Code should be dense, tasteful, minimal, clean, and correct** - no cruft, no over-engineering, no unnecessary abstractions
 - PatternMatchers should be defined at module level (slow to construct)
 - Prefer `graph_rewrite` over manual graph traversal
 - UOp methods like `.replace()` preserve tags unless explicitly changed
