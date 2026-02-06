@@ -203,11 +203,8 @@ class TransformerBlock:
 
     # TODO: remove these kv cache realizes
     if not hasattr(self, "cache_kv"):
-      self.cache_kv = Tensor.empty((2, B, self.n_kv_heads, self.max_context, self.head_dim), dtype=k.dtype, device=k.device).contiguous().realize()
-    if k.dtype != self.cache_kv.dtype: k = k.cast(self.cache_kv.dtype)
-    if v.dtype != self.cache_kv.dtype: v = v.cast(self.cache_kv.dtype)
-    self.cache_kv[0, :, :, start_pos:start_pos+T, :].assign(k)
-    self.cache_kv[1, :, :, start_pos:start_pos+T, :].assign(v)
+      self.cache_kv = Tensor.empty(2, B, self.n_kv_heads, self.max_context, self.head_dim, dtype=k.dtype, device=k.device).contiguous().realize()
+    self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v)).realize()
     k = self.cache_kv[0, :, :, 0:start_pos+T, :]
     v = self.cache_kv[1, :, :, 0:start_pos+T, :]
 
@@ -519,6 +516,9 @@ if __name__ == "__main__":
   parser.add_argument("--no-quantized", dest="quantized", action="store_false", help="Dequantize weights (faster inference, more memory)")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--prompt", type=str, default=None, help="Single prompt to run (non-interactive mode)")
+  parser.add_argument("--raw-prompt", action="store_true", help="Use prompt as-is (no chat formatting)")
+  parser.add_argument("--count", type=int, default=1000, help="Max tokens to generate (with --prompt)")
   args = parser.parse_args()
 
   # Default to quantized=True for MLA models with custom Q4K/Q6K kernels
@@ -552,6 +552,23 @@ if __name__ == "__main__":
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
+
+  # Single prompt mode
+  if args.prompt:
+    if args.raw_prompt:
+      # Raw prompt: just encode the text with BOS
+      ids = ([bos_id] if bos_id is not None else []) + tok.encode(args.prompt)
+    else:
+      # Chat formatted prompt
+      ids = tok.build_chat_ids([{"role":"user", "content": args.prompt}], bos_id, eos_id, add_generation_prompt=True)
+    generated = 0
+    for next_id in model.generate(ids, 0):
+      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n")
+      sys.stdout.flush()
+      generated += 1
+      if next_id == eos_id or generated >= args.count: break
+    print()
+    exit(0)
 
   # Interactive mode
   messages: list[dict] = []
