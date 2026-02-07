@@ -54,9 +54,28 @@ class QuantizedExpertWeights:
     xk = x if x.shape[2] == K else x.expand(B, T, K, x.shape[-1])
     x_flat = xk.reshape(n_sel, self.in_features)
 
-    # Gather selected expert blocks, dequant on the fly (fused with matmul)
     self._ensure_expert_blocks(x.device)
     sel_blocks = self._expert_blocks[sel.reshape(-1)]  # (n_sel, bpe, bpb)
+
+    # Q4_0 packed-dot: compute matmul directly on packed nibbles without expanding to full weight matrix
+    # sum((nib - 8) * x) = sum(nib * x) - 8 * sum(x)  per block, then scale and reduce across blocks
+    if self.ggml_type == 2 and self.in_features % 32 == 0:
+      O, IN = self.out_features, self.in_features
+      bpr = IN // 32  # blocks per row
+      blocks = sel_blocks.reshape(n_sel, O, bpr, 18)
+      scale = blocks[:, :, :, :2].bitcast(dtypes.float16)  # (n_sel, O, bpr, 1)
+      packed = blocks[:, :, :, 2:]  # (n_sel, O, bpr, 16) packed nibble bytes
+      x_fp16 = x_flat.cast(dtypes.float16) if x_flat.dtype != dtypes.float16 else x_flat
+      x_pairs = x_fp16.reshape(n_sel, 1, bpr, 2, 16)
+      x_lo, x_hi = x_pairs[:, :, :, 0, :], x_pairs[:, :, :, 1, :]  # (n_sel, 1, bpr, 16) each
+      lo = packed.bitwise_and(0xF).cast(dtypes.float16)  # (n_sel, O, bpr, 16)
+      hi = packed.rshift(4).cast(dtypes.float16)  # (n_sel, O, bpr, 16)
+      nib_dot = (lo * x_lo + hi * x_hi).sum(axis=-1)  # (n_sel, O, bpr)
+      x_block_sum = x_fp16.reshape(n_sel, 1, bpr, 32).sum(axis=-1)  # (n_sel, 1, bpr)
+      out = (scale.squeeze(-1) * (nib_dot - 8.0 * x_block_sum)).sum(axis=-1)  # (n_sel, O)
+      return out.reshape(B, T, K, O)
+
+    # Fallback: dequant to full weight matrix, then matmul
     w = self._dequant_fn(sel_blocks.reshape(-1, self._bytes_per_block)).reshape(n_sel, self.out_features, self.in_features)
     if getenv("HALF", 1): w = w.cast(dtypes.float16)
     return (x_flat.reshape(n_sel, 1, self.in_features) @ w.transpose(-1, -2)).reshape(B, T, K, self.out_features)
