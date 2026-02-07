@@ -2,7 +2,7 @@ import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, AMX
 from tinygrad.dtype import ImageDType
-from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
@@ -61,10 +61,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
-  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 16), getenv("MV_ROWS_PER_THREAD", 4)
+  mulop = k.reduceop.src[0] if k.reduceop is not None else None
+  if isinstance(mulop, UOp) and mulop.op is Ops.CAST and len(mulop.src) and mulop.src[0].op is Ops.MUL: mulop = mulop.src[0]
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
-    (mulop:=k.reduceop.src[0]).op is Ops.MUL and k.ranges_of(AxisType.REDUCE):
+    isinstance(mulop, UOp) and mulop.op is Ops.MUL and k.ranges_of(AxisType.REDUCE):
     first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
     # find activation: an INDEX operand of the MUL whose idx contains first_reduce_rng
     for act_i in range(2):

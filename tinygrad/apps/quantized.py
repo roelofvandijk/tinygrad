@@ -1,7 +1,33 @@
 from __future__ import annotations
-from tinygrad import Tensor, nn, getenv
-from tinygrad.dtype import dtypes
+from tinygrad import Tensor, UOp, nn, getenv
+from tinygrad.dtype import AddrSpace, dtypes
+from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.nn.state import GGML_QUANT_INFO
+
+def custom_q4_0_linear(out:UOp, x:UOp, blocks:UOp) -> UOp:
+  # out: (N, O), x: (N, I), blocks: (O, I//32, 18)
+  assert len(out.shape) == 2 and len(x.shape) == 2 and len(blocks.shape) == 3
+  assert all(isinstance(s, int) for s in out.shape+x.shape+blocks.shape), "custom q4_0 kernel requires static shapes"
+  N, O = out.shape
+  I = x.shape[1]
+  bpr = I // 32
+  assert x.shape[0] == N and blocks.shape[0] == O and blocks.shape[1] == bpr and blocks.shape[2] == 18
+
+  n = UOp.range(N, 0)
+  o = UOp.range(O, 1)
+  r = UOp.range(bpr*16, 2, axis_type=AxisType.REDUCE)
+  br, j = r//16, r%16
+
+  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
+  acc = acc.after(n, o)[0].set(0.0)
+  scale = (blocks[o, br, 0].cast(dtypes.ushort) + (blocks[o, br, 1].cast(dtypes.ushort) << 8)).bitcast(dtypes.half).cast(dtypes.float)
+  q = blocks[o, br, j+2]
+  q_lo = (q & 0xF).cast(dtypes.float) - 8.0
+  q_hi = (q >> 4).cast(dtypes.float) - 8.0
+  x_lo = x[n, br*32 + j].cast(dtypes.float)
+  x_hi = x[n, br*32 + j + 16].cast(dtypes.float)
+  acc = acc[0].set(acc.after(r)[0] + scale * (q_lo * x_lo + q_hi * x_hi), end=r)
+  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=()))
 
 class QuantizedLinear:
   __slots__ = ('blocks', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_dequant_fn', '_dequant_cache', '_q4_0_blocks')
@@ -27,8 +53,25 @@ class QuantizedLinear:
     self._q4_0_blocks = blocks.reshape(self.out_features, bpr, 18)
 
   def __call__(self, x:Tensor) -> Tensor:
+    use_cache = getenv("QL_CACHE_ALL", 0) == 1
+    if not use_cache:
+      use_cache = (
+        (getenv("QL_CACHE_ATTN_Q_A", 0) == 1 and self.out_features == 1536 and self.in_features == 2048) or
+        (getenv("QL_CACHE_ATTN_KV_A", 0) == 1 and self.out_features == 576 and self.in_features == 2048) or
+        (getenv("QL_CACHE_ATTN_Q_B", 0) == 1 and self.out_features == 3072 and self.in_features == 1536) or
+        (getenv("QL_CACHE_ATTN_OUT", 0) == 1 and self.out_features == 2048 and self.in_features == 2048) or
+        (getenv("QL_CACHE_FFN_IN", 0) == 1 and self.out_features == 6144 and self.in_features == 2048) or
+        (getenv("QL_CACHE_FFN_DOWN", 0) == 1 and self.out_features == 2048 and self.in_features == 6144)
+      )
     # Q4_0 packed-dot: read quantized blocks directly (3.56x less bandwidth than fp16 cache)
-    if self.ggml_type == 2 and self.in_features % 32 == 0:
+    if self.ggml_type == 2 and self.in_features % 32 == 0 and not use_cache:
+      if getenv("QL_CUSTOM", 0) == 1:
+        self._ensure_q4_0_blocks(x.device)
+        x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
+        x_flat = x_fp16.reshape(-1, self.in_features)
+        out = Tensor.empty(x_flat.shape[0], self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+        out = Tensor.custom_kernel(out, x_flat, self._q4_0_blocks, fxn=custom_q4_0_linear)[0]
+        return out.reshape(*x.shape[:-1], self.out_features)
       self._ensure_q4_0_blocks(x.device)
       O, bpr = self.out_features, self.in_features // 32
       blocks = self._q4_0_blocks

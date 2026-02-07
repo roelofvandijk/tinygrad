@@ -98,17 +98,17 @@ class MLATransformerBlock:
     freqs_cis = self.freqs_cis_cache[start_pos:start_pos+T]
     q_pe = self._rope_interleaved(q_pe, freqs_cis)
     k_pe = self._rope_interleaved(k_pe, freqs_cis)
-    # Absorbed K: q_nope @ k_b^T, then cat with rope part
-    q = (q_nope @ self.attn_k_b.weight.transpose(-1, -2)).cat(q_pe, dim=-1)
-    kv_normed = self.attn_kv_a_norm(compressed_kv)
-    k = kv_normed.unsqueeze(1).cat(k_pe, dim=-1)
+    # Absorb K projection into q_nope and score with one QK matmul.
+    q_nope = q_nope @ self.attn_k_b.weight.transpose(-1, -2)
+    q = q_nope.cat(q_pe, dim=-1)
+    kv_normed = self.attn_kv_a_norm(compressed_kv).unsqueeze(1)
+    k_new = kv_normed.cat(k_pe, dim=-1)
     # KV cache
     cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
-      self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=k.dtype, device=k.device).contiguous().realize()
-    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k).realize()
+      self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
+    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new)
     k = self.cache_k[:, :, 0:start_pos+T, :]
-    v = k[:, :, :, :self.kv_lora_rank]
     # Attention scores
     qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
     if T > 1:
@@ -117,8 +117,8 @@ class MLATransformerBlock:
     else:
       e = qk.float().exp()
       attn_weights = (e / e.sum(-1, keepdim=True)).half()
-    # Absorbed V: attn @ v_b^T
-    attn = (attn_weights.matmul(v) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
+    # Absorbed V: (attn @ kv_normed_cache) @ v_b^T
+    attn = (attn_weights.matmul(k[:, :, :, :self.kv_lora_rank]) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
 
   def _feed_forward(self, h: Tensor) -> Tensor:
@@ -145,7 +145,7 @@ class MLATransformerBlock:
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    return self._feed_forward(self._attention(x, start_pos))
 
 def load_mla_params_from_gguf(kv: dict, arch: str) -> dict:
   """Extract MLA architecture params from GGUF metadata. Returns dict of MLA params."""

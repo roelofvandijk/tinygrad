@@ -1574,3 +1574,68 @@ At 29.7 us/kernel average overhead, **dispatch cost = 19.3ms**. GPU compute time
 3. **Fuse RMSNorm into following matmul**: saves 2 kernels/layer = 64 total
 4. **Fuse absorbed einsums with surrounding ops**: K absorb + cat, V absorb + output proj
 5. **Consider replacing einsum with matmul+reshape**: may fuse better with tinygrad scheduler
+
+---
+
+## Youtu Q4_0 Reset Notes (Feb 7, 2026 late)
+
+### Reproducible Baseline Right Now
+- In current environment, clean `HEAD` reproduces about **44-47 tok/s** with **424 kernels** (`--benchmark 8`).
+- Historical `51-55 tok/s` results remain valid as prior milestones, but are not currently re-reproduced on this exact setup.
+
+### What Is Valuable To Keep
+1. Keep the **matvec matcher robustness fix** in `heuristic.py` that unwraps `CAST(MUL(...))` before pattern checks.
+2. Keep **single-run iteration** (`bench_iter.py`) with strict `timeout 60` after each change.
+3. Keep the MLA **absorbed formulation** (single K cache semantics, V from K-slice), matching the intended architecture.
+
+### What To Avoid Keeping By Default
+1. Avoid hardcoding aggressive MV defaults globally unless they win repeatedly on youtu.
+2. Avoid keeping cache-write scheduling tweaks that can trigger compile/schedule blowups.
+3. Avoid keeping algebraic MLA rewrites (e.g., split score paths) unless they show measured tok/s gain.
+
+### Current Working Hypothesis
+- Biggest regressions now are from a subset of **Q4 packed-dot QuantizedLinear kernels** that run with weak opts (`GROUPTOP` only) and low GB/s.
+- Priority is kernel quality for that family before further MLA graph churn.
+
+### Immediate Protocol
+1. One code change at a time.
+2. One benchmark at a time.
+3. Always wrap benchmark/profiling commands in `timeout 60`.
+4. If tok/s drops, revert that single change immediately and record it.
+
+---
+
+## Youtu Q4_0 Tok/s-Only Update (Feb 7, 2026 latest)
+
+### Decision Rule
+- Keep/revert based on **steady tok/s only** (same model, same benchmark length).
+- Kernel count is diagnostic only, not a success metric.
+
+### Current Repro Range
+- Current tree repeatedly lands around **44-46 tok/s** steady on `--benchmark 12`.
+- Typical baseline in this phase: ~**44.5 tok/s**.
+
+### What Was Tried (and measured)
+
+| Change | Steady tok/s | Outcome |
+|---|---:|---|
+| Restore stronger MLA barriers (`cache assign .realize()` + trailing `.contiguous()`) | ~42.2 | Revert |
+| QuantizedLinear dequant-cache only (remove packed-dot path) | ~25.3 | Revert |
+| QuantizedLinear cached unpack (`lo/hi` cached per device) | ~29.4 | Revert |
+| Forced Q4-specific tiling heuristic branch | ~29.3 (and one crash before fix) | Revert |
+| T==1 attention softmax path to native `qk.softmax(-1)` | ~44.7 | No material gain |
+| `JIT_BATCH_SIZE=1400` | ~45.3 | Small win |
+| `JIT_BATCH_SIZE=2800` | ~44.9 | No gain |
+| MV knobs `4/16/4` | ~45.6 (single run) | Best single-run candidate so far |
+| MV knobs `2/16/4` | ~45.0 | Slightly worse |
+| MV knobs `8/16/8` | ~44.1 | Worse |
+
+### Updated Read
+1. No recent graph/scheduling refactor produced a step change. Most were regressions.
+2. The only positive movement is small (single-digit %) from launch/tiling tuning.
+3. To reach **70 tok/s**, we likely need a new fast path for the hot Q4 packed-dot linear kernels (not incremental heuristic tweaks).
+
+### Next Direction
+1. Keep current stable path (packed-dot QuantizedLinear + absorbed MLA) as baseline.
+2. Continue tok/s-only gating with strict `timeout 60`.
+3. Implement/try a specialized high-throughput Q4 linear execution path as the next step-change attempt.
