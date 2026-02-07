@@ -1,3 +1,156 @@
+## Journal — Feb 7, 2026 (night): Why MoE Quantized Models Are Slow — Root Cause Analysis
+
+### The Core Problem
+
+Dense quantized models (llama, qwen) are fast. MoE quantized models (GLM, deepseek, qwen3:30b-a3b) are 4-7x slower than theoretical. Same quantization format (Q4K), same optimizer, completely different performance.
+
+### Root Cause: Dequant-Cache vs On-The-Fly Dequant
+
+| Path | Used By | How | Kernel Quality |
+|------|---------|-----|----------------|
+| **Dequant-cache** | `QuantizedLinear` (dense) | Dequant to fp16 once at load → `x @ W.T` | Standard matmul, MV matches, 70+ GB/s |
+| **On-the-fly dequant** | `QuantizedExpertWeights` (MoE) | Gather selected expert Q4K blocks → fuse dequant+matmul | Terrible: 2-15 GB/s |
+
+Dense models CAN cache because total weights fit. GLM's 64 experts at fp16 = 30GB+ → doesn't fit in 36GB RAM.
+
+### Bench: Simplified Dequant Formats (2048×5120 matvec)
+
+| Format | Time | BW | Kernel | Opts | Why |
+|--------|------|-----|--------|------|-----|
+| Q8 repack (scale×int8) | **146us** | **72 GB/s** | `r_2048_16_20_16` | GROUPTOP(1,16) | Simple MUL, clean shape |
+| cached fp16 | 456us | 46 GB/s | standard | MV | 2x more data than Q8 |
+| Q4 repack (scale×nib+off) | 2622us | 2 GB/s | `r_16_32_4_20_4_2_32` | UPCAST+UNROLL+LOCAL | Nibble unpack fragments kernel |
+| Q4K full (8 sub-scales) | ~1400us | 14 GB/s | `r_88_32_3_8_4_2_32_8_4_2_32` | GROUPTOP(1,16) | Complex UOp graph |
+
+**Key finding**: Q8 repack is **faster than fp16** (reads half the data). But Q8 doesn't fit for GLM (31GB).
+
+### Why Q4 Nibble Unpack Kills Performance
+
+Q4K dequant does: `Tensor.stack(qs.bitwise_and(0xF), qs.rshift(4), dim=2)` to unpack nibbles.
+This creates a **new dimension** in the UOp graph. The kernel shape decomposes into many small factors
+(e.g., `16_32_4_20_4_2_32`) instead of clean `[output, reduce]` shape.
+
+Result: optimizer assigns only 16 workgroups instead of 2000+. Each thread does serial reduction. 2 GB/s.
+
+Q8 avoids this because `int8` values need no unpacking — direct cast to fp16.
+
+### GLM-4.7-Flash Context
+- **30B parameter MoE model** (not 4.7B — that's just the name)
+- 64 experts, 4 selected per token, 47 blocks
+- Active params/token: ~1.24 GB → theoretical 80 tok/s at 100 GB/s
+- Current: ~12 tok/s (15% efficiency)
+- Q4K_M file: ~17GB. Q8_0: 31GB (doesn't fit in 36GB RAM)
+- Must stay at ~4-bit quantization
+
+### MV Heuristic Change (deepseek-v2-lite only)
+Relaxed `MUL(INDEX, INDEX)` check to allow `MUL(INDEX, dequant_chain)` → 19.2 → 21.3 tok/s.
+Does NOT help GLM because GLM's MoE kernel top-level MUL is `routing × expert_result`, not `activation × weight`.
+
+### Paths Forward
+
+1. ~~**Simpler quantization format**~~: **DONE** — Q4_0 is 11% faster than Q4_K (23.4 vs 21 tok/s on deepseek-v2-lite).
+   One scale per 32 elements, simple `(nibble - 8) * scale` formula.
+   Key: avoid `q_to_uint8` expansion, use direct `bitwise_and + rshift + cat`.
+
+2. **Avoid nibble expansion**: Process packed bytes against activation pairs (llama.cpp style).
+   `lo_nib * x[j] + hi_nib * x[j+128]` per byte → no 2x tensor expansion.
+   Needs new dequant formulation in `QuantizedExpertWeights.__call__`.
+
+3. **Fix optimizer for fused dequant**: Teach GROUPTOP/MV to handle kernels with extra sub-block
+   dimensions. Hard — requires deep changes to heuristic pattern matching.
+
+4. **Hybrid approach**: Repack Q4K → simplified per-block (scale, offset, packed_nibbles) at load time.
+   Loses sub-block precision (~0.5% quality loss). Gets simpler dequant.
+
+### Key Insight: Kernel Count is the Secondary Problem
+
+840 kernels/tok is bad, but the PRIMARY problem is individual kernel efficiency (2-15 GB/s vs 100 GB/s).
+With 840 kernels at 100 GB/s, theoretical: 840 × 20us = 16.8ms → 60 tok/s. That's plenty.
+Reducing to tens of kernels only matters if we ALSO fix kernel efficiency.
+
+---
+
+## Journal — Feb 7, 2026 (late): Q4_0 Is Actually Faster Than Q4_K!
+
+### Discovery
+Testing Q4_0 quantization revealed it's **11% faster** than Q4_K for deepseek-v2-lite MoE:
+- **deepseek-v2-lite Q4_0**: 23.4 tok/s (43ms/tok)
+- **deepseek-v2-lite Q4_K_M**: 21.0 tok/s (47ms/tok)
+
+This is surprising given Q4_0 has **8x more blocks** (32 vs 256 elements per block).
+
+### Why Q4_0 Is Faster
+
+**Dequant complexity comparison:**
+
+Q4_0 (simple):
+```python
+d = blocks[:,:2].bitcast(float16).cast(float32)  # 1 scale
+lo = blocks[:,2:].bitwise_and(0xF)
+hi = blocks[:,2:].rshift(4)
+return (cat(lo, hi, dim=-1).cast(float32) - 8) * d
+```
+
+Q4_K (hierarchical):
+```python
+d, dmin = blocks[:,[0,2]].bitcast(float16).cast(float32)  # 2 base scales
+sc, mn = <complex 8-sub-block scale extraction>  # 8 sub-scales each
+q = stack(bitwise_and(0xF), rshift(4), dim=2).reshape(8,32)  # nibble unpack
+return d * sc * q - dmin * mn  # hierarchical formula
+```
+
+**Key differences:**
+1. **Simpler UOp graph**: Q4_0 has ~5 ops, Q4_K has ~20 ops with complex bit manipulation
+2. **Better fusion**: Simpler dequant chain fuses better with matmul
+3. **More uniform structure**: Optimizer handles Q4_0's regular pattern better than Q4_K's hierarchical structure
+
+Even with 8x more blocks, the **per-block simplicity** creates a net win.
+
+### Critical Fix: Replace `q_to_uint8`
+
+The original Q4_0 dequant used `q_to_uint8(blocks, 4)` which does:
+```python
+expand + idiv + bitwise_and + transpose + flatten
+```
+
+This created massive UOp bloat (8x blocks × expand/idiv overhead = JIT failure).
+
+New version uses direct bit ops:
+```python
+bitwise_and(0xF) + rshift(4) + cat
+```
+
+Much simpler → scheduler handles it efficiently.
+
+### GLM-4.7-Flash Q4_0 Results
+
+Confirmed Q4_0 is faster than Q4_K for GLM too:
+- **GLM Q4_K_M**: ~12 tok/s
+- **GLM Q4_0 (unsloth)**: **14.6 tok/s** (+22%)
+
+**IMPORTANT**: The bartowski Q4_0 GGUF was broken (0.02 tok/s), but the unsloth Q4_0 works fine.
+Different GGUF producers can have different tensor layouts/metadata — always use unsloth for GLM.
+
+### Implications
+
+1. **Q4_0 > Q4_K for MoE models**: Simpler dequant trumps larger blocks
+2. **Quantization complexity matters**: Hierarchical structures hurt fusion
+3. **GGUF source matters**: bartowski vs unsloth can be dramatically different
+
+### Tokenizer Fix Required
+
+DeepSeek Q4_0 GGUF had bad unicode ranges in tokenizer regex:
+- `Ὗ-ώ` (U+1F5F to U+03CE) — backwards range
+- `ῐ-ΐ` (U+1FD0 to U+0390) — backwards range
+
+Fixed by replacing ranges with individual characters in `_DEEPSEEK_LETTERS`.
+
+### Files Modified
+- `tinygrad/nn/state.py`: Simplified `dequantize_q4_0` (no q_to_uint8), added to GGML_QUANT_INFO
+- `tinygrad/apps/llm.py`: Fixed tokenizer unicode ranges, added Q4_0/Q6_K model URLs
+
+---
+
 ## Journal — Feb 7, 2026: Remove Hand-Coded MSL Kernels — Pure Tinygrad Baseline
 
 ### Result

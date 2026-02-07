@@ -11,8 +11,8 @@ from tinygrad.apps.quantized import replace_quantized_modules
 # DeepSeek tokenizer patterns (used when preset="deepseek-llm")
 _DEEPSEEK_LETTERS = (
   r"[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯ"
-  r"Ա-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙ-ὛὝὟ-ώ"
-  r"ᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹ"
+  r"Ա-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟὡὣὥὧὩὫὭὯὰάὲέὴήὶίὸόὺύὼώ"
+  r"ᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐῑῒΐῖῗῘῙῚΊῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹ"
   r"ℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗ"
   r"Ａ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+"
 )
@@ -425,9 +425,12 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
-  "glm-4.7:flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
+  "glm-4.7:flash-Q4_K_M": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
   "glm-4.7:flash-Q8": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q8_0.gguf",
+  "glm-4.7:flash-Q4_0": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_0.gguf",
+  "glm-4.7:flash-Q6_K": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q6_K.gguf",
   "deepseek-v2-lite": "https://huggingface.co/mradermacher/DeepSeek-V2-Lite-GGUF/resolve/main/DeepSeek-V2-Lite.Q4_K_M.gguf",
+  "deepseek-v2-lite-Q4_0": "https://huggingface.co/zhentaoyu/DeepSeek-V2-Lite-Chat-Q4_0-GGUF/resolve/main/deepseek-v2-lite-chat-q4_0.gguf",
   "youtu-llm:2b-Q4": "https://huggingface.co/AaryanK/Youtu-LLM-2B-GGUF/resolve/main/Youtu-LLM-2B.q4_k_m.gguf",
   "youtu-llm:2b-Q8": "https://huggingface.co/tencent/Youtu-LLM-2B-GGUF/resolve/main/Youtu-LLM-2B-Q8_0.gguf",
 }

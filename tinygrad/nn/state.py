@@ -340,8 +340,17 @@ def dequantize_q6k(blocks: Tensor) -> Tensor:
   d = blocks[:,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand((-1, 256))
   return d * (xl.bitwise_or(xh).bitcast(dtypes.int8).cast(dtypes.float32) - 32).flatten(-2) * scales
 
+def dequantize_q4_0(blocks: Tensor) -> Tensor:
+  """Dequantize Q4_0 blocks to float32. blocks shape: (num_blocks, 18). 32 elements per block."""
+  d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)  # (num_blocks, 1)
+  qs = blocks[:,2:]  # (num_blocks, 16) packed nibbles
+  lo = qs.bitwise_and(0xF)  # (num_blocks, 16) low nibbles
+  hi = qs.rshift(4)         # (num_blocks, 16) high nibbles
+  return (Tensor.cat(lo, hi, dim=-1).cast(dtypes.float32) - 8) * d  # (num_blocks, 32)
+
 # GGML quantization info: (elements_per_block, bytes_per_block, dequantize_fn)
 GGML_QUANT_INFO: dict[int, tuple[int, int, Callable[[Tensor], Tensor]]] = {
+  2: (32, 18, dequantize_q4_0),    # Q4_0
   12: (256, 144, dequantize_q4k),  # Q4_K
   13: (256, 176, dequantize_q5k),  # Q5_K
   14: (256, 210, dequantize_q6k),  # Q6_K
