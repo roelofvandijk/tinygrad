@@ -2,7 +2,6 @@ from __future__ import annotations
 import math
 from tinygrad import Tensor, nn, UOp
 from tinygrad.dtype import dtypes
-from tinygrad.apps.rope import apply_rope_interleaved
 
 def _topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
   """O(n^2) pairwise comparison topk. 3 kernels vs 29 for bitonic sort. Fine for small n (e.g. 64 experts)."""
@@ -39,6 +38,7 @@ class MLATransformerBlock:
     self.q_lora_rank = q_lora_rank
     self.max_context = max_context
     self.mscale = mscale
+    self._attn_scale = mscale * mscale / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
     if q_lora_rank > 0:
       self.attn_q_a = nn.Linear(dim, q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(q_lora_rank, norm_eps)
@@ -75,45 +75,50 @@ class MLATransformerBlock:
       self.ffn_up = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
 
+  @staticmethod
+  def _rope_interleaved(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    """RoPE in native dtype — no float32 round-trip. cos/sin in [-1,1], safe for fp16."""
+    cos = freqs_cis[..., 0].reshape(1, 1, x.shape[2], -1).cast(x.dtype)
+    sin = freqs_cis[..., 1].reshape(1, 1, x.shape[2], -1).cast(x.dtype)
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return (x1*cos - x2*sin).unsqueeze(-1).cat((x2*cos + x1*sin).unsqueeze(-1), dim=-1).flatten(-2)
+
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)
     B, T, _ = x.shape
-    if self.q_lora_rank > 0:
-      q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm)))
-    else:
-      q = self.attn_q(x_norm)
+    # Q projection (with optional LoRA)
+    q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))) if self.q_lora_rank > 0 else self.attn_q(x_norm)
     q = q.reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    # KV compression
     compressed_kv = self.attn_kv_a_mqa(x_norm)
     compressed_kv, k_pe = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = k_pe.reshape(B, T, 1, self.qk_rope_head_dim).transpose(1, 2)
+    # RoPE (fp16, no float32 conversion)
     freqs_cis = self.freqs_cis_cache[start_pos:start_pos+T]
-    q_pe = apply_rope_interleaved(q_pe, freqs_cis)
-    k_pe = apply_rope_interleaved(k_pe, freqs_cis)
+    q_pe = self._rope_interleaved(q_pe, freqs_cis)
+    k_pe = self._rope_interleaved(k_pe, freqs_cis)
+    # Absorbed K: q_nope @ k_b^T, then cat with rope part
+    q = (q_nope @ self.attn_k_b.weight.transpose(-1, -2)).cat(q_pe, dim=-1)
     kv_normed = self.attn_kv_a_norm(compressed_kv)
-    # Absorbed attention: absorb K projection into Q  (weight is h,kv_lora,qk_nope — contract over qk_nope)
-    q_absorbed = Tensor.einsum("bhtd,hnd->bhtn", q_nope, self.attn_k_b.weight)
-    q = q_absorbed.cat(q_pe, dim=-1)
-    kv_normed_4d = kv_normed.reshape(B, T, 1, self.kv_lora_rank).transpose(1, 2)
-    k = kv_normed_4d.cat(k_pe, dim=-1)
+    k = kv_normed.unsqueeze(1).cat(k_pe, dim=-1)
+    # KV cache
     cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
       self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=k.dtype, device=k.device).contiguous().realize()
-      self.cache_v = Tensor.empty((B, 1, self.max_context, self.kv_lora_rank), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
     self.cache_k[:, :, start_pos:start_pos+T, :].assign(k).realize()
-    self.cache_v[:, :, start_pos:start_pos+T, :].assign(kv_normed_4d).realize()
     k = self.cache_k[:, :, 0:start_pos+T, :]
-    v = self.cache_v[:, :, 0:start_pos+T, :]
-    scale = self.mscale * self.mscale / math.sqrt(self.q_head_dim)
-    qk = q.matmul(k.transpose(-2, -1)) * scale
+    v = k[:, :, :, :self.kv_lora_rank]
+    # Attention scores
+    qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
     if T > 1:
-      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
-      qk = qk + mask
-    attn_weights = qk.float().softmax(-1).cast(qk.dtype)
-    attn = attn_weights.matmul(v)
-    # Absorbed attention: absorb V projection
-    attn = Tensor.einsum("bhtn,hvn->bhtv", attn, self.attn_v_b.weight)
-    attn = attn.transpose(1, 2).reshape(B, T, -1)
+      qk = qk + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      attn_weights = qk.softmax(-1)
+    else:
+      e = qk.float().exp()
+      attn_weights = (e / e.sum(-1, keepdim=True)).half()
+    # Absorbed V: attn @ v_b^T
+    attn = (attn_weights.matmul(v) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
 
   def _feed_forward(self, h: Tensor) -> Tensor:
@@ -136,9 +141,8 @@ class MLATransformerBlock:
       if hasattr(self, 'ffn_gate_shexp'):
         out = out + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).float().silu() * self.ffn_up_shexp(h_norm).float()).float()
       return h + out.cast(h.dtype)
-    h_norm_f = h_norm.float()
-    gated = self.ffn_gate(h_norm_f).silu().contiguous() * self.ffn_up(h_norm_f)
-    return h + self.ffn_down(gated).float().cast(h.dtype)
+    gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
+    return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     return self._feed_forward(self._attention(x, start_pos)).contiguous()

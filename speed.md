@@ -1518,3 +1518,59 @@ explicit adds for weighted sum, shared expert fully independent. See `llamacpp.m
 - G3: ~30 tok/s — packed-dot Q4_0 for QuantizedLinear (Phase 2)
 - G4: ~40 tok/s — kernel count reduction (Phase 3)
 - G5: 50 tok/s — BEAM + dispatch optimization (Phase 4)
+
+---
+
+## Youtu Q4_0 Sprint Results (Feb 7, 2026)
+
+### Status: 52 tok/s (was 26.5 baseline, was 55.5 with MSL)
+
+**No MSL kernels.** Pure tinygrad tensor DSL. Rule: no custom kernels, no BEAM.
+
+### Changes Made & Impact
+
+| # | Change | tok/s | Kernels | Delta | Status |
+|---|--------|-------|---------|-------|--------|
+| 0 | Baseline (fp16 dequant cache) | 26.5 | 780 | — | was |
+| 1 | Q4_0 packed-dot QuantizedLinear (v1, 3 reduces) | 45.5 | 1004 | +224 kernels, +19 tok/s | replaced |
+| 2 | Q4_0 packed-dot v2 (subtract 8 inline, 1 reduce) | 52.0 | 780 | 0 kernels, +25 tok/s | **CURRENT** |
+| 3 | Eliminate cache_v (V = slice of K) | 52.0 | 650 | -130 kernels | **CURRENT** |
+| 4 | Remove .float() casts in dense FFN | 52.0 | 650 | 0 | **CURRENT** |
+| 5 | Remove .float() from softmax | 51.8 | 650 | 0 | **CURRENT** |
+
+### Key Decisions
+
+1. **Packed-dot Q4_0**: Read quantized blocks directly, compute matvec inline. 3.56x less bandwidth than fp16 cache. The trick is `(nib - 8) * x` instead of `nib * x - 8 * sum(x)` — avoids separate x_block_sum kernel.
+
+2. **Single K cache, no V**: V is `cache_k[:,:,:,:kv_lora_rank]`. Saves 4 kernels/block (cache write + associated ops) × 32 blocks = 128 kernels. Matches llama.cpp's MLA approach.
+
+3. **Absorbed MLA is correct**: Researched naive (HuggingFace expand-at-cache), absorbed (llama.cpp/DeepSeek), and split-scores (DeepSeek reference). Absorbed wins for batch=1: smaller cache, fewer bytes, MQA attention. See `mla.md` for full analysis.
+
+### Where Time Goes (650 kernels, 19.2ms/tok)
+
+| Category | Kernels/tok | % of kernels |
+|----------|-------------|-------------|
+| Large reduce (matmul/MoE) | 273 | 42% |
+| Elementwise | 139 | 21% |
+| Small reduce (norm/softmax/topk) | 238 | 37% |
+
+At 29.7 us/kernel average overhead, **dispatch cost = 19.3ms**. GPU compute time is ~0.1ms in ICBs. The entire bottleneck is dispatch overhead.
+
+### What Didn't Help
+- JIT_BATCH_SIZE=780 (single ICB): 50.3 tok/s — marginal
+- GROUPTOP_LIMIT increase: no change
+- Remove .contiguous() from FFN silu: -32 kernels but slower (kernel explosion risk)
+- Remove .float() casts: 0 kernel change (tinygrad already optimizes away)
+
+### Gap Analysis
+
+- **Current**: 52 tok/s = 19.2ms = 650 kernels × 29.5us
+- **Target**: 80 tok/s = 12.5ms
+- **Need to cut**: 6.7ms → ~227 fewer kernels at same overhead, or same kernels at 19.2us/kernel
+
+### Next Steps (Youtu Q4_0)
+1. **Profile with DEBUG=5** to see actual Metal kernel source and identify fusion opportunities
+2. **Reduce attention kernel count**: 20/layer → 12/layer would save 256 kernels → ~14.5ms → 69 tok/s
+3. **Fuse RMSNorm into following matmul**: saves 2 kernels/layer = 64 total
+4. **Fuse absorbed einsums with surrounding ops**: K absorb + cat, V absorb + output proj
+5. **Consider replacing einsum with matmul+reshape**: may fuse better with tinygrad scheduler
