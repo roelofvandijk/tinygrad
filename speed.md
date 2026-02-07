@@ -1,3 +1,345 @@
+## Youtu Q4_0 Speed Sprint: 26.5 → 70 tok/s (Feb 7, 2026)
+
+**Baseline**: 26.5 tok/s, 780 kernels, 58us/kernel, 45.2ms/token
+**Target**: 70 tok/s (llama.cpp), 14ms/token
+**Model**: youtu-llm:2b-Q4_0 (32 layers, MLA attention, dense FFN, no MoE)
+**Rule**: No custom kernels, no BEAM. Everything else in tinygrad on the table.
+
+### 780 kernels / 32 layers = 24.4 kernels/layer
+
+Per layer, the operations and likely kernel counts:
+
+**Attention (~16 kernels):**
+- RMSNorm: reduce + ewise = 2-3 kernels
+- q_a matmul, q_a_norm (2-3k), q_b matmul = 4-5 kernels
+- kv_a_mqa matmul, kv_a_norm (2-3k) = 3-4 kernels
+- RoPE (q + k) = 1-2 kernels
+- absorbed K einsum = 1 kernel
+- QK matmul + scale = 1 kernel
+- softmax (max, exp-sub, sum, div) = 2-3 kernels
+- V matmul = 1 kernel
+- absorbed V einsum = 1 kernel
+- output matmul + residual = 1-2 kernels
+
+**Dense FFN (~8 kernels):**
+- RMSNorm: 2-3 kernels
+- gate matmul = 1 kernel
+- silu = 1 kernel (or fused)
+- .contiguous() FORCES BREAK
+- up matmul = 1 kernel
+- mul (gate_silu * up) = 1 kernel
+- down matmul = 1 kernel
+- .float().cast() + residual = 1-2 kernels
+
+### Experiments Plan
+
+| # | Change | Expected impact | Why |
+|---|--------|----------------|-----|
+| A | Remove .contiguous() from FFN + __call__ | -2-3 kernels/layer | Allows fusion across boundaries |
+| B | Remove .float() casts, keep fp16 throughout | -3-4 kernels/layer | Eliminates cast kernels |
+| C | Merge attn RMSNorm + q_a projection | -1-2 kernels/layer | One fused kernel |
+| D | Remove .silu().contiguous() split | -1 kernel/layer | Fuse gate_silu with up |
+| E | Simplify softmax (stay in fp16) | -1-2 kernels/layer | No float32 round-trip |
+
+If each saves even 2 kernels/layer: 780 - 64 = 716, ~8% faster. Need more radical changes.
+
+### Results
+
+---
+
+## Component Isolation Experiments (Feb 7, 2026)
+
+GLM-4.7-Flash Q4_0 — measured by disabling components with env vars:
+
+| Experiment | tok/s | ms/tok | Kernels | Delta kernels | Delta ms |
+|------------|-------|--------|---------|--------------|----------|
+| **Full model (baseline)** | **14.20** | **70.4** | **1638** | — | — |
+| No shared expert | 17.50 | 57.1 | 1592 | -46 | -13.3 |
+| Attention only (NO_FFN=1) | 38.34 | 26.1 | 952 | -686 | -44.3 |
+| Skip topk (hardcoded experts) | 13.46 | 74.3 | 1546 | -92 | +3.9 |
+| Explicit k adds (vs .sum) | 14.20 | 70.4 | 1638 | 0 | 0 |
+| Packed-dot QuantizedLinear | 14.10 | 70.9 | 1780 | +142 | +0.5 |
+
+### Time Breakdown (derived)
+
+| Component | ms | Kernels | kernels/layer | us/kernel |
+|-----------|-----|---------|---------------|-----------|
+| Attention | 26.1 | 952 | 20.3 | 27.4 |
+| MoE experts+routing | 31.0 | 640 | 13.9 | 48.4 |
+| Shared expert | 13.3 | 46 | 1.0 | 289 |
+| **Total** | **70.4** | **1638** | **34.9** | **43.0** |
+
+### Key Learnings
+
+1. **Attention is the first bottleneck**: Even with NO FFN, attention-only is 38 tok/s (26ms).
+   Target is 50+ tok/s. Must fix attention FIRST before FFN matters.
+2. **952 attention kernels / 47 layers = 20.3 kernels/layer**. llama.cpp does ~15.
+   At 27.4 us/kernel overhead, reducing to 15 would save (952-705) × 27.4 = 6.8ms → 19.3ms → 52 tok/s.
+3. **Shared expert = 46 kernels but 13.3ms** → 289us each. These are big fp16 matmuls (2048×10240).
+   Bandwidth-bound, not dispatch-bound. Q4_0 direct reads would help but adds kernels.
+4. **Packed-dot for QuantizedLinear was WORSE**: +142 kernels wiped out bandwidth savings.
+   The tensor DSL approach fragments into too many small kernels. Need a different strategy.
+5. **Topk removal didn't help**: -92 kernels but SLOWER (48.1 us/kernel vs 43.0).
+   Suggests the routing kernels are efficient and their removal changes scheduling unfavorably.
+6. **Explicit k adds = identical to .sum()**: tinygrad optimizes them to the same thing.
+
+### Next: Focus on Attention Kernel Reduction
+
+Use youtu-llm:2b-Q4 for fast iteration (same MLA attention, 4x faster).
+Target: reduce from 20 kernels/layer to ~12 kernels/layer.
+
+---
+
+## KEY INSIGHT: We Read 3.56x Too Much Data (Feb 7, 2026 night)
+
+### The llama.cpp Difference
+
+llama.cpp reads Q4_0 blocks directly in every matvec kernel — 0.5625 bytes/element.
+We dequant to fp16 at load time (QuantizedLinear._dequant_cache), then read 2 bytes/element every token.
+That's **3.56x data amplification** on every QuantizedLinear call.
+
+### GLM Architecture (deepseek2, 47 blocks, dim=2048)
+
+```
+Per block, batch=1, T=1:
+
+ATTENTION (QuantizedLinear — fp16 dequant-cache, read every token):
+  attn_q_a:      2048 → 768    Q4_0: 0.88MB  fp16: 3.15MB  (×47 = 148MB)
+  attn_q_b:      768 → 5120    Q4_0: 2.21MB  fp16: 7.86MB  (×47 = 369MB)
+  attn_kv_a_mqa: 2048 → 576    Q4_0: 0.66MB  fp16: 2.36MB  (×47 = 111MB)
+  attn_output:   5120 → 2048   Q4_0: 5.90MB  fp16: 20.97MB (×47 = 986MB)
+  absorbed k_b:  already fp16   3.93MB                       (×47 = 185MB)
+  absorbed v_b:  already fp16   5.24MB                       (×47 = 246MB)
+
+SHARED EXPERT (QuantizedLinear — fp16 dequant-cache, THE BIGGEST TARGET):
+  ffn_gate_shexp: 2048 → 10240  Q4_0: 11.8MB  fp16: 41.9MB (×46 = 1928MB)
+  ffn_up_shexp:   2048 → 10240  Q4_0: 11.8MB  fp16: 41.9MB (×46 = 1928MB)
+  ffn_down_shexp: 10240 → 2048  Q4_0: 11.8MB  fp16: 41.9MB (×46 = 1928MB)
+
+EXPERTS (QuantizedExpertWeights — reads Q4_0 directly, already efficient):
+  gate_exps: 4/64 × 64×1536×2048  Q4_0: 7.1MB per call     (×46 = 325MB)
+  up_exps:   same                  Q4_0: 7.1MB              (×46 = 325MB)
+  down_exps: 4/64 × 64×2048×1536  Q4_0: 7.1MB              (×46 = 325MB)
+```
+
+### Bytes Read Per Token
+
+| Component | Current (fp16 cache) | With Q4_0 direct | Savings |
+|-----------|---------------------|------------------|---------|
+| Attention linears (×47) | 1.61 GB fp16 | 0.45 GB Q4_0 | **1.16 GB** |
+| Shared expert (×46) | 5.78 GB fp16 | 1.62 GB Q4_0 | **4.16 GB** |
+| Expert weights (×46) | 0.98 GB Q4_0 | 0.98 GB Q4_0 | 0 |
+| Absorbed k_b/v_b (×47) | 0.43 GB fp16 | 0.43 GB fp16 | 0 (already fp16) |
+| **Total** | **8.80 GB** | **3.48 GB** | **5.32 GB (60% less)** |
+
+At 100 GB/s bandwidth:
+- Current: 8.80 GB → **88ms → 11.4 tok/s theoretical** (we're at 15, so ~30% overhead)
+- With Q4_0 direct: 3.48 GB → **34.8ms → 28.7 tok/s theoretical**
+- With overhead: ~23 tok/s realistic (1.5x current)
+
+### Why We Were Wrong Before
+
+We assumed the dequant-cache was free because it's a one-time cost. But at batch=1,
+the **per-token cost is reading the cached weights** — and fp16 is 3.56x bigger than Q4_0.
+Every single token pays this 3.56x tax on every QuantizedLinear call.
+
+The packed-dot approach (reading Q4_0 directly) saves bandwidth at the cost of some
+extra ALU for inline dequant. But Apple Silicon has 100 GB/s bandwidth and ~10 TFLOPS
+compute — we're massively bandwidth-limited, so trading bandwidth for compute is a huge win.
+
+llama.cpp figured this out from day one. Their entire architecture is built around
+reading quantized data directly, never materializing fp16 weight matrices.
+
+### What We Tried That DIDN'T Help (and why)
+
+| Attempt | Result | Why it failed |
+|---------|--------|---------------|
+| Packed-dot for QuantizedExpertWeights | +3.6% | Experts are only 0.98 GB — 11% of total reads |
+| MV heuristic relaxation | 2 MATVEC matches | Expert MUL structure doesn't match |
+| TC_OPT=1,2 | no change | TC useless for batch=1 matvec |
+| Contiguous split | 2x worse | +134 kernels of dispatch overhead |
+| Full expert dequant cache | OOM | 56 GB fp16 for all experts |
+
+**Root cause**: We were optimizing the expert path (0.98 GB) while ignoring the
+QuantizedLinear path (7.39 GB = 84% of reads). The shared expert alone is 5.78 GB.
+
+### Plan: Packed-Dot for QuantizedLinear (Phase 1)
+
+**Goal**: Replace fp16 dequant-cache with Q4_0 packed-dot for all QuantizedLinear.
+Read Q4_0 blocks directly, compute matvec inline. No fp16 weight materialization.
+
+**Implementation**:
+```python
+class QuantizedLinear:
+  def __call__(self, x: Tensor) -> Tensor:
+    # Instead of: x @ self._dequant_cache.T  (reads fp16)
+    # Do: packed-dot on self.blocks directly (reads Q4_0)
+    bpr = self.in_features // 32
+    blocks = self.blocks.reshape(self.out_features, bpr, 18)
+    scale = blocks[:, :, :2].bitcast(dtypes.float16)
+    packed = blocks[:, :, 2:]
+    x_fp16 = x.cast(dtypes.float16).reshape(-1, 1, bpr, 2, 16)
+    x_lo, x_hi = x_fp16[..., 0, :], x_fp16[..., 1, :]
+    lo = packed.bitwise_and(0xF).cast(dtypes.float16)
+    hi = packed.rshift(4).cast(dtypes.float16)
+    nib_dot = (lo * x_lo + hi * x_hi).sum(axis=-1)
+    x_block_sum = x_fp16.reshape(-1, 1, bpr, 32).sum(axis=-1)
+    return (scale.squeeze(-1) * (nib_dot - 8.0 * x_block_sum)).sum(axis=-1)
+```
+
+**Expected savings**:
+- Shared expert: 5.78 GB → 1.62 GB (saves 4.16 GB)
+- Attention: 1.61 GB → 0.45 GB (saves 1.16 GB)
+- Total: 8.80 GB → 3.48 GB reads per token
+- Memory: frees ~3 GB RAM (no fp16 dequant caches)
+
+**Risk**: Packed-dot kernel must achieve >30 GB/s to beat fp16 matmul.
+Expert packed-dot measured 22 GB/s — but QuantizedLinear has simpler shapes
+(no expert gather) so optimizer should handle it better.
+
+**Success criteria**: >20 tok/s on GLM Q4_0 (currently 15.15).
+
+### Phase 2: Kernel Count Reduction
+
+Even at 3.48 GB / 100 GB/s = 34.8ms compute, we need <500 kernels at <15us overhead
+to hit 50 tok/s. Current: 1550 kernels × 43us = 67ms overhead alone.
+
+After Phase 1, profile again and attack kernel count.
+
+---
+
+## Plan: GLM Q4_0 → 50 tok/s (Feb 7, 2026)
+
+### Profile: GLM Q4_0 (unsloth) — 12.15 tok/s, 1550 kernels/token, 82.5ms/tok
+
+```
+  STEADY     82.5    12.15        35.1
+  Kernels: 1550 per token, 6 ICBs (32+64+128+256+512+558)
+  Avg overhead per kernel: 53.2 us
+```
+
+### Per-Block Kernel Map (32 kernels × ~40 blocks + overhead = 1550)
+
+Each block has TWO schedule calls: 28-kernel MoE schedule + 4-kernel shared-expert tail.
+Every block has a UNIQUE schedule hash (different weight buffers → different cache key).
+After first miss, all subsequent tokens hit cache (JIT captures full 1550-kernel sequence).
+
+**The three killer kernels** (per block, warmup times, ~41 calls/token each):
+
+| # | Kernel | Time | BW | What | Labels |
+|---|--------|------|----|------|--------|
+| 65 | `r_64_32_3_64_32_64_32` | **1115us** | **13 GB/s** | Expert gate_up+silu+mul (Q4_0 fused dequant+matmul) | bitcast,rshift,bitwise_and,cat,__sub__,cast,__matmul__,silu,__mul__ |
+| 59 | `r_1536_16_128_2048` | **800us** | **16 GB/s** | Shared expert gate_up+silu+mul (fused dequant) | cast,linear,silu,__mul__ |
+| 47 | `r_768_16_128n1` | **720us** | **4 GB/s** | Attention KV_A projection (fused dequant) | __add__ |
+
+Everything else per block is fast (50-160 GB/s): attention projections, attention compute, norms.
+
+**Full per-block trace** (28-kernel schedule [6e082f08] + 4-kernel schedule [efe5d8bb]):
+```
+  #46 r_16_128n1        14us  -       RMSNorm pre-attention
+  #47 r_768_16_128n1   720us  4GB/s   *** Attn KV_A projection (fused Q4_0 dequant)
+  #48 r_16_48            9us  -       Norm
+  #49 r_40_32_4_192_4  150us  53GB/s  Attn KV_B projection
+  #50 r_5_18_4_16_2_48_4 53us 87GB/s  Attn Q projection
+  #51 r_20_T_16_36      10us  -       QK matmul
+  #52 r_5_4_T             8us -       Softmax reduce
+  #53 r_5_4_Tn1           8us -       Softmax normalize
+  #54 r_5_8_16_4_4_T    12us  -       Attn V matmul
+  #55 r_40_32_4_128_4n1  72us 70GB/s  Attn output proj
+  #56 r_2048_16_320n1   288us 73GB/s  Linear + residual
+  #57 r_16_128           16us -       RMSNorm pre-MoE
+  #58 r_64_16_128        22us -       MoE gate (sigmoid routing)
+  #59 r_1536_16_128_2048 800us 16GB/s *** Shared expert gate_up+silu (fused Q4_0 dequant)
+  #60 r_64_16_4          10us -       Topk reduce
+  #61 r_4_16_4            8us -       Topk select
+  #62 E_18432_32_4_3    165us 129GB/s Expert block gather (gate/up)
+  #63 E_18432_32_4_3n1  166us 128GB/s Expert block gather (gate/up)
+  #64 E_4                 9us -       Routing probs gather
+  #65 r_64_32_3_64_32_64_32 1115us 13GB/s *** Expert dequant+matmul+silu+mul (THE bottleneck)
+  #66 r_4                 7us -       Routing norm
+  #67 r_4_128_8_4_4_192 251us 161GB/s Expert down matmul (good!)
+  #68 r_2048_16_4_96     88us 72GB/s  MoE output combine + residual
+  #69 r_16_128n1         13us -       RMSNorm
+  #70 r_576_16_128n1     40us 60GB/s  Shared expert down
+  #71 r_16_32            13us -       Norm
+  #72 E_9_32_2n1          9us -       Routing elementwise
+  #73 E_9_16_4n1          8us -       Routing elementwise
+  --- 4-kernel tail schedule [efe5d8bb] ---
+  #74 r_16_128n1         13us -       Norm
+  #75 r_512_16_128n1     36us 66GB/s  Projection
+  #76 r_16_32n1          13us -       Norm
+  #77 E_4_32_4n48         8us -       Elementwise
+```
+
+### Root Cause: Fused Dequant Kills Optimizer
+
+The Q4_0 `dequantize_q4_0` generates `bitwise_and → rshift → cat → cast → sub → mul` chains.
+When tinygrad fuses these with matmul, the resulting kernel has terrible parallelism:
+- MV heuristic requires `MUL(INDEX, INDEX)` but sees `MUL(dequant_chain, INDEX)` → no match
+- GROUPTOP can't apply (output > 2048 threshold)
+- Result: serial reduction, 13-16 GB/s instead of 80+ GB/s
+
+### The Packed-Dot Breakthrough (bench_q4_repack.py)
+
+The `q4_packed_dot` approach achieves **196us at 26 GB/s** for 4096×4096 — pure tinygrad, no MSL:
+```python
+# Instead of: unpack nibbles → full weight matrix → matmul
+# Do: paired nibble × activation dot product → scale → reduce
+lo = packed.bitwise_and(0xF).cast(fp16)
+hi = packed.rshift(4).cast(fp16)
+result = (scale * (lo * x_lo + hi * x_hi)).sum(...)
+```
+This structures the computation so the inner products create `MUL(INDEX, INDEX)` patterns
+that the optimizer CAN match. 5.7x faster than fused dequant (1115us → 196us scale).
+
+For Q4_0 with offset: `sum((nib - 8) * x) = sum(nib * x) - 8 * sum(x_block)`
+The `-8` offset becomes a simple `block_sum * scale * (-8)` correction term.
+
+### Phased Plan
+
+**Phase 1: Packed-dot Q4_0 for QuantizedExpertWeights** (target ~25 tok/s)
+- Replace `dequant → reshape → matmul` with packed-dot in `QuantizedExpertWeights.__call__`
+- For Q4_0 (type 2) only: restructure computation to paired nibble×activation products
+- Pure tinygrad tensor ops, no MSL
+- Success: expert dequant+matmul kernels go from 13 GB/s to 25+ GB/s
+
+**Phase 2: Packed-dot for QuantizedLinear** (target ~30 tok/s)
+- Same packed-dot for attention projections and shared expert
+- Fixes r_768_16_128n1 at 4 GB/s and r_1536_16_128_2048 at 16 GB/s
+- Success: ALL dequant+matmul kernels at 25+ GB/s
+
+**Phase 3: Kernel count reduction** (target ~40 tok/s)
+- Fuse expert gathers (E_18432 × 2 + E_4 → 1)
+- Fuse topk + gate into single schedule
+- Fuse norms into adjacent matmuls
+- Target: ~20 kernels/block × 40 = 800 kernels (from 1550)
+
+**Phase 4: BEAM + further optimization** (target ~50 tok/s)
+- BEAM on remaining hot kernels
+- Dispatch overhead: start JIT_BATCH_SIZE higher, reduce ICBs
+- Per-kernel overhead from 53us to ~25us
+- Target: ~500 kernels × 25us = 12.5ms dispatch + 12.4ms compute ≈ 25ms → 40 tok/s
+- Remaining gap: eliminate more kernels or reduce per-kernel overhead further
+
+### Success Criteria
+
+| Phase | tok/s | ms/tok | Kernels | Key metric |
+|-------|-------|--------|---------|------------|
+| Current | 12.15 | 82.5 | 1550 | Fused dequant at 13 GB/s |
+| Phase 1 | ~25 | ~40 | 1550 | Expert dequant at 25+ GB/s |
+| Phase 2 | ~30 | ~33 | 1550 | All dequant at 25+ GB/s |
+| Phase 3 | ~40 | ~25 | ~800 | Fewer dispatches |
+| Phase 4 | ~50 | ~20 | ~500 | BEAM + dispatch reduction |
+
+### Theoretical Budget (20ms target)
+- Memory bandwidth limited: 1.24 GB / 100 GB/s = **12.4ms compute**
+- Dispatch budget: 20 - 12.4 = **7.6ms overhead**
+- At 500 kernels × 15us = 7.5ms → barely fits
+- At 200 kernels × 38us = 7.6ms → more comfortable
+- Kernel count reduction is essential even with faster kernels
+
+---
+
 ## Journal — Feb 7, 2026 (night): Why MoE Quantized Models Are Slow — Root Cause Analysis
 
 ### The Core Problem
@@ -1022,40 +1364,22 @@ Files changed:
 
 ---
 
-## Next Prioritized Work
+## Next Prioritized Work (Feb 7 — Q4_0 packed-dot approach)
 
-### Priority 1: Remove ICB Barriers for Independent Operations
-In `tinygrad/runtime/graph/metal.py:50`, every ICB command gets `.setBarrier()`, serializing all 975 kernels. Many operations are independent:
-- `attn_q_a` and `attn_kv_a_mqa` both read `x_norm` — can run concurrently
-- `ffn_gate` and `ffn_up` both read `h_norm` — can run concurrently
+See "Plan: GLM Q4_0 → 50 tok/s" at top of file.
 
-Removing unnecessary barriers lets the GPU overlap kernel execution. Estimate: 2-5ms savings.
+### Phase 1: Packed-dot Q4_0 for QuantizedExpertWeights
+Restructure `QuantizedExpertWeights.__call__` to use packed-byte dot products for Q4_0:
+- `lo_nib * x_lo + hi_nib * x_hi` per packed byte, avoiding 2x tensor expansion
+- Offset correction: `scale * (dot(nibs, x) - 8 * sum(x_block))` per block
+- Pure tinygrad tensor ops, targets 25+ GB/s (from 13 GB/s)
 
-### Priority 2: Fused MLA Block Metal Kernel (target: 10-20x fewer kernels)
-Write a single MSL kernel that does the **entire MLA block** for T=1:
-```
-rmsnorm → q_lora(q_a → q_a_norm → q_b) → kv_compress → absorbed_attention → output_proj → residual
-```
-One kernel per block → 32 blocks = 32 kernels instead of ~975.
+### Phase 2: Packed-dot for QuantizedLinear (attention, shared expert)
+Same approach for cached-dequant linears. Currently these dequant to fp16 then matmul.
+Packed-dot skips fp16 materialization: reads packed Q4_0 bytes + does dot inline.
 
-**Why this works at T=1:**
-- All matmuls are matvec (1×D × D×D' = 1×D') — each is a simple reduction
-- Intermediate state is 4KB — fits in threadgroup memory
-- Weight reads dominate; chaining ops avoids writing/reading intermediates to device memory
-- `q4k_linear_msl` already proves this pattern works and achieves 400 GB/s
-
-### Priority 3: Fuse MoE FFN into 1-2 Kernels
-Extend the existing `q4k_moe_fused` kernel to include:
-- Router linear + topk selection
-- All expert matmuls (gate/up/down)
-- Shared expert matmuls
-- Weighted sum + residual
-
-### Priority 4: Increase JIT_BATCH_SIZE
-Current `JIT_BATCH_SIZE=32` (doubles per batch). With 975 kernels, first ICB has only 32. Try starting higher.
-
-### Priority 5 (Nuclear Option): Full Forward Pass Metal Kernel
-1 kernel dispatch instead of 975. Load all 0.69 GB weights, stream through blocks, pass hidden state in threadgroup memory.
+### Later: Kernel count reduction, ICB barrier removal, BEAM optimization
+See plan phases 3-4 at top of file.
 
 ---
 
@@ -1185,11 +1509,12 @@ explicit adds for weighted sum, shared expert fully independent. See `llamacpp.m
 - M3: 70 tok/s — barrier removal + initial fusion
 - M4: 100+ tok/s — fused MLA block kernel or mega-kernel
 
-### GLM-4.7-Flash
-- G0: 12.2 tok/s — measured with pairwise topk + MoE fusion break (DONE, Feb 5)
-- G0.5: **18.0 tok/s** — Q6K MoE MSL kernel for expert down projections (**DONE, Feb 6**) — currently disabled (hallucination risk)
-- G0.7: **14.0 tok/s** — selective .contiguous() split for Q5K/Q6K experts (**DONE, Feb 6**) — no MSL, pure tinygrad
-- G1: 20 tok/s — Q4K MoE MSL for expert gate/up, or further Q6K tuning
-- G2: 25 tok/s — fuse MoE gate·up, reduce small kernels
-- G3: 35 tok/s — dispatch overhead reduction (barriers, ICB batching)
-- G4: 50 tok/s — custom MoE kernel (mul_mat_id style)
+### GLM-4.7-Flash (Q4_0 path — current focus)
+- G0: 12.2 tok/s — Q4_K_M baseline with pairwise topk + MoE fusion break (DONE, Feb 5)
+- G0.5: 18.0 tok/s — Q6K MoE MSL kernel for Q4_K expert down projections (DONE, Feb 6) — MSL removed
+- G0.7: 14.0 tok/s — selective .contiguous() split for Q5K/Q6K experts (DONE, Feb 6) — Q4_K path
+- G1: **14.6 tok/s** — Q4_0 (unsloth), pure tinygrad, no MSL (**DONE, Feb 7**) — current baseline
+- G2: ~25 tok/s — packed-dot Q4_0 for QuantizedExpertWeights (Phase 1)
+- G3: ~30 tok/s — packed-dot Q4_0 for QuantizedLinear (Phase 2)
+- G4: ~40 tok/s — kernel count reduction (Phase 3)
+- G5: 50 tok/s — BEAM + dispatch optimization (Phase 4)
