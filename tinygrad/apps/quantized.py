@@ -4,13 +4,14 @@ from tinygrad.dtype import dtypes
 from tinygrad.nn.state import GGML_QUANT_INFO
 
 class QuantizedLinear:
-  __slots__ = ('blocks', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_dequant_fn', '_dequant_cache')
+  __slots__ = ('blocks', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_dequant_fn', '_dequant_cache', '_q4_0_blocks')
   def __init__(self, blocks:Tensor, shape:tuple[int, int], ggml_type:int):
     self.blocks = blocks
     self.out_features, self.in_features = shape
     self.ggml_type = ggml_type
     self._el_per_block, _, self._dequant_fn = GGML_QUANT_INFO[ggml_type]
     self._dequant_cache = None
+    self._q4_0_blocks = None
 
   def _ensure_dequant_cache(self, device: str|tuple[str, ...]) -> None:
     if self._dequant_cache is not None and self._dequant_cache.device == device: return
@@ -19,7 +20,28 @@ class QuantizedLinear:
     if getenv("HALF", 1): w = w.cast('float16')
     self._dequant_cache = w.realize()
 
+  def _ensure_q4_0_blocks(self, device: str|tuple[str, ...]) -> None:
+    if self._q4_0_blocks is not None and self._q4_0_blocks.device == device: return
+    blocks = self.blocks.to(device) if self.blocks.device != device else self.blocks
+    bpr = self.in_features // 32
+    self._q4_0_blocks = blocks.reshape(self.out_features, bpr, 18)
+
   def __call__(self, x:Tensor) -> Tensor:
+    # Q4_0 packed-dot: read quantized blocks directly (3.56x less bandwidth than fp16 cache)
+    if self.ggml_type == 2 and self.in_features % 32 == 0:
+      self._ensure_q4_0_blocks(x.device)
+      O, bpr = self.out_features, self.in_features // 32
+      blocks = self._q4_0_blocks
+      scale = blocks[:, :, :2].bitcast(dtypes.float16)  # (O, bpr, 1)
+      packed = blocks[:, :, 2:]  # (O, bpr, 16)
+      x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
+      x_pairs = x_fp16.reshape(-1, 1, bpr, 2, 16)
+      x_lo, x_hi = x_pairs[:, :, :, 0, :], x_pairs[:, :, :, 1, :]
+      # Subtract 8 from nibbles (avoids separate x_block_sum kernel)
+      lo = packed.bitwise_and(0xF).cast(dtypes.float16) - 8.0
+      hi = (packed.rshift(4)).cast(dtypes.float16) - 8.0
+      # Scale and reduce in one pass over (bpr, 16)
+      return (scale * (lo * x_lo + hi * x_hi)).reshape(-1, O, bpr * 16).sum(axis=-1).reshape(*x.shape[:-1], O)
     self._ensure_dequant_cache(x.device)
     return x.linear(self._dequant_cache.T, None)
 
