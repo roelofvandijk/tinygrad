@@ -107,7 +107,7 @@ class MLATransformerBlock:
     cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
       self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
-    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new)
+    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new).realize()
     k = self.cache_k[:, :, 0:start_pos+T, :]
     # Attention scores
     qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
@@ -145,7 +145,7 @@ class MLATransformerBlock:
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos))
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 def load_mla_params_from_gguf(kv: dict, arch: str) -> dict:
   """Extract MLA architecture params from GGUF metadata. Returns dict of MLA params."""
