@@ -187,7 +187,7 @@ Use VIZ=-1 to capture rewrite traces (and it implicitly enables profiling). The 
 
 ### Capture a profile
 ```bash
-VIZ=-1 .venv2/bin/python3 tinygrad/apps/llm.py --model "deepseek-v2-lite" --benchmark 10
+VIZ=-1 .venv2/bin/python3 tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 10
 ```
 
 ### View the slowest kernels
@@ -206,7 +206,7 @@ DEBUG=5 prints the **Metal source code** for every kernel. Essential for underst
 
 ### Capture kernel sources
 ```bash
-DEBUG=5 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite" --benchmark 3 > ./debug5.log 2>&1
+DEBUG=5 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 3 > ./debug5.log 2>&1
 ```
 
 ### Find a specific kernel's Metal source
@@ -251,7 +251,7 @@ Result: serial 1536-element reduction per thread at 2 GB/s.
 ### Debugging opt decisions
 ```bash
 # See which opts were applied
-DEBUG=3 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite" --benchmark 1 2>&1 | grep "MATVEC\|GROUPTOP"
+DEBUG=3 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 1 2>&1 | grep "MATVEC\|GROUPTOP"
 ```
 
 ## Benchmarking Rules

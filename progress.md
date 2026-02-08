@@ -779,7 +779,7 @@ TEMP=0.7 REP_PENALTY=1.05 python tinygrad/apps/llm.py --model "youtu-llm:2b" --m
 # TEMP=0.7 python tinygrad/apps/llm.py --model "deepseek-coder-v2-lite" --max_context 256
 
 # DeepSeek-V2-Lite (16B MoE, needs 64GB+ RAM)
-# python tinygrad/apps/llm.py --model "deepseek-v2-lite"
+# python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0"
 ```
 
 ## System Info

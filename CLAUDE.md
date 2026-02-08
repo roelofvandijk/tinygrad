@@ -394,7 +394,7 @@ Use VIZ=-1 to capture rewrite traces (and it implicitly enables profiling):
 
 ```bash
 # Capture
-VIZ=-1 .venv2/bin/python3 tinygrad/apps/llm.py --model "deepseek-v2-lite" --benchmark 10
+VIZ=-1 .venv2/bin/python3 tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 10
 
 # View slowest kernels
 PYTHONPATH=. .venv2/bin/python3 extra/viz/cli.py --profile --device METAL
@@ -408,7 +408,7 @@ PYTHONPATH=. .venv2/bin/python3 extra/viz/cli.py --profile --device METAL --kern
 DEBUG=5 prints the **Metal source code** for every kernel. Essential for understanding why a kernel is slow.
 
 ```bash
-DEBUG=5 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite" --benchmark 3 > ./debug5.log 2>&1
+DEBUG=5 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 3 > ./debug5.log 2>&1
 ```
 
 What to look for in kernel source:
