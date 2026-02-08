@@ -426,14 +426,12 @@ models = {
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "glm-4.7:flash-Q4_K_M": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
-  "glm-4.7:flash-Q8": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q8_0.gguf",
   "glm-4.7:flash-Q4_0": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_0.gguf",
   "glm-4.7:flash-Q6_K": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q6_K.gguf",
-  "deepseek-v2-lite": "https://huggingface.co/mradermacher/DeepSeek-V2-Lite-GGUF/resolve/main/DeepSeek-V2-Lite.Q4_K_M.gguf",
+  "deepseek-v2-lite-Q4_K_M": "https://huggingface.co/mradermacher/DeepSeek-V2-Lite-GGUF/resolve/main/DeepSeek-V2-Lite.Q4_K_M.gguf",
   "deepseek-v2-lite-Q4_0": "https://huggingface.co/zhentaoyu/DeepSeek-V2-Lite-Chat-Q4_0-GGUF/resolve/main/deepseek-v2-lite-chat-q4_0.gguf",
   "youtu-llm:2b-Q4_K_M": "https://huggingface.co/AaryanK/Youtu-LLM-2B-GGUF/resolve/main/Youtu-LLM-2B.q4_k_m.gguf",
   "youtu-llm:2b-Q4_0": "https://huggingface.co/AaryanK/Youtu-LLM-2B-GGUF/resolve/main/Youtu-LLM-2B.q4_0.gguf",
-  "youtu-llm:2b-Q8": "https://huggingface.co/tencent/Youtu-LLM-2B-GGUF/resolve/main/Youtu-LLM-2B-Q8_0.gguf",
 }
 
 # *** simple OpenAI compatible server on 11434 to match ollama ***
