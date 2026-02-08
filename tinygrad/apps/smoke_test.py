@@ -8,7 +8,7 @@ from tinygrad.apps.llm import Transformer, SimpleTokenizer, models
 
 SMOKE_MODELS = {
   "youtu": ("youtu-llm:2b-Q4_0", [37317, 11, 290, 1483, 371]),  # 'Okay, the user is'
-  "deepseek": ("deepseek-v2-lite", [790, 40619, 13, 976, 185]),  # '"Paris."\n'
+  "deepseek": ("deepseek-v2-lite-Q4_0", [790, 40619, 13, 976, 185]),  # '"Paris."\n'
   "glm": ("glm-4.7:flash", [16, 13, 220, 3070, 28203]),          # '1.  **Ident'
 }
 HISTORY_FILE = Path(__file__).parent / "smoke_test_history.md"

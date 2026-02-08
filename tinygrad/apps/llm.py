@@ -512,7 +512,7 @@ class Handler(HTTPRequestHandler):
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", default="deepseek-v2-lite", help="Model choice or local path")
+  parser.add_argument("--model", default="deepseek-v2-lite-Q4_0", help="Model choice or local path")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--quantized", action="store_true", default=None, help="Keep weights quantized for lower memory (slower inference)")
   parser.add_argument("--no-quantized", dest="quantized", action="store_false", help="Dequantize weights (faster inference, more memory)")
