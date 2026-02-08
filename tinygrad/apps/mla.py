@@ -115,9 +115,8 @@ class MLATransformerBlock:
       qk = qk + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
       attn_weights = qk.softmax(-1)
     else:
-      # Decode (T=1): fp16 exp without max (saves 3 kernels, no overflow risk for small seq)
-      e = qk.exp()
-      attn_weights = e / e.sum(-1, keepdim=True)
+      e = qk.float().exp()
+      attn_weights = (e / e.sum(-1, keepdim=True)).half()
     # Absorbed V: (attn @ kv_normed_cache) @ v_b^T
     attn = (attn_weights.matmul(k[:, :, :, :self.kv_lora_rank]) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
