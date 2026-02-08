@@ -86,13 +86,16 @@ class MLATransformerBlock:
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)
     B, T, _ = x.shape
-    # Q projection (with optional LoRA)
-    q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))) if self.q_lora_rank > 0 else self.attn_q(x_norm)
+    if self.q_lora_rank > 0:
+      q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm)))
+      kv_out = self.attn_kv_a_mqa(x_norm)
+    else:
+      q = self.attn_q(x_norm)
+      kv_out = self.attn_kv_a_mqa(x_norm)
     q = q.reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     # KV compression
-    compressed_kv = self.attn_kv_a_mqa(x_norm)
-    compressed_kv, k_pe = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    compressed_kv, k_pe = kv_out.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = k_pe.reshape(B, T, 1, self.qk_rope_head_dim).transpose(1, 2)
     # RoPE (fp16, no float32 conversion)
     freqs_cis = self.freqs_cis_cache[start_pos:start_pos+T]
