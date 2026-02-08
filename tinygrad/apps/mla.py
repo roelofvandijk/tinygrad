@@ -136,13 +136,15 @@ class MLATransformerBlock:
       probs = gate_scores.gather(-1, sel)
       if self.expert_gating_func == 3: probs = probs.softmax(-1)
       elif self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(6.103515625e-5)
-      gated = self.ffn_gate_exps(sel, h_norm).float().silu() * self.ffn_up_exps(sel, h_norm).float()
-      expert_out = self.ffn_down_exps(sel, gated).float()
+      gate = self.ffn_gate_exps(sel, h_norm).silu().contiguous()
+      up = self.ffn_up_exps(sel, h_norm).contiguous()
+      gated = gate * up
+      expert_out = self.ffn_down_exps(sel, gated)
       # Break fusion with contiguous before weighted sum
       expert_out = expert_out.contiguous()
       out = (expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_shexp'):
-        out = out + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).float().silu() * self.ffn_up_shexp(h_norm).float()).float()
+        out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)

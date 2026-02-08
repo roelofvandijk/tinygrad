@@ -88,6 +88,27 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           return k
       break
 
+  # Q4_0 packed-dot GROUP: bitwise ops in reduce chain indicate dequant — MV can't match these, apply GROUP directly
+  reduce_rngs = k.ranges_of(AxisType.REDUCE) if k.reduceop is not None else []
+  reduce_product = prod(int(r.vmax+1) for r in reduce_rngs) if reduce_rngs else 0
+  if k.ren.has_local and k.ren.has_shared and k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and \
+    reduce_product >= 256 and len(reduce_rngs) >= 2 and \
+    any(u.op in {Ops.AND, Ops.SHR} for u in k.reduceop.src[0].toposort() if isinstance(u, UOp)):
+    first_reduce_rng = reduce_rngs[0]
+    for global_idx in k.axes_of(AxisType.GLOBAL):
+      gshape = k.full_shape[global_idx]
+      for gsz in [16, 8, 4]:
+        if first_reduce_rng.src[0].divides(gsz) is None: continue
+        for lsz, usz in [(4,4), (4,2), (2,4), (2,2)]:
+          if gshape % (lsz * usz) != 0: continue
+          try:
+            tk = k.copy()
+            tk.apply_opt(Opt(OptOps.GROUP, 0, gsz))
+            tk.apply_opt(Opt(OptOps.LOCAL, global_idx, lsz))
+            tk.apply_opt(Opt(OptOps.UPCAST, global_idx, usz))
+            return tk
+          except KernelOptError: pass
+
   # are we grouping? (requires local shape support)
   if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):

@@ -32,6 +32,8 @@ All models use MLA (Multi-head Latent Attention). GLM and deepseek-v2-lite also 
 
 10. **ICB barrier removal gave 0% speedup.** Nearly all 586 kernels are data-dependent (each output feeds next input). Conflict-based barriers re-insert on almost every kernel. Would need kernel reordering to create concurrency.
 
+11. **GROUP heuristic for Q4_0 dequant has ~50 GB/s ceiling.** Detecting bitwise ops (AND/SHR) in reduce chain and applying GROUP+LOCAL+UPCAST gets individual expert kernels from 34→42 GB/s (down) and 31→50 GB/s (gate/up). But scattered byte reads in generated code prevent reaching 100+ GB/s. The `.contiguous()` splits needed to enable GROUP add ~26 kernels, partially offsetting gains. Net: +7% tok/s on ds2-lite.
+
 ## What Worked
 
 | Change | Impact | Details |
@@ -64,6 +66,7 @@ All models use MLA (Multi-head Latent Attention). GLM and deepseek-v2-lite also 
 | Combined q_a+kv_a projection | **Same** | Split consumption → scheduler duplicates |
 | Combined gate+up projection | **+1 kernel** | Breaks parallel reduce fusion |
 | Pre-dequant to fp16 for experts | **Worse** | 3.56x bandwidth increase > bandwidth saving |
+| Q4_0 GROUP heuristic (ds2-lite) | **+7%** (25.4→27.1) | GROUP fires on all expert kernels but ceiling ~50 GB/s; +26 kernels from splits offset gains |
 
 ## Model Specifications
 

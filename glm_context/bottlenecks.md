@@ -74,7 +74,8 @@ tinygrad's Q4_0 packed-dot kernels achieve **103-147 GB/s** (45-64% of theoretic
 This is where the gap is largest. tinygrad fuses dequant+matmul into one kernel, but:
 - **MV heuristic fails**: requires `MUL(INDEX, INDEX)`, sees `MUL(dequant_chain(INDEX), INDEX)`
 - **GROUPTOP fails**: output dims (6×2048 = 12288) exceed 2048 threshold
-- Result: **serial reduction at 2-15 GB/s** instead of 80+ GB/s
+- Without GROUP: **serial reduction at 2-15 GB/s** instead of 80+ GB/s
+- With Q4_0 GROUP heuristic (Feb 8): **42-54 GB/s** — improved but **~50 GB/s ceiling** from scattered byte reads in generated code. Custom MSL needed for 100+ GB/s.
 
 ---
 
@@ -141,6 +142,30 @@ Output for expert gate+up kernel: 6 experts * 1408 outputs = 8448 > 2048. For ex
 ### Multireduce Prevents GROUP
 
 Gate+up fused kernel has TWO reduction groups. GROUP(0, N) only splits the FIRST reduction's outer dim. The second reduction is unaffected. Both reductions run serially, with GROUP sync overhead paid but only one reduction benefits.
+
+### Q4_0 GROUP Heuristic — Works But ~50 GB/s Ceiling (Feb 8, 2026)
+
+**Approach**: Detect Q4_0 packed-dot kernels via bitwise ops (AND/SHR) in reduce chain, apply GROUP+LOCAL+UPCAST. Added to heuristic.py after MV section.
+
+**Detection**: `reduce_product >= 256 and len(reduce_rngs) >= 2 and any(u.op in {Ops.AND, Ops.SHR} ...)`
+
+**Key learnings**:
+1. **Must try ALL global axes**, not just the first. Down kernel has global axes [2, 32] — first axis (2) too small for any LOCAL+UPCAST combo, but second (32) works. The MV-style `break` after first axis prevented this.
+2. **Flexible GROUP sizes matter**: First reduce range of 44 needs GROUP(0,4) since 44 % 16 ≠ 0 and 44 % 8 ≠ 0. Try [16, 8, 4].
+3. **Tighten detection**: Without `reduce_product >= 256` and `len(reduce_rngs) >= 2`, GROUP pollutes small topk kernels (r_64_16_4: 10→20us, 2x worse).
+4. **`.contiguous()` after `.silu()` breaks fusion** (ALU op prevents `found_contiguous` elision in rangeify.py). But `.contiguous()` after `.reshape()` is elided.
+5. **Shared expert split** requires `.contiguous()` before addition to break multireduce → single-reduce. Then GROUP fires.
+
+**Per-kernel results** (ds2-lite, warm-up times):
+
+| Kernel | Before | After | GROUP config |
+|--------|--------|-------|-------------|
+| Gate `r_528_*` | 201us, 50 GB/s | 198us, 50 GB/s | GROUP(0,16), LOCAL(0,4), UPCAST(0,4) |
+| Up `r_528_*n1` | 198us, 51 GB/s | 192us, 54 GB/s | GROUP(0,16), LOCAL(0,4), UPCAST(0,4) |
+| Down `r_*_44_16` | 281us, 34 GB/s | 241us, 42 GB/s | GROUP(0,4), LOCAL(1,4), UPCAST(1,4) |
+| Shared `r_288_*` | 200us, 27 GB/s | 196us, 28 GB/s | GROUP(0,16), LOCAL(0,4), UPCAST(0,4) |
+
+**Net**: 25.4 → 27.1 tok/s (+7%). Per-kernel gains offset by +26 kernels from `.contiguous()` splits. Generated code still uses scattered byte reads — fundamental limit for heuristic approach.
 
 ---
 
@@ -268,6 +293,8 @@ Why: Q4_0 dequant = ~5 ops. Q4_K dequant = ~20 ops with hierarchical sub-block s
 | GROUPTOP_MAX=16384 | 12.8 | -33% | Applied to ALL kernels |
 | Targeted packed-dot GROUP | 18.8 | -2% | Still caught multireduce |
 | Split gate+up .contiguous() | 28.8 | 0% | Scheduler re-fuses (found_contiguous) |
+| Split gate+up `.silu().contiguous()` | 28.8 | 0% | ALU prevents re-fusion, but no GROUP without heuristic |
+| Q4_0 GROUP heuristic (AND/SHR detect) | 27.1 | +7% | GROUP on all 4 expert kernels; 780 kernels (+26 from splits) |
 | MV_ROWS_PER_THREAD=1 | 29.2 | +1% | Small win on attention |
 | Per-expert dispatch | — | -18% | 6x more dispatches |
 | JIT_BATCH_SIZE=728 | 28.4 | -1% | ICB transitions not bottleneck |
@@ -306,6 +333,7 @@ Why: Q4_0 dequant = ~5 ops. Q4_K dequant = ~20 ops with hierarchical sub-block s
 | Different tensor expression | Not tested | Doubles scale multiplications |
 | Pre-dequant experts to fp16 | Math says worse | 80/3.56 = 22.5 GB/s effective < 33 GB/s Q4_0 |
 | Teach optimizer about fused dequant | Blocked | Multireduce + ranges_subset makes this very hard |
+| Q4_0 GROUP heuristic + split | +7% | GROUP fires, gate 50GB/s, down 42GB/s — ceiling ~50 GB/s from scattered byte reads |
 
 ---
 
