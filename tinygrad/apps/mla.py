@@ -110,18 +110,15 @@ class MLATransformerBlock:
     cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
       self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
-    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new).realize()
+    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new)  # there could be a .realize() here, seems to give 2-3 tok/s 
     k = self.cache_k[:, :, 0:start_pos+T, :]
-    # Attention scores
-    qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
-    if T > 1:
-      qk = qk + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
-      attn_weights = qk.softmax(-1)
-    else:
-      e = qk.float().exp()
-      attn_weights = (e / e.sum(-1, keepdim=True)).half()
+    # Use SDPA to fuse qk, masking, softmax, and attn@kv_lora into one attention op.
+    # SDPA applies 1/sqrt(d), so multiply q by mscale^2 to preserve MLA's attention scale.
+    kv_lora = k[:, :, :, :self.kv_lora_rank]
+    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
+    attn_kv = (q * (self.mscale * self.mscale)).scaled_dot_product_attention(k, kv_lora, attn_mask=mask, enable_gqa=True)
     # Absorbed V: (attn @ kv_normed_cache) @ v_b^T
-    attn = (attn_weights.matmul(k[:, :, :, :self.kv_lora_rank]) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
+    attn = (attn_kv @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
 
   def _feed_forward(self, h: Tensor) -> Tensor:
@@ -144,13 +141,13 @@ class MLATransformerBlock:
       expert_out = expert_out.contiguous()
       out = (expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_shexp'):
-        out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        out = out + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()  # contiguous() needs to be here for performance, 2-3 tok/s
 
 def load_mla_params_from_gguf(kv: dict, arch: str) -> dict:
   """Extract MLA architecture params from GGUF metadata. Returns dict of MLA params."""
