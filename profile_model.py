@@ -122,10 +122,11 @@ def categorize_kernel(name):
   if total_work > 10000: return 'large reduce (matmul/MoE)'
   return 'small reduce (norm/softmax/topk)'
 
-def print_report(data, profile, model_name):
+def print_report(data, profile, model_name, kernel_sources=None):
   W = 80
   print("=" * W)
   print(f"  PROFILE: {model_name}")
+  if kernel_sources: print(f"  (with kernel source, {len(kernel_sources)} kernels captured)")
   print("=" * W)
 
   # === Performance ===
@@ -200,12 +201,22 @@ def print_report(data, profile, model_name):
     print(f"  {'Name':<45s} {'Calls':>5s} {'Tot ms':>8s} {'Avg us':>8s} {'AvgBW':>6s}")
     print(f"  {'-'*45} {'-'*5} {'-'*8} {'-'*8} {'-'*6}")
     by_total = sorted(name_times.items(), key=lambda x: sum(t for t, _, _ in x[1]), reverse=True)
-    for name, times in by_total[:20]:
+    for i, (name, times) in enumerate(by_total[:20]):
       count = len(times)
       tot_ms = sum(t for t, _, _ in times) / 1000
       avg_us = sum(t for t, _, _ in times) / count
       avg_bw = sum(a for _, a, _ in times) / count
       print(f"  {name:<45s} {count:>5d} {tot_ms:>8.2f} {avg_us:>8.1f} {avg_bw:>5.0f}GB")
+      # Show source for top 3 slowest kernels if available
+      if kernel_sources and i < 3 and name in kernel_sources:
+        print(f"\n    Source for {name}:")
+        src_lines = kernel_sources[name].split('\n')
+        # Show first 30 lines of source
+        for line in src_lines[:30]:
+          print(f"    {line}")
+        if len(src_lines) > 30:
+          print(f"    ... ({len(src_lines)-30} more lines)")
+        print()
 
     # Top by call count
     print(f"\n  Top by Call Count:")
@@ -277,19 +288,55 @@ def print_report(data, profile, model_name):
 
   print("\n" + "=" * W)
 
+def extract_kernel_sources(output:str) -> dict[str, str]:
+  """Extract Metal kernel source code from DEBUG=5 output.
+
+  Parses output like:
+    kernel void r_88_32_3_8(device float* data0, ...) {
+      ...
+    }
+
+  Returns dict mapping kernel name -> full source code.
+  """
+  sources = {}
+  lines = output.split('\n')
+  i = 0
+  while i < len(lines):
+    # Look for kernel declarations: "kernel void <name>(" or "kernel void* <name>("
+    m = re.match(r'kernel (?:void\*?|half\*?) (\S+)\(', lines[i])
+    if m:
+      name = m.group(1)
+      # Collect lines until we hit the closing } (matching braces)
+      src_lines = [lines[i]]
+      i += 1
+      brace_count = lines[i-1].count('{') - lines[i-1].count('}')
+      while i < len(lines) and brace_count > 0:
+        line = lines[i]
+        src_lines.append(line)
+        brace_count += line.count('{') - line.count('}')
+        i += 1
+      sources[name] = '\n'.join(src_lines)
+    else:
+      i += 1
+  return sources
+
 def main():
   if len(sys.argv) < 2:
-    print(f"Usage: {sys.argv[0]} <model> [n_tokens] [extra_env...]")
+    print(f"Usage: {sys.argv[0]} <model> [n_tokens] [extra_env...] [--with-source]")
     print(f"  e.g.: {sys.argv[0]} deepseek-v2-lite 10")
     print(f"  e.g.: {sys.argv[0]} glm-4.7:flash 10 MOE_ADDS=2")
+    print(f"  e.g.: {sys.argv[0]} deepseek-v2-lite 5 --with-source  # Includes kernel source (slower)")
     sys.exit(1)
 
-  model = sys.argv[1]
-  n_tokens = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 10
-  extra_env = [a for a in sys.argv[2:] if '=' in a]
+  with_source = '--with-source' in sys.argv
+  args = [a for a in sys.argv[1:] if a != '--with-source']
+
+  model = args[0]
+  n_tokens = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
+  extra_env = [a for a in args[1:] if '=' in a]
 
   env = os.environ.copy()
-  env['DEBUG'] = '2'
+  env['DEBUG'] = '5' if with_source else '2'
   env['PROFILE'] = '1'
   for e in extra_env:
     k, v = e.split('=', 1)
@@ -298,6 +345,8 @@ def main():
   cmd = ['.venv2/bin/python3', 'tinygrad/apps/llm.py', '--model', model, '--benchmark', str(n_tokens)]
   env_str = ' '.join(f'{k}={v}' for k, v in sorted(env.items()) if k in ('DEBUG', 'PROFILE', *[e.split('=')[0] for e in extra_env]))
   print(f"$ {env_str} {' '.join(cmd)}")
+  if with_source:
+    print("  (Note: DEBUG=5 is slower due to Metal source printing)")
   print()
 
   try:
@@ -309,7 +358,8 @@ def main():
 
   data = parse_debug_log(all_output.split('\n'))
   prof = load_profile()
-  print_report(data, prof, model)
+  kernel_sources = extract_kernel_sources(all_output) if with_source else None
+  print_report(data, prof, model, kernel_sources)
 
   log_path = os.path.abspath(f"./profile_{model.replace(':', '_').replace('.', '_')}.log")
   with open(log_path, 'w') as f:

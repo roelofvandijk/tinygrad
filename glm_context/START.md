@@ -6,7 +6,7 @@
 |-------|--------|-------|--------|-------------|-------------|------------|
 | youtu-llm:2b-Q4_0 | 0.69 GB | **56** | 17.8 | 586 (5 ICBs) | 145 (6.9ms) | 39% |
 | deepseek-v2-lite | ~2 GB | **26.5** | 37.7 | 840 (5 ICBs) | — | — |
-| GLM-4.7-Flash | 1.24 GB | **18** | 55.6 | 1700 (6 ICBs) | 80 (12.4ms) | 22% |
+| GLM-4.7-Flash | 1.24 GB | **20.9** | 48.0 | 1450 (6 ICBs) | 80 (12.4ms) | 26% |
 
 All models use MLA (Multi-head Latent Attention). GLM and deepseek-v2-lite also use MoE.
 
@@ -41,6 +41,7 @@ All models use MLA (Multi-head Latent Attention). GLM and deepseek-v2-lite also 
 | Q4K/Q6K CompiledRunner | **1.8x** (31→55.5 tok/s) | JIT ICB batching: 417→5 dispatch items |
 | Q6K MoE MSL kernel | **+48%** (12→18 tok/s GLM) | llama.cpp access pattern for expert down proj |
 | MoE down proj `.contiguous()` break | **+41%** (18→25.5 tok/s ds2) | Separate kernel gets proper parallelism |
+| Shared expert `.contiguous()` split | **+17%** (18→20.9 tok/s GLM) | Q5_K fp16 multireduce → two MV-matched matmuls (34→89 GB/s) |
 | Pairwise topk | **4.4x** per topk | 29→3 kernels, constant kernel count for any N |
 | Q4_0 packed-dot QuantizedLinear | **+96%** (26.5→52 tok/s) | 3.56x less bandwidth than fp16 cache |
 | Single K cache (V = slice of K) | -130 kernels | Matches llama.cpp MLA approach |

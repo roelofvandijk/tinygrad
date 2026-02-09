@@ -16,8 +16,8 @@
 
 llama.cpp has ~10-15 hand-written operations per layer. tinygrad generates 18-37 kernels/layer because:
 
-1. **RMSNorm = 2 kernels** (reduce + elementwise). llama.cpp: 1 fused kernel.
-2. **Softmax = 2-3 kernels** (QK + exp+sum + div). llama.cpp: online softmax in 1.
+1. **RMSNorm = 2 kernels** (reduce + elementwise). llama.cpp: 1 fused kernel. **FIXED: 1 kernel with indexing.py:236 change**
+2. **Softmax = 2-3 kernels** (QK + exp+sum + div). llama.cpp: online softmax in 1. **IMPROVED: 2 kernels with indexing.py:236 change**
 3. **MoE routing = 3+ kernels** (gate + topk + gather). llama.cpp: fused topk-moe (CUDA) or argsort (Metal).
 4. **Expert dispatch = 4+ kernels** (2 gathers + probs + fused dequant+matmul). llama.cpp: 1 `mul_mat_id` per projection.
 5. **Cache ops = 2-5 kernels** (assign + contiguous boundaries). llama.cpp: direct pointer writes.
@@ -30,6 +30,13 @@ The scheduler can't fuse across `.realize()` / `.contiguous()` boundaries. These
 - Adding more barriers → 652+ kernels (fragments fusion)
 - Combining projections (q_a+kv_a, gate+up) → same or more kernels (split consumption duplicates, breaks parallel reduce fusion)
 - The current 18/layer is the best the scheduler can do with current fusion heuristics
+
+### indexing.py:236 change breaks through the optimum
+- **Mechanism**: Remove `not (PCONTIG > 1)` guard → ranges only end when out of order
+- **Result**: Reduce+broadcast patterns (RMSNorm, softmax) fuse into single kernels
+- **GLM impact**: ~45 kernels/block → potentially ~35/block (5 RMSNorms × 1 kernel saved + softmax savings)
+- **Blocker**: 3-matmul gate+up+down fusion creates LOCAL BUFFERIZE with 10240 floats → exceeds Metal shared_max
+- **See**: `glm_context/scheduler_fusion.md` for full analysis
 
 ### 15 vs 586: the raw graph proof
 
@@ -104,15 +111,19 @@ This is where the gap is largest. tinygrad fuses dequant+matmul into one kernel,
 
 Expert kernels = **80% of token time**. Everything else is noise.
 
-### GLM-4.7-Flash-Q4_0 (82.5ms/tok, 12 tok/s → improved to 55.6ms, 18 tok/s)
+### GLM-4.7-Flash-Q4_0 (82.5ms/tok, 12 tok/s → 55.6ms, 18 tok/s → 48ms, 20.9 tok/s)
 
-Three killer kernels per block (warmup times):
+Top kernels (warmup times, after shared expert split):
 
 | Kernel | Time | BW | What |
 |--------|------|----|------|
-| Expert gate·up+silu (Q4_0 fused) | 1115us | 13 GB/s | THE bottleneck |
-| Shared expert gate·up+silu | 800us | 16 GB/s | Fused dequant |
-| Attn KV_A projection | 720us | 4 GB/s | Fused dequant |
+| Expert down `r_2048_16_2_2_3_16` | 234us | 30 GB/s | Q4_0 packed-dot |
+| Expert gate `r_384_16_4_4_4_16` | 157us | 45 GB/s | Q4_0 packed-dot |
+| Expert up `r_384_16_4_4_4_16n1` | 152us | 47 GB/s | Q4_0 packed-dot |
+| Shared gate `r_96_16_4_4_128` | 72us | 89 GB/s | Q5_K fp16 dequant (MV-matched) |
+| Shared up `r_96_16_4_4_128n1` | 94us | 91 GB/s | Q5_K fp16 dequant (MV-matched) |
+
+Previously: shared expert gate·silu·up was fused multireduce at 373us/34 GB/s. Split with `.contiguous()` → +17%.
 
 ---
 
@@ -303,7 +314,7 @@ Why: Q4_0 dequant = ~5 ops. Q4_K dequant = ~20 ops with hierarchical sub-block s
 | fp16 dequant-cache for Experts | OOM | — | 30GB+ |
 | .contiguous() split (dequant then fp16) | 12 | -37% | +33MB write+read per expert |
 
-### GLM-4.7-Flash (baseline: 12→18 tok/s)
+### GLM-4.7-Flash (baseline: 12→18→20.9 tok/s)
 
 | Experiment | tok/s | Notes |
 |-----------|-------|-------|
@@ -311,6 +322,7 @@ Why: Q4_0 dequant = ~5 ops. Q4_K dequant = ~20 ops with hierarchical sub-block s
 | GLM Q4_0 (unsloth) | 14.6 | +22% from simpler dequant |
 | Selective .contiguous() (Q5K+Q6K) | 14.0 | +27% from split benefit |
 | Q6K MoE MSL kernel | 17.97 | +48% for expert down proj |
+| **Shared expert .contiguous() split** | **20.9** | **+17%** — Q5_K multireduce → two MV matmuls (34→89 GB/s) |
 | Component isolation: no shared expert | 17.5 | -13.3ms from shared expert |
 | Component isolation: attention only | 38.3 | 26ms for attention alone |
 | Packed-dot QuantizedLinear | 14.1 | +142 kernels wiped out bandwidth savings |

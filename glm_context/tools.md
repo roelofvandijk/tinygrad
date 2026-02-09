@@ -22,6 +22,17 @@ hashlib.md5('https://huggingface.co/...'.encode('utf-8')).hexdigest()
 ```
 
 
+### Pre-populating Cache
+To avoid re-downloading, move existing GGUF files to cache with correct hash name:
+```bash
+# Get the hash for a URL
+python -c "import hashlib; print(hashlib.md5('https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf'.encode()).hexdigest())"
+# 946c72affc2a08d1db03146bcb52c03a
+
+# Move file to cache
+mv GLM-4.7-Flash-Q4_K_M.gguf ~/Library/Caches/tinygrad/downloads/946c72affc2a08d1db03146bcb52c03a
+```
+
 ### Reading GGUF Metadata
 ```python
 from tinygrad.nn.state import gguf_load

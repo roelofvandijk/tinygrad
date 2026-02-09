@@ -152,18 +152,6 @@ after_map = [(u, u.buf_uop) for u in big_sink.toposort() if u.op is Ops.AFTER]
 ```
 The conditional check adds complexity, potential bugs, and often negligible speedup. Only optimize when profiling shows a real bottleneck.
 
-### Testing LLM Changes
-```bash
-# Quick smoke test
-echo "Hello" | DEBUG=1 python tinygrad/apps/llm.py --model "llama3.2:1b"
-
-# Check cache hits (should see "cache hit" after warmup)
-echo "Hello world" | DEBUG=1 python tinygrad/apps/llm.py --model "llama3.2:1b" 2>&1 | grep cache
-
-# Test with beam search
-echo "Hello" | BEAM=2 python tinygrad/apps/llm.py --model "llama3.2:1b"
-```
-
 ## Common Patterns
 
 ### Graph Transformation
@@ -309,3 +297,12 @@ For multi-step tasks, state a brief plan:
 3. [Step] → verify: [check]
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+## LLM Optimization Guides
+
+**For detailed guides on LLM optimization (GLM, Youtu, DeepSeek models), see:**
+- `glm_context/tools.md` - Model loading, profiling, troubleshooting
+- `glm_context/architecture.md` - MLA, MoE, quantization formats
+- `glm_context/performance.md` - Benchmark results and bottleneck analysis
+- `glm_context/bottlenecks.md` - Detailed hotspot analysis
+- `glm_context/START.md` - Quick start guide
