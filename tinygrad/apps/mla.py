@@ -141,13 +141,13 @@ class MLATransformerBlock:
       expert_out = expert_out.contiguous()
       out = (expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_shexp'):
-        out = out + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()  # contiguous() needs to be here for performance, 2-3 tok/s
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 def load_mla_params_from_gguf(kv: dict, arch: str) -> dict:
   """Extract MLA architecture params from GGUF metadata. Returns dict of MLA params."""
