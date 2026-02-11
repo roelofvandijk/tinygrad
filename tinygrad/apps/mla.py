@@ -139,17 +139,19 @@ class MLATransformerBlock:
       gate_up = self.ffn_gate_up_exps(sel, h_norm)  # (B, T, K, 2*moe_hidden_dim)
       gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
       gated = (gate.silu() * up).contiguous()
-      expert_out = self.ffn_down_exps(sel, gated).contiguous()
-      out = (expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale
+      expert_out = self.ffn_down_exps(sel, gated)
+      out = (expert_out * probs.unsqueeze(-1)).sum(axis=2).contiguous() * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_up_shexp'):
         # Merged shared expert: single weight load instead of separate gate/up (reduces 22% bottleneck)
         shexp_gate_up = self.ffn_gate_up_shexp(h_norm)
         shexp_out_dim = shexp_gate_up.shape[-1] // 2
         shexp_gate, shexp_up = shexp_gate_up[..., :shexp_out_dim], shexp_gate_up[..., shexp_out_dim:]
-        out = out.contiguous() + self.ffn_down_shexp((shexp_gate.silu() * shexp_up).contiguous())
+        shexp = self.ffn_down_shexp(shexp_gate.silu() * shexp_up)
+        out = (out + shexp).contiguous()
       elif hasattr(self, 'ffn_gate_shexp'):
         # Original separate shared expert (not merged)
-        out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        out = (out + shexp).contiguous()
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
