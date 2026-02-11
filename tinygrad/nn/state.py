@@ -36,7 +36,8 @@ inverse_safe_dtypes = {v:k for k,v in safe_dtypes.items()}
 
 def accept_filename(func: Callable[[Tensor], T]) -> Callable[[Tensor|str|pathlib.Path], T]:
   @functools.wraps(func)
-  def wrapper(fn: Tensor|str|pathlib.Path) -> T: return func(Tensor(pathlib.Path(fn)) if not isinstance(fn, Tensor) else fn)
+  def wrapper(fn: Tensor|str|pathlib.Path, *args, **kwargs) -> T:
+    return func(Tensor(pathlib.Path(fn)) if not isinstance(fn, Tensor) else fn, *args, **kwargs)
   return wrapper
 
 @accept_filename
@@ -303,12 +304,66 @@ def torch_load(t:Tensor) -> dict[str, Tensor]:
     fobj.seek(rwd)
     return TorchPickle(fobj).load()
 
+def q_to_uint8(t: Tensor, b: int) -> Tensor:
+  """Unpack b-bit values from uint8 tensor. Used by quantized types."""
+  # TODO: rewrite with arange?
+  shift_tensor, bitmask = Tensor.stack(*[ Tensor(2**(i*b), device=t.device, dtype=t.dtype) for i in range(8//b) ]), 0xff >> (8 - b)
+  return t.unsqueeze(-1).expand((*t.shape,8//b)).idiv(shift_tensor).bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
+
+def dequantize_q4k(blocks: Tensor) -> Tensor:
+  """Dequantize Q4_K blocks to float32. blocks shape: (num_blocks, 144)"""
+  d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
+  s = blocks[:,4:16]
+  sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
+  mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
+  q = Tensor.stack((qs:=blocks[:,16:144].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32).cast(dtypes.float32)
+  return (d * sc.cast(dtypes.float32).unsqueeze(-1) * q - dmin * mn.cast(dtypes.float32).unsqueeze(-1)).flatten(-2)
+
+def dequantize_q5k(blocks: Tensor) -> Tensor:
+  """Dequantize Q5_K blocks to float32. blocks shape: (num_blocks, 176)"""
+  d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
+  s = blocks[:,4:16]
+  sc_low, mn_low = s[:,0:4].bitwise_and(63), s[:,4:8].bitwise_and(63)
+  sc_high = s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4))
+  mn_high = s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4))
+  sc, mn = sc_low.cat(sc_high, dim=-1), mn_low.cat(mn_high, dim=-1)
+  qh, qs = blocks[:,16:48], blocks[:,48:176]
+  ql = Tensor.stack(qs.reshape(-1,4,32).bitwise_and(0xF), qs.reshape(-1,4,32).rshift(4), dim=2).reshape(-1,8,32)
+  qh_bits = q_to_uint8(qh, 1).reshape(-1, 8, 32)
+  q = ql.bitwise_or(qh_bits.lshift(4)).cast(dtypes.float32)
+  return (d * sc.cast(dtypes.float32).unsqueeze(-1) * q - dmin * mn.cast(dtypes.float32).unsqueeze(-1)).flatten(-2)
+
+def dequantize_q6k(blocks: Tensor) -> Tensor:
+  """Dequantize Q6_K blocks to float32. blocks shape: (num_blocks, 210)"""
+  xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
+  scales = blocks[:,192:208].bitcast(dtypes.int8).cast(dtypes.float32).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
+  d = blocks[:,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand((-1, 256))
+  return d * (xl.bitwise_or(xh).bitcast(dtypes.int8).cast(dtypes.float32) - 32).flatten(-2) * scales
+
+def dequantize_q4_0(blocks: Tensor) -> Tensor:
+  """Dequantize Q4_0 blocks to float32. blocks shape: (num_blocks, 18). 32 elements per block."""
+  d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)  # (num_blocks, 1)
+  qs = blocks[:,2:]  # (num_blocks, 16) packed nibbles
+  lo = qs.bitwise_and(0xF)  # (num_blocks, 16) low nibbles
+  hi = qs.rshift(4)         # (num_blocks, 16) high nibbles
+  return (Tensor.cat(lo, hi, dim=-1).cast(dtypes.float32) - 8) * d  # (num_blocks, 32)
+
+# GGML quantization info: (elements_per_block, bytes_per_block, dequantize_fn)
+GGML_QUANT_INFO: dict[int, tuple[int, int, Callable[[Tensor], Tensor]]] = {
+  2: (32, 18, dequantize_q4_0),    # Q4_0
+  12: (256, 144, dequantize_q4k),  # Q4_K
+  13: (256, 176, dequantize_q5k),  # Q5_K
+  14: (256, 210, dequantize_q6k),  # Q6_K
+}
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
 
   Supported native types: float32 (id: 0), float16 (id: 1), int8 (id: 16), int16 (id: 17), int32 (id: 18)
-  Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q8_0 (id: 8), Q4_K (id: 12), Q6_K (id: 14), MXFP4 (id: 39)
+  Supported quantized types:
+    Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6), Q5_1 (id: 7), Q8_0 (id: 8),
+    Q4_K (id: 12), Q5_K (id: 13), Q6_K (id: 14), MXFP4 (id: 39)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
@@ -316,31 +371,36 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   if (dtype := { 0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8, 17: dtypes.int16, 18: dtypes.int32 }.get(ggml_type)) is not None:
     return t[:dtype.itemsize * n].bitcast(dtype)
 
-  def q_to_uint8(t: Tensor, b: int) -> Tensor:
-    # TODO: rewrite with arange?
-    shift_tensor, bitmask = Tensor.stack(*[ Tensor(2**(i*b), device=t.device, dtype=t.dtype) for i in range(8//b) ]), 0xff >> (8 - b)
-    return t.unsqueeze(-1).expand((*t.shape,8//b)).idiv(shift_tensor).bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
-
   # map to (number of elements, number of bytes)
-  if (nelements_nbytes := { 2: (32, 18), 3: (32, 20), 8: (32, 34), 12: (256, 144), 14: (256, 210), 39: (32, 17) }.get(ggml_type)) is not None:
+  quant_map = {
+    2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34),
+    12: (256, 144), 13: (256, 176), 14: (256, 210), 39: (32, 17),
+  }
+  if (nelements_nbytes := quant_map.get(ggml_type)) is not None:
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1]))
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
       d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
       return q_to_uint8(blocks[:,4:], 4).bitcast(dtypes.int8) * d + m
+    if ggml_type in (6, 7):  # Q5_0/Q5_1: 5-bit quantization with high-bit extraction
+      has_m = ggml_type == 7
+      d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      qh_start = 4 if has_m else 2
+      qh = blocks[:,qh_start:qh_start+4].flatten(-2).bitcast(dtypes.uint32)
+      qs = blocks[:,qh_start+4:qh_start+20]
+      ql_lo, ql_hi = qs.bitwise_and(0x0F), qs.rshift(4)
+      shifts_lo = Tensor([1 << i for i in range(16)], dtype=dtypes.uint32, device=blocks.device)
+      shifts_hi = Tensor([1 << (i + 16) for i in range(16)], dtype=dtypes.uint32, device=blocks.device)
+      qh_exp = qh.unsqueeze(-1)
+      qh_lo = qh_exp.bitwise_and(shifts_lo).ne(0).cast(dtypes.uint8).lshift(4)
+      qh_hi = qh_exp.bitwise_and(shifts_hi).ne(0).cast(dtypes.uint8).lshift(4)
+      if has_m:
+        q = ql_lo.bitwise_or(qh_lo).cat(ql_hi.bitwise_or(qh_hi), dim=-1).cast(dtypes.float32)
+        return d * q + blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32)
+      q = (ql_lo.bitwise_or(qh_lo)).cat(ql_hi.bitwise_or(qh_hi), dim=-1).bitcast(dtypes.int8).cast(dtypes.float32) - 16.0
+      return d * q
     if ggml_type == 8: return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[:,2:].bitcast(dtypes.int8)
-    if ggml_type == 12:  # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
-      d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
-      s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
-      sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
-      mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
-      q = Tensor.stack((qs:=blocks[:,16:144].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32).cast(dtypes.float32)
-      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
-    if ggml_type == 14:
-      xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
-      scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
-      d = blocks[:,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand((-1, 256))
-      return d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales
+    if ggml_type in GGML_QUANT_INFO: return GGML_QUANT_INFO[ggml_type][2](blocks)
     if ggml_type == 39:
       e_int = blocks[:, 0].cast(dtypes.int32)
       d = ((e_int >= 2).cast(dtypes.float32) * (e_int.cast(dtypes.float32) - 128).exp2() +
@@ -355,7 +415,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 @accept_filename
-def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(tensor: Tensor, quantized: bool = False) -> tuple[dict, dict[str, Tensor], dict[str, tuple[Tensor, tuple, int, bool]]|None]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`.
 
@@ -363,10 +423,13 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
   kv_data, state_dict = nn.state.gguf_load(gguf_tensor)
   ```
+  If quantized=True, returns a third dict mapping tensor names to (raw_blocks, shape, ggml_type, expert_first_in_memory) for Q4_K/Q5_K/Q6_K tensors.
+  These tensors are NOT included in state_dict, allowing on-the-fly dequantization during inference.
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
   reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
+  quantized_tensors: dict[str, tuple[Tensor, tuple, int, bool]] = {} if quantized else None
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
   def read_str(): return str(reader.read(read_uint64()), "utf-8")
   def read_arr():
@@ -387,6 +450,18 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos: state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  for name, dims, typ, off in t_infos:
+    n = prod(dims)
+    if quantized and typ in GGML_QUANT_INFO:
+      el_per_block, bytes_per_block, _ = GGML_QUANT_INFO[typ]
+      nbytes = (n // el_per_block) * bytes_per_block
+      raw_blocks = tensor[data_start + off:(data_start + off) + nbytes].reshape(-1, bytes_per_block)
+      # detect expert memory layout: expert dim is smallest of 3 GGUF dims, last = expert-first in memory
+      expert_first_in_memory = True
+      if len(dims) == 3 and any(x in name for x in ['_exps', '_shexp']):
+        expert_first_in_memory = (min(range(3), key=lambda i: dims[i]) == 2)
+      quantized_tensors[name] = (raw_blocks, tuple(reversed(dims)), typ, expert_first_in_memory)
+    else:
+      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
 
-  return kv_data, state_dict
+  return kv_data, state_dict, quantized_tensors

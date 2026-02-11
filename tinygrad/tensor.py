@@ -250,6 +250,15 @@ class Tensor(OpMixin):
     """
     return [Tensor(u, device=u.device) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
 
+  def mul_mat_id(self, *lst:Tensor, fxn:Callable, grad_fxn:Callable|None=None) -> Tensor:
+    """
+    Expert-id indexed matmul API lowered through custom kernel CALL.
+
+    This API is alpha and may change.
+    """
+    u = UOp.mul_mat_id(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)
+    return Tensor(u, device=u.device)
+
   def schedule_with_vars(self, *lst:Tensor) -> tuple[list[ExecItem], dict[str, int]]:
     """
     Creates the schedule needed to realize these Tensor(s), with Variables.

@@ -826,6 +826,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(contig_srcs)]
     kernel = fxn(*placeholders).call(*contig_srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in contig_srcs]
+  def mul_mat_id(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> UOp:
+    # Single-output expert-id indexed matmul primitive.
+    # Unlike custom_kernel, only the output tensor (srcs[0]) gets AFTER(kernel).
+    contig_srcs = tuple(x.contiguous() if x.op is not Ops.AFTER else x for x in srcs)
+    placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(contig_srcs)]
+    kernel = fxn(*placeholders).call(*contig_srcs, grad_fxn=grad_fxn)
+    return contig_srcs[0].after(kernel)
 
 @dataclass(frozen=True)
 class KernelInfo:

@@ -119,11 +119,30 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
 beam_pool, BEAM_DEBUG = None, getenv("BEAM_DEBUG")
 def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True, disable_cache=IGNORE_BEAM_CACHE.value):
   global beam_pool
+  # Optional fast path: skip BEAM for non-reduction kernels (typically init/copy/random/elementwise setup work).
+  # This keeps BEAM focused on reduction kernels where search is most valuable.
+  if getenv("BEAM_REDUCE_ONLY", 0) and s.reduceop is None:
+    return s
+  skip_threshold = getenv("BEAM_SKIP_MS", 0.0)/1e3
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.device, "suffix": s.ren.suffix}
   if not disable_cache and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
-    return ret
+    # if skip_threshold set, verify cached kernel meets it
+    if skip_threshold > 0:
+      dev = Device[s.ren.device]
+      _, proc = _try_compile((0, ret), dev.compiler)
+      if proc is not None:
+        rawbufs = _ensure_buffer_alloc(rawbufs)
+        var_vals: dict[str, int] = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
+        p, lib, _ = proc
+        tms = _time_program(p, lib, var_vals, rawbufs, allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'))
+        if min(tms) >= skip_threshold:
+          if DEBUG >= 2: print(f"BEAM cache miss: {min(tms)*1000:.2f}ms >= {skip_threshold*1000:.1f}ms threshold, re-running beam")
+        else:
+          return ret
+    else:
+      return ret
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
@@ -134,7 +153,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     @atexit.register
     def close_pool(): beam_pool.close()
 
-  min_progress = getenv("BEAM_MIN_PROGRESS", 0.01)/1e6
+  min_progress = getenv("BEAM_MIN_PROGRESS", 0.01)/1e3
   if BEAM_DEBUG:
     print("BEAM_SEARCH:")
     print(pyrender(s.ast.replace(arg=None)))
@@ -143,8 +162,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   try:
     rawbufs = _ensure_buffer_alloc(rawbufs)
     var_vals: dict[str, int] = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
-    exiting, st = False, time.perf_counter()
     dev = Device[s.ren.device]
+    exiting, st = False, time.perf_counter()
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
@@ -177,6 +196,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
 
       # done
       opts = sorted(timed, key=lambda x: x[1])
+      # BEAM_SKIP_MS is used for cache revalidation only. Do not early-exit beam search on fast kernels,
+      # otherwise sub-ms kernels stop exploring too early and lock in suboptimal launch shapes.
       exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
       if not exiting: beam = opts[:amt]
       elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
