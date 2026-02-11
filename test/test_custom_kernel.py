@@ -1,7 +1,8 @@
 import unittest
-from tinygrad import Tensor, UOp
+from tinygrad import Tensor, UOp, Device
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import KernelInfo, AxisType
+from tinygrad.codegen.opt import Opt, OptOps
 
 # **** kernels ****
 
@@ -63,6 +64,17 @@ def slice_sum_kernel(dest:UOp, src:UOp):
   reg = reg[0].set(reg.after(R)[0] + slice_src[R], end=R)
   ast = dest[G].set(reg[0], end=G)
   return ast.sink(arg=KernelInfo(name=f"slice_sum_{src.shape[0]}_{src.shape[1]}", opts_to_apply=()))
+
+def slice_sum_kernel_grouped(dest:UOp, src:UOp):
+  """Like slice_sum_kernel but with GROUPTOP for cooperative reduction."""
+  G = UOp.range(src.shape[0], 0)
+  slice_src = src[G, :]
+  reg = UOp.placeholder((1,), dest.dtype.base, 0, addrspace=AddrSpace.REG)
+  reg = reg.after(G)[0].set(0)
+  R = UOp.range(src.shape[1], 1, AxisType.REDUCE)
+  reg = reg[0].set(reg.after(R)[0] + slice_src[R], end=R)
+  ast = dest[G].set(reg[0], end=G)
+  return ast.sink(arg=KernelInfo(name=f"slice_sum_grouped_{src.shape[0]}_{src.shape[1]}", opts_to_apply=(Opt(OptOps.GROUPTOP, 0, 4),)))
 
 def simple_qkv_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
   # attention without softmax
@@ -185,6 +197,15 @@ class TestCustomKernel(unittest.TestCase):
     b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
     self.assertEqual(b.item(), 15)
 
+  def test_mul_mat_id(self):
+    N = 16
+    a = Tensor.randn(N, N)
+    b = Tensor.randn(N, N)
+    c = Tensor.empty(N, N)
+    tst = Tensor.mul_mat_id(c, a, b, fxn=custom_gemm)
+    err = (tst - (a@b)).square().max()
+    self.assertLess(err.item(), 1e-6)
+
   def test_slice_sum(self):
     A = Tensor.randn(16, 16).contiguous()
     B = Tensor.empty(16)
@@ -288,6 +309,35 @@ class TestCustomKernel(unittest.TestCase):
 
     self.assertIsNotNone(custom_idx, "custom_addmul kernel not found in schedule")
     self.assertEqual(custom_idx, 3, f"custom_addmul should be at index 3, got {custom_idx}")
+
+  @unittest.skipIf(Device.DEFAULT in ("CPU", "PYTHON"), "GROUP requires shared memory")
+  def test_placeholder_group_end_store(self):
+    """Bug 1: fix_group_for_end_store — GROUP_REDUCE ranges on END(STORE(reg, val)) must be rewritten into
+    cooperative shared-memory reduction. Without this pattern match, GROUP_REDUCE ranges are silently ignored."""
+    A = Tensor.randn(16, 16).contiguous()
+    B = Tensor.empty(16)
+    B = Tensor.custom_kernel(B, A, fxn=slice_sum_kernel_grouped)[0]
+    self.assertTrue(B.allclose(A.sum(1)))
+
+  @unittest.skipIf(Device.DEFAULT in ("CPU", "PYTHON"), "GROUP requires shared memory")
+  def test_placeholder_group_reg_slot_collision(self):
+    """Bug 2: ReduceContext acc_num must start past existing DEFINE_REG slots to avoid UOp cache collision.
+    Placeholder register at slot 0 + GROUP creates a reduce accumulator — without the fix, both get slot 0
+    (due to UOp caching, same op/dtype/arg = same object), corrupting the reduction. Uses 16x32 to stress
+    the cooperative reduction with a larger reduce range than the 16x16 test above."""
+    A = Tensor.randn(16, 32).contiguous()
+    B = Tensor.empty(16)
+    B = Tensor.custom_kernel(B, A, fxn=slice_sum_kernel_grouped)[0]
+    self.assertTrue(B.allclose(A.sum(1)))
+
+  @unittest.skipIf(Device.DEFAULT in ("CPU", "PYTHON"), "GROUP requires shared memory")
+  def test_placeholder_group_gpudims_ptrdtype(self):
+    """Bug 3: add_gpudims must not assume all STORE INDEX sources have PtrDType. After GROUP rewrite of
+    register accumulators, STORE nodes target register types (non-PtrDType), which crash without a guard."""
+    A = Tensor.randn(8, 32).contiguous()
+    B = Tensor.empty(8)
+    B = Tensor.custom_kernel(B, A, fxn=slice_sum_kernel_grouped)[0]
+    self.assertTrue(B.allclose(A.sum(1)))
 
 if __name__ == '__main__':
   unittest.main()

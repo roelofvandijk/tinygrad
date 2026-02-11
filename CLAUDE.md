@@ -73,6 +73,23 @@ VIZ=1 python -c "from tinygrad import Tensor; Tensor.ones(10).sum().realize()"
 - Run tests before proposing commits
 - Test with `SPEC=2` when modifying UOp-related code
 
+## LLM Optimization Loop (GLM)
+
+When optimizing decode performance for GLM/DeepSeek-style models, use this loop:
+
+1. Keep one production path. No optional "experimental" runtime branches.
+2. Change one variable at a time and run an explicit A/B.
+3. Use representative benchmarks first:
+   - micro correctness/perf check for the changed kernel/path
+   - `bench_block.py` with real model shapes/quant mix
+4. Run benchmarks sequentially only (never in parallel).
+5. Treat full model benchmark as expensive:
+   - run only after bench-block evidence is clearly positive
+   - use it to confirm tok/s impact, not for every micro-iteration
+6. Inspect generated kernels (`DEBUG=2`/`DEBUG=6`) and track which kernels dominate by wall time.
+7. Validate kernel quality with throughput metrics (GFLOPS/GB/s) but decide by end-to-end latency/tok/s.
+8. Write every accepted/rejected trial in `glm_context/optimization_journal.md` with command + result.
+
 ## Auto-generated Files (DO NOT EDIT)
 
 The following files are auto-generated and should never be edited manually:
@@ -86,6 +103,7 @@ To add missing instruction implementations, add them to `extra/assembly/amd/emu.
 ## Style Notes
 
 - 2-space indentation, 150 char line limit
+- **Code should be dense, tasteful, minimal, clean, and correct** - no cruft, no over-engineering, no unnecessary abstractions
 - PatternMatchers should be defined at module level (slow to construct)
 - Prefer `graph_rewrite` over manual graph traversal
 - UOp methods like `.replace()` preserve tags unless explicitly changed
@@ -130,15 +148,29 @@ after_map = [(u, u.buf_uop) for u in big_sink.toposort() if u.op is Ops.AFTER]
 The conditional check adds complexity, potential bugs, and often negligible speedup. Only optimize when profiling shows a real bottleneck.
 
 ### Testing LLM Changes
-```bash
-# Quick smoke test
-echo "Hello" | DEBUG=1 python tinygrad/apps/llm.py --model "llama3.2:1b"
 
-# Check cache hits (should see "cache hit" after warmup)
-echo "Hello world" | DEBUG=1 python tinygrad/apps/llm.py --model "llama3.2:1b" 2>&1 | grep cache
+**IMPORTANT RULES:**
+- **NEVER use `head` or `tail` when running model inference ** - these commands are expensive. Always write full output to a file.
+- **NEVER pipe echo into llm.py** - always use `--prompt` and `--count` flags instead.
+- **Write output files to this folder** - use relative paths like `./llm_test.log`, not `/tmp/`.
+
+```bash
+# Correctness + benchmark in one run (PREFERRED — avoids loading model twice)
+# stdout = generated text, stderr = per-token timing
+python tinygrad/apps/llm.py --model "glm-4.7:flash-Q4_0" --prompt "Hello" --count 10 --benchmark > ./combo_stdout.log 2> ./combo_stderr.log
+
+# Quick smoke test (no timing)
+DEBUG=1 python tinygrad/apps/llm.py --model "llama3.2:1b" --prompt "Hello" --count 10 2>&1 | tee ./llm_test.log
+
+# Benchmark only (no tokenizer needed)
+python tinygrad/apps/llm.py --model "glm-4.7:flash-Q4_0" --benchmark 20 > ./bench.log 2>&1
+
+# Test DeepSeek-V2-Lite
+DEBUG=1 python tinygrad/apps/llm.py --model deepseek-v2-lite --prompt "User: Hi\n\nAssistant:" --count 5 2>&1 | tee ./ds2_test.log
 
 # Test with beam search
-echo "Hello" | BEAM=2 python tinygrad/apps/llm.py --model "llama3.2:1b"
+BEAM=2 python tinygrad/apps/llm.py --model "llama3.2:1b" --prompt "Hello" --count 10 2>&1 | tee ./beam_test.log
+```
 ```
 
 ## Common Patterns
@@ -192,6 +224,84 @@ When optimizing tinygrad internals:
 
 9. **Avoid creating intermediate objects in hot paths** - For example, `any(x.op in ops for x in self.backward_slice)` is faster than `any(x.op in ops for x in {self:None, **self.backward_slice})` because it avoids dict creation.
 
+## Kernel Optimization
+
+When optimizing or adding custom kernels:
+
+1. **Always create small unit tests first** - Test correctness before performance. A 10x faster wrong kernel is useless.
+
+2. **Test with JIT enabled** - Many optimizations (buffer views, custom kernels) work with `JIT=0` but break with JIT/MetalGraph ICB replay.
+
+3. **Profile before and after** - Measure wall time with real workloads, not microbenchmarks. **Important**: Warm-up times (pre-JIT) are REAL per-kernel times. Steady-state times show per-ICB-batch totals, but individual kernel times within an ICB are evenly divided artifacts.
+
+### Profiling Tools
+
+**Quick profiling with profile_model.py**:
+```bash
+python profile_model.py deepseek-v2-lite 10               # 10 tokens
+python profile_model.py glm-4.7:flash 20                  # 20 tokens
+python profile_model.py youtu-llm:2b-Q4 10 MOE_ADDS=0     # with env vars
+python profile_model.py deepseek-v2-lite 5 --with-source  # includes Metal source for top 3 kernels (slower)
+```
+Runs `DEBUG=2 PROFILE=1` (or `DEBUG=5` with `--with-source`) and produces: performance (ms/tok, tok/s), kernel count per token, ICB breakdown, schedule cache hit/miss stats, top kernels by total time and call count (warm-up times), kernel categories, steady-state per-ICB timing, file paths for deeper investigation. With `--with-source`, displays Metal source code for the top 3 slowest kernels inline.
+
+**Detailed kernel analysis with VIZ=-1**:
+```bash
+# Capture full rewrite trace and profiling data
+VIZ=-1 python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 10
+
+# View slowest kernels
+PYTHONPATH=. python extra/viz/cli.py --profile --device METAL
+
+# Inspect specific kernel (see Metal source, opts applied, bandwidth)
+PYTHONPATH=. python extra/viz/cli.py --profile --device METAL --kernel "<kernel_name>"
+```
+Outputs to `/tmp/profile.pkl.<user>` and `/tmp/rewrites.pkl.<user>`. Shows before/after diffs for every pattern matcher transformation.
+
+**Metal source inspection with DEBUG=5**:
+```bash
+DEBUG=5 python tinygrad/apps/llm.py --model "model-name" --benchmark 3 > debug5.log 2>&1
+grep -n "kernel void r_9_32" debug5.log  # Find specific kernel
+```
+
+4. **Metal threadgroup memory limits** - Max 32KB per kernel. If fusion creates >32KB local buffers, kernels will silently fail or crash. Two failure modes: (a) single large LOCAL (e.g., 10240 floats = 40960 bytes), (b) multiple small LOCALs totaling >32KB. Cap individual LOCAL buffers at 32KB (promote to GLOBAL) and account for existing DEFINE_LOCAL bytes in GROUP optimization.
+
+5. **JIT batching requires CompiledRunner** - Custom kernels must extend `CompiledRunner` (not base `Runner`) and provide correct `ProgramSpec` with `global_size`, `local_size`, and proper input/output buffers for MetalGraph ICB batching.
+
+6. **Avoid buffer views with JIT** - `Buffer.view(offset=N)` breaks with JIT replay. Instead, bake byte offsets as `#define` in kernel source and pass base buffer at offset=0.
+
+### Analyzing Slow Kernels (DEBUG=5)
+
+`DEBUG=5` prints Metal source for every kernel. Look for:
+- **Grid dims** (`gidx0`, `gidx1`): Need ~2000+ workgroups for bandwidth saturation
+- **Threadgroup dims** (`lidx0`, `lidx1`): 64-256 threads typical
+- **Threadgroup memory**: `threadgroup float` indicates GROUP/GROUPTOP is active (good)
+- **Reduction loops**: Long `for (int Ridx...)` loops = missing GROUPTOP, each thread does full reduction serially
+
+Red flags:
+- **< 20 GB/s bandwidth**: Too few workgroups OR scattered memory access
+- **Scattered byte reads**: `unsigned char val = *(data+...)` per element = poor coalescing. Use `uint16_t` or larger reads when possible.
+- **Multireduce kernels**: GROUP only helps the FIRST reduction. Second reduction runs serially with GROUP sync overhead paid but no benefit.
+- **No cooperative reduction**: Each thread does full reduction alone instead of splitting work with GROUP
+
+### Heuristic Optimizer Pattern Matching
+
+The MV heuristic (`heuristic.py:72-73`) requires `MUL(INDEX, INDEX)`. It **fails on fused dequant+matmul** because the outermost MUL is `MUL(scale_bitcast_chain, ADD(...))` — neither operand is an INDEX. Activation INDEXes are buried 2+ levels deep. This is why quantized MoE kernels often run at 2-15 GB/s without manual intervention.
+
+GROUPTOP threshold (`heuristic.py:92`) requires `prod(output_shape[i] for i in upcastable_dims) <= 2048`. MoE kernels with 6 experts × 2048 outputs = 12288 > 2048 are blocked.
+
+Common test pattern:
+```python
+# test/test_my_kernel.py
+def test_correctness():
+  # Small inputs, verify output matches reference
+  assert torch_result == tinygrad_result
+
+def test_correctness_jit():
+  # Same test but with JIT=1 - catches JIT-specific bugs
+  assert torch_result == tinygrad_result
+```
+
 ## Pattern Matching Analysis
 
 **Use the right tool:**
@@ -225,3 +335,72 @@ VIZ=-1 python test/test_tiny.py TestTiny.test_gemm
 Set VIZ to `-2` to save performance counters traces for the AMD backend.
 
 Use the CLI in `./extra/sqtt/roc.py` to explore the trace.
+
+## LLM Optimization Guides
+
+**For detailed guides on LLM optimization (GLM, Youtu, DeepSeek models), see:**
+- `glm_context/tools.md` - Model loading, profiling, troubleshooting
+- `glm_context/architecture.md` - MLA, MoE, quantization formats
+- `glm_context/performance.md` - Benchmark results and bottleneck analysis
+- `glm_context/bottlenecks.md` - Detailed hotspot analysis
+- `glm_context/START.md` - Quick start guide
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+Tradeoff: These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+1. Think Before Coding
+
+Don't assume. Don't hide confusion. Surface tradeoffs.
+
+Before implementing:
+
+    State your assumptions explicitly. If uncertain, ask.
+    If multiple interpretations exist, present them - don't pick silently.
+    If a simpler approach exists, say so. Push back when warranted.
+    If something is unclear, stop. Name what's confusing. Ask.
+
+2. Simplicity First
+
+Minimum code that solves the problem. Nothing speculative.
+
+    No features beyond what was asked.
+    No abstractions for single-use code.
+    No "flexibility" or "configurability" that wasn't requested.
+    No error handling for impossible scenarios.
+    If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+3. Surgical Changes
+
+Touch only what you must. Clean up only your own mess.
+
+When editing existing code:
+
+    Don't "improve" adjacent code, comments, or formatting.
+    Don't refactor things that aren't broken.
+    Match existing style, even if you'd do it differently.
+    If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+
+    Remove imports/variables/functions that YOUR changes made unused.
+    Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+4. Goal-Driven Execution
+
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+
+    "Add validation" → "Write tests for invalid inputs, then make them pass"
+    "Fix the bug" → "Write a test that reproduces it, then make it pass"
+    "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
