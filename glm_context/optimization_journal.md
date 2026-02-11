@@ -786,3 +786,255 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Decision
 - Rejected and reverted.
 - Interpretation: bench_block looked mildly positive/noisy, but full-model decode stability regressed, so this path is not production-safe.
+
+## Trial: `MLA_MOE_SPLIT_BOUNDARIES` in full model (2026-02-11)
+
+### Setup
+- Code: `tinygrad/apps/mla.py` has optional boundary barriers around MoE gate/up/down paths.
+- Bench signal looked promising with boundaries off:
+  - `MLA_MOE_SPLIT_BOUNDARIES=1`: ff `11.35 ms`, 19 kernels
+  - `MLA_MOE_SPLIT_BOUNDARIES=0`: ff `9.94 ms`, 15 kernels
+
+### Full-model A/B
+- Baseline (previous run):
+  - steady tokens t6..t10: `24.80, 24.52, 25.39, 25.44, 25.34 tok/s` (~`25.1 tok/s` avg)
+- Trial (`MLA_MOE_SPLIT_BOUNDARIES=0`):
+  - command: `BEAM=0 MLA_MOE_SPLIT_BOUNDARIES=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - steady tokens t6..t10: `20.56, 21.55, 21.35, 21.00, 21.55 tok/s` (~`21.2 tok/s` avg)
+
+### Decision
+- Rejected as default behavior.
+- Despite fewer kernels and better bench feed-forward, full-model decode regressed by ~15% in steady tok/s.
+
+## Trial: remaining `glm.py` ideas (2026-02-11)
+
+### Idea 1: pairwise top-k vs generic `.topk`
+- Patch trial: allow switching MoE selection between pairwise and `.topk`.
+- `bench_block`:
+  - pairwise: ff `10.51 ms`, 19 kernels
+  - `.topk`: ff `29.05 ms`, 46 kernels
+- full model (`MLA_PAIRWISE_TOPK=0`): steady t6..t10
+  - `23.18, 23.81, 23.78, 23.54, 23.81 tok/s` (~`23.6 tok/s`)
+- compared to pairwise baseline (~`25 tok/s`), `.topk` is slower.
+- Decision: keep pairwise; remove switch.
+
+### Idea 2: attention-length bucketing (`GLM_ATTN_MIN_BUCKET`)
+- First observation: prior implementation only activated for integer `start_pos`; with `SYM=0` this disables JIT and collapses throughput (~`0.45 tok/s`).
+- Added a symbolic-compatible fixed-bucket trial and tested:
+  - command: `BEAM=0 GLM_ATTN_MIN_BUCKET=256 ... --benchmark 10`
+  - steady t6..t10: `19.75, 23.42, 23.31, 23.55, 22.90 tok/s` (~`22.6 tok/s`)
+- baseline on same code path with bucket disabled:
+  - steady t6..t10: `25.01, 24.81, 24.87, 25.01, 25.06 tok/s` (~`25.0 tok/s`)
+- Decision: reject bucketing for current decode benchmark regime.
+
+### Cleanup
+- Reverted trial toggles and symbolic-bucket logic from `tinygrad/apps/mla.py`.
+- Kept the proven pairwise top-k path and existing merged MoE/Q4 expert fast path.
+
+## Trial: shift contiguous later in MoE combine (2026-02-11)
+
+### Hypothesis
+- Similar to `gated` change: avoid early materialization and place `.contiguous()` after larger fused expressions.
+- Specifically:
+  - `expert_out = ffn_down_exps(sel, gated)` (no immediate contiguous)
+  - `out = (expert_out * probs.unsqueeze(-1)).sum(axis=2).contiguous() * scale`
+  - shared expert add: `out = (out + shexp).contiguous()` instead of `out.contiguous() + shexp_term`
+
+### bench_block (20 iters)
+- before:
+  - full `1.74 ms`, ff `10.29 ms`, kernels `32` full / `17` ff
+- after:
+  - full `1.28 ms`, ff `10.15 ms`, kernels `31` full / `16` ff
+
+### full model
+- command: `BEAM=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- steady t6..t10: `22.71, 25.29, 25.02, 25.03, 25.14 tok/s`
+- Compared to recent baseline (`~24.8-25.1 tok/s` steady), this looks neutral/slightly positive but noisy.
+
+### Decision
+- Keep for now as a low-risk cleanup with small-kernel-count reduction and no observed full-model regression.
+- Revalidate with a stronger multi-run A/B before treating as a hard win.
+
+## Trial batch: additional contiguous-placement candidates (2026-02-11)
+
+### Baseline for this batch
+- `bench_block.py 20 --model glm-4.7:flash-unsloth-Q4_0`
+- full: `1.36 ms`, ff: `10.31 ms`, kernels: `31` full / `16` ff
+
+### Candidate 1: dense FFN in `llm.py` (`TransformerBlock`)
+- Change tested: `self.ffn_gate(...).silu().contiguous() * self.ffn_up(...)`
+  -> `(self.ffn_gate(...).silu() * self.ffn_up(...)).contiguous()`
+- Microbench (`TransformerBlock._feed_forward`, dim=2048, hidden=6144):
+  - baseline: `median 3.641 ms`, kernels `84`
+  - trial: `median 4.019 ms` then `3.650 ms`, kernels `63`
+- Interpretation: fewer kernels but no clear speedup; also not on GLM MLA hot path.
+- Decision: reject.
+
+### Candidate 2: remove trailing block output contiguous in `MLATransformerBlock.__call__`
+- Change tested: return `_feed_forward(_attention(...))` (no trailing `.contiguous()`)
+- `bench_block`:
+  - run1: full `1.34 ms`, ff `10.90 ms`
+  - run2: full `2.02 ms`, ff `11.27 ms`
+- Interpretation: ff path consistently slower.
+- Decision: reject.
+
+### Candidate 3: relax `mul_mat_id` source contiguity in `uop/ops.py`
+- Change tested: stop forcing contiguous on already-buffer-like non-output srcs.
+- `bench_block`:
+  - run1: full `2.10 ms`, ff `10.48 ms`
+  - run2: full `1.14 ms`, ff `10.56 ms`
+- Interpretation: high full-block noise, but ff median regressed vs baseline.
+- Decision: reject.
+
+### Outcome
+- No additional keepers from this batch.
+- Existing good contiguous rewrite in `mla.py` remains the best result from this direction.
+
+## Trial: Q5_K/Q6_K custom kernels in `QuantizedLinear` (2026-02-11)
+
+### Goal
+- Try the same custom-kernel strategy used for Q4 experts on Q5/Q6 shared-expert linears first.
+
+### What was tested
+- Added custom kernels for:
+  - `custom_q5_k_linear_1_3072_2048`
+  - `custom_q6_k_linear_1_2048_1536`
+- Added preprocess/separation caches for Q5_K/Q6_K block fields and routed `ggml_type in {13,14}` through `Tensor.custom_kernel`.
+
+### Why this looked plausible
+- Model GGUF actually contains significant Q5/Q6:
+  - ggml type `13` (Q5_K): `92` tensors (~`0.199 GB` quant bytes)
+  - ggml type `14` (Q6_K): `47` tensors (~`0.379 GB` quant bytes)
+- Shared experts are Q5/Q6 in this model family:
+  - `ffn_gate_shexp`, `ffn_up_shexp` -> Q5_K
+  - `ffn_down_shexp` -> Q6_K
+
+### DEBUG=2 findings (bench loop)
+- New custom kernels were directly on hot path and expensive:
+  - `custom_q5_k_linear_1_3072_2048`: ~`1.20 ms`
+  - `custom_q6_k_linear_1_2048_1536`: ~`0.60 ms` with spikes up to `~2.25 ms`
+- Full block warmup capture rose to `34` kernels (from prior `~31` in current baseline path).
+- One-iter debug run showed severe regression:
+  - full block median: `5.34 ms`
+  - feed_forward median: `17.82 ms`
+
+### Decision
+- **Rejected and reverted** Q5/Q6 custom path.
+- Keep Q4 expert `mul_mat_id` custom primitive path only.
+
+### Post-revert check (`BEAM=0 bench_block.py 20`)
+- full block median: `1.25 ms`
+- feed_forward median: `10.44 ms`
+- warmup kernels: `31` full / `16` ff
+- Confirms regression source was Q5/Q6 custom implementation.
+
+## Q5/Q6 focused pass (2026-02-11, follow-up)
+
+### Goal
+- Improve the Q5_K/Q6_K shared-expert path first, without handwritten backend kernels.
+
+### Ground truth on this model
+- GGUF quant type counts/bytes (`glm-4.7:flash-unsloth-Q4_0`):
+  - Q4_0 (`type 2`): `278` tensors, ~`15.80 GB` quant bytes
+  - Q5_K (`type 13`): `92` tensors, ~`0.199 GB`
+  - Q6_K (`type 14`): `47` tensors, ~`0.379 GB`
+- Shared experts are Q5/Q6 in this checkpoint:
+  - `ffn_gate_shexp`, `ffn_up_shexp` -> Q5_K
+  - `ffn_down_shexp` -> Q6_K
+
+### Trial 1: full custom Q5/Q6 kernels in `QuantizedLinear`
+- Added custom kernels + pre-separated Q5/Q6 caches.
+- Rejected: severe bench regression.
+  - debug hot kernels:
+    - `custom_q5_k_linear_1_3072_2048` ~`1.2 ms`
+    - `custom_q6_k_linear_1_2048_1536` ~`0.6–2.2 ms` (spiky)
+  - feed_forward jumped to ~`17.8 ms` in debug run.
+
+### Trial 2: quant-aware DSL Q5/Q6 grouped dot path (no custom kernel)
+- Kept packed Q5/Q6 separated and computed grouped reductions in DSL.
+- Rejected: feed_forward regressed (~`12.2 ms` vs ~`10.3 ms` baseline).
+
+### Trial 3: dequant-cache transpose-contiguous storage
+- Cached dequantized weights as transposed contiguous and used `x.dot(cache)`.
+- Rejected: no gain; feed_forward regressed (~`11.0 ms`).
+
+### Trial 4: split shared Q6 down input (`(silu*up).contiguous()` before `ffn_down_shexp`)
+- This changed kernel makeup as expected:
+  - `r_2048_16_96` dropped from ~`140us` to ~`80us`
+  - plus a small extra `silu*mul` kernel (~`8–10us`)
+- Microbench looked near-neutral/slightly positive in some runs, but full-model A/B did not show a clear real tok/s win.
+- Full-model comparison (`--benchmark 10`, BEAM=0):
+  - split variant steady decode was not better than baseline in a reliable way.
+- Decision: rejected for default path.
+
+### Current best default (kept)
+- Keep baseline Q5/Q6 path: dequantize-once cache + linear.
+- Keep Q4 expert `mul_mat_id` custom path unchanged.
+
+### Baseline reconfirmation after this pass
+- `bench_block.py 20`:
+  - full block ~`1.27 ms`
+  - feed_forward ~`10.28 ms`
+- full model (`--benchmark 10`) steady tokens are still ~mid-24 to ~25 tok/s depending on token/window in run.
+
+### Key takeaway
+- Q5/Q6 are present and important, but in this model they are not currently the dominant limiter vs the larger Q4 expert path and related non-shared MoE kernels.
+- Custom or semi-custom Q5/Q6 rewrites were easy to make slower; wins seen in isolated kernel timing did not carry to end-to-end tok/s.
+
+## Benchmark correctness fix: add decode-stack proxy (2026-02-11)
+
+### Problem
+- Single-block / feed-forward microbench could report local wins that did not survive full-model decode.
+- If benchmark signal disagrees with model tok/s, benchmark is wrong for optimization decisions.
+
+### Fix
+- Updated `bench_block.py` to add a **decode-stack JIT proxy**:
+  - Runs one decode token through a stack of MoE blocks (`46` by default for GLM-4.7 flash).
+  - Uses same block shapes/ops and captures real kernel volume and graph batching behavior.
+  - Keeps fast loop (no full model load/benchmark), but much closer to model decode critical path.
+
+### Why this matters
+- It now exposes the actual kernel scale directly:
+  - warmup shows ~`1426` kernels (`31 kernels/block * 46 blocks`), then graph-batched execution.
+- This explains the previously surprising `>1400 kernels` and gives a metric that tracks decode-step reality better than single-block medians.
+
+### New baseline (BEAM=0, `bench_block.py 20`)
+- full block JIT median: `1.53 ms`
+- decode stack JIT median (`46 blocks`): `28.08 ms` -> `35.61 tok/s` proxy
+- feed_forward median: `9.90 ms`
+
+### Decision
+- Keep decode-stack metric as the primary go/no-go signal for micro-iteration.
+- Continue to confirm only promising changes on full model afterward.
+
+## Split/Fuse + BEAM coupling experiment (2026-02-11)
+
+### Goal
+- Check whether split/fuse boundary decisions are independent from kernel opt search.
+
+### Setup
+- New generic harness: `search2.py` (module contract `bench_mask(mask, iters, beam)`).
+- `bench_block.py` now exposes:
+  - `SPLIT_POINTS` (17 MLA boundary bits)
+  - `bench_mask(...)` using cached block/weights per process.
+- Small run: exhaustive sample of 8 masks (`--max-masks 8`, `iters=4`, `repeat=2`).
+
+### Results
+- `beam=0`:
+  - baseline `mask=0x00000`: `28.86 ms`
+  - best in sample: `mask=0x1c000`: `27.37 ms`
+- `beam=4`:
+  - baseline `mask=0x00000`: `27.91 ms`
+  - best in sample: `mask=0x04000`: `25.86 ms`
+  - next: `mask=0x10000`: `25.96 ms`, `mask=0x1c000`: `26.05 ms`
+
+### Interpretation
+- Split/fuse is **not independent** of BEAM/opts.
+- Ranking changed between `beam=0` and `beam=4`:
+  - `0x1c000` was best at `beam=0` sample.
+  - `0x04000` became best at `beam=4`.
+- Therefore boundary search must be coupled with opt search (outer split mask, inner BEAM).
+
+### Decision
+- Keep `search2.py` and `bench_block.bench_mask` path for co-search workflow.
+- Next step: larger mask set + stronger repeats using `beam=4`, then validate top mask on full model.

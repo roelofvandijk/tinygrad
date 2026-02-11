@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Realistic single-block benchmark for GLM-4.7-Flash Q4_0.
+"""Realistic decode benchmarks for GLM-4.7-Flash Q4_0.
 
 Tests actual scheduler fusion behavior with JIT (MetalGraph ICB batching).
 Builds one MLA block from GGUF metadata so tensor shapes match the real model.
@@ -21,6 +21,12 @@ from tinygrad.apps.rope import precompute_freqs_cis, load_yarn_params_from_gguf
 from tinygrad.nn.state import GGML_QUANT_INFO
 
 DEFAULT_BENCH_MODEL = "glm-4.7:flash-unsloth-Q4_0"
+MLA_SPLIT_POINTS = [
+  "attn_norm", "attn_q_proj", "attn_kv_proj", "attn_q_cat", "attn_k_cache_view", "attn_scores", "attn_softmax",
+  "attn_ctx", "attn_out_proj", "ffn_norm", "ffn_gate_up_exps", "ffn_gated", "ffn_expert_out", "ffn_moe_combine",
+  "ffn_shexp_gate_up", "ffn_shexp_down", "ffn_moe_plus_shexp",
+]
+SPLIT_POINTS = MLA_SPLIT_POINTS
 
 def _median(vals: list[float]) -> float:
   v = sorted(vals)
@@ -65,6 +71,8 @@ class BenchCfg:
   shexp_gate_type: int
   shexp_up_type: int
   shexp_down_type: int
+
+_BENCH_MASK_CACHE: dict[tuple[str, int], tuple[BenchCfg, MLATransformerBlock]] = {}
 
 def _resolve_model_source(name_or_path: str) -> str:
   model_src = models.get(name_or_path, name_or_path)
@@ -250,6 +258,43 @@ def bench_full_block(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 20
   print(f"  → {1000/st['median']:.1f} blocks/s  (est. {est_tok_s:.1f} tok/s × {moe_blocks} MoE blocks)")
   return st["median"]
 
+def bench_decode_stack(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 8, decode_blocks: int | None = None,
+                      quiet: bool = False, warmups: int = 2):
+  x = Tensor.randn(1, 1, cfg.dim).cast(dtypes.float16).realize()
+  v_sp = UOp.variable("start_pos", 0, cfg.max_context - 1)
+  moe_blocks = max(cfg.num_blocks - cfg.leading_dense_blocks, 1)
+  n_blocks = moe_blocks if decode_blocks is None else decode_blocks
+
+  @TinyJit
+  def run_decode(x, start_pos):
+    for _ in range(n_blocks):
+      x = block(x, start_pos)
+    return x.contiguous()
+
+  if not quiet: print(f"\n── decode stack with JIT ({n_blocks} blocks, {n_iter} iterations) ──")
+  out = run_decode(x, v_sp.bind(1)).realize()
+  Device.default.synchronize()
+  for i in range(warmups):
+    GlobalCounters.reset()
+    out = run_decode(x, v_sp.bind(2 + i)).realize()
+    Device.default.synchronize()
+    if not quiet: print(f"  warmup {i}: {GlobalCounters.kernel_count} kernels")
+
+  times = []
+  for i in range(n_iter):
+    Device.default.synchronize()
+    st = time.perf_counter()
+    out = run_decode(x, v_sp.bind(10 + i)).realize()
+    Device.default.synchronize()
+    times.append((time.perf_counter() - st) * 1000)
+
+  st = _stats(times)
+  if not quiet:
+    print(f"  median: {st['median']:.2f} ms  best: {st['best']:.2f} ms  avg: {st['avg']:.2f} ms")
+    print(f"  p10/p90: {st['p10']:.2f}/{st['p90']:.2f} ms  IQR: {st['iqr']:.2f} ms  MAD: {st['mad']:.2f} ms")
+    print(f"  → decode proxy: {1000/st['median']:.2f} tok/s")
+  return st["median"]
+
 def bench_feed_forward(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 20):
   x = Tensor.randn(1, 1, cfg.dim).cast(dtypes.float16).realize()
   print(f"\n── feed_forward only, no JIT ({n_iter} iterations) ──")
@@ -273,7 +318,7 @@ def bench_feed_forward(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 
   print(f"  p10/p90: {st['p10']:.2f}/{st['p90']:.2f} ms  IQR: {st['iqr']:.2f} ms  MAD: {st['mad']:.2f} ms")
   return st["median"]
 
-def run_benchmark(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 20, rounds: int = 1) -> tuple[float, float]:
+def run_benchmark(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 20, rounds: int = 1) -> tuple[float, float, float]:
   print(f"Loading GGUF metadata for {model}...")
   cfg = load_bench_cfg(model, max_context)
   print(
@@ -285,19 +330,142 @@ def run_benchmark(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, cou
   with Context(BEAM=0):
     block = build_block(cfg)
   print(f"Block built. Device: {Device.DEFAULT}\n")
-  full, ff = [], []
+  full, decode, ff = [], [], []
+  decode_iters = max(4, count // 4)
   for r in range(rounds):
     if rounds > 1: print(f"=== Round {r+1}/{rounds} ===")
     full.append(bench_full_block(block, cfg, count))
+    decode.append(bench_decode_stack(block, cfg, decode_iters))
     ff.append(bench_feed_forward(block, cfg, count))
     if rounds > 1 and r != rounds - 1: print()
   if rounds > 1:
-    fstats, ffstats = _stats(full), _stats(ff)
+    fstats, dstats, ffstats = _stats(full), _stats(decode), _stats(ff)
     print("\n== Aggregate (median of round medians) ==")
     print(f"  full block: {fstats['median']:.2f} ms  p10/p90 {fstats['p10']:.2f}/{fstats['p90']:.2f}  IQR {fstats['iqr']:.2f}")
+    print(f"  decode stack: {dstats['median']:.2f} ms  p10/p90 {dstats['p10']:.2f}/{dstats['p90']:.2f}  IQR {dstats['iqr']:.2f}")
     print(f"  feed_forward: {ffstats['median']:.2f} ms  p10/p90 {ffstats['p10']:.2f}/{ffstats['p90']:.2f}  IQR {ffstats['iqr']:.2f}")
-    return fstats["median"], ffstats["median"]
-  return full[0], ff[0]
+    return fstats["median"], dstats["median"], ffstats["median"]
+  return full[0], decode[0], ff[0]
+
+def _get_cached_block(model: str, max_context: int) -> tuple[BenchCfg, MLATransformerBlock]:
+  key = (model, max_context)
+  if key in _BENCH_MASK_CACHE: return _BENCH_MASK_CACHE[key]
+  cfg = load_bench_cfg(model, max_context)
+  with Context(BEAM=0):
+    block = build_block(cfg)
+  _BENCH_MASK_CACHE[key] = (cfg, block)
+  return cfg, block
+
+def bench_mask(mask: int, iters: int = 8, beam: int = 0, model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096) -> float:
+  cfg, block = _get_cached_block(model, max_context)
+  os.environ["MLA_SPLIT_MASK"] = str(mask)
+  with Context(BEAM=beam):
+    return bench_decode_stack(block, cfg, n_iter=max(4, iters), quiet=True, warmups=1)
+
+def run_fusion_search(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 16, passes: int = 2,
+                      eps_ms: float = 0.10):
+  print(f"Loading GGUF metadata for {model}...")
+  cfg = load_bench_cfg(model, max_context)
+  print("Building block with Q4_0 weights...")
+  with Context(BEAM=0):
+    block = build_block(cfg)
+  print(f"Block built. Device: {Device.DEFAULT}")
+
+  decode_iters = max(4, count // 4)
+  n_bits = len(MLA_SPLIT_POINTS)
+  all_split = (1 << n_bits) - 1
+
+  def measure(mask: int) -> float:
+    os.environ["MLA_SPLIT_MASK"] = str(mask)
+    t = bench_decode_stack(block, cfg, decode_iters, quiet=True, warmups=1)
+    print(f"  mask=0x{mask:05x} decode={t:.2f} ms ({1000/t:.2f} tok/s proxy)")
+    return t
+
+  print(f"\nFusion search over {n_bits} split points (all-split -> greedy re-fuse):")
+  for i, name in enumerate(MLA_SPLIT_POINTS): print(f"  bit {i:2d}: {name}")
+  best_mask, best_t = all_split, measure(all_split)
+  print(f"Start (all split): 0x{best_mask:05x}, {best_t:.2f} ms")
+
+  for p in range(passes):
+    print(f"\nPass {p+1}/{passes}")
+    improved, pass_best_t, pass_best_mask, pass_best_bit = False, best_t, best_mask, -1
+    for bit in range(n_bits):
+      if ((best_mask >> bit) & 1) == 0: continue
+      cand_mask = best_mask & ~(1 << bit)
+      cand_t = measure(cand_mask)
+      if cand_t + eps_ms < pass_best_t:
+        pass_best_t, pass_best_mask, pass_best_bit = cand_t, cand_mask, bit
+        improved = True
+    if not improved:
+      print("  no improving fuse step in this pass")
+      break
+    print(f"  keep: fuse bit {pass_best_bit} ({MLA_SPLIT_POINTS[pass_best_bit]}) -> {pass_best_t:.2f} ms")
+    best_t, best_mask = pass_best_t, pass_best_mask
+
+  os.environ["MLA_SPLIT_MASK"] = str(best_mask)
+  fused_bits = [i for i in range(n_bits) if ((best_mask >> i) & 1) == 0]
+  split_bits = [i for i in range(n_bits) if ((best_mask >> i) & 1) == 1]
+  print("\nBest mask summary:")
+  print(f"  mask=0x{best_mask:05x} decode={best_t:.2f} ms ({1000/best_t:.2f} tok/s proxy)")
+  print(f"  fused bits ({len(fused_bits)}): {[MLA_SPLIT_POINTS[i] for i in fused_bits]}")
+  print(f"  split bits ({len(split_bits)}): {[MLA_SPLIT_POINTS[i] for i in split_bits]}")
+  return best_mask, best_t
+
+def run_fusion_beam_search(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 8, beam_amt: int = 4,
+                           max_steps: int = 4, eps_ms: float = 0.05):
+  print(f"Loading GGUF metadata for {model}...")
+  cfg = load_bench_cfg(model, max_context)
+  print("Building block with Q4_0 weights...")
+  with Context(BEAM=0):
+    block = build_block(cfg)
+  print(f"Block built. Device: {Device.DEFAULT}")
+
+  decode_iters = max(4, count // 2)
+  n_bits = len(MLA_SPLIT_POINTS)
+  seen: set[int] = set()
+
+  def measure(mask: int) -> float:
+    os.environ["MLA_SPLIT_MASK"] = str(mask)
+    with Context(BEAM=beam_amt):
+      t = bench_decode_stack(block, cfg, decode_iters, quiet=True, warmups=1)
+    print(f"  mask=0x{mask:05x} decode={t:.2f} ms ({1000/t:.2f} tok/s proxy)")
+    return t
+
+  print(f"\nFusion+BEAM search ({n_bits} split points, BEAM={beam_amt})")
+  for i, name in enumerate(MLA_SPLIT_POINTS): print(f"  bit {i:2d}: {name}")
+
+  cur_mask = 0
+  cur_t = measure(cur_mask)
+  seen.add(cur_mask)
+  print(f"Start (all fused): 0x{cur_mask:05x}, {cur_t:.2f} ms")
+
+  for step in range(max_steps):
+    print(f"\nStep {step+1}/{max_steps}: try 1-bit neighbors")
+    best_mask, best_t = cur_mask, cur_t
+    for bit in range(n_bits):
+      cand_mask = cur_mask ^ (1 << bit)
+      if cand_mask in seen: continue
+      cand_t = measure(cand_mask)
+      seen.add(cand_mask)
+      if cand_t + eps_ms < best_t:
+        best_mask, best_t = cand_mask, cand_t
+    if best_mask == cur_mask:
+      print("  no improving neighbor")
+      break
+    changed = cur_mask ^ best_mask
+    bit = changed.bit_length() - 1
+    action = "split" if ((best_mask >> bit) & 1) else "fuse"
+    print(f"  keep: {action} bit {bit} ({MLA_SPLIT_POINTS[bit]}) -> {best_t:.2f} ms")
+    cur_mask, cur_t = best_mask, best_t
+
+  os.environ["MLA_SPLIT_MASK"] = str(cur_mask)
+  fused_bits = [i for i in range(n_bits) if ((cur_mask >> i) & 1) == 0]
+  split_bits = [i for i in range(n_bits) if ((cur_mask >> i) & 1) == 1]
+  print("\nBest mask summary:")
+  print(f"  mask=0x{cur_mask:05x} decode={cur_t:.2f} ms ({1000/cur_t:.2f} tok/s proxy)")
+  print(f"  fused bits ({len(fused_bits)}): {[MLA_SPLIT_POINTS[i] for i in fused_bits]}")
+  print(f"  split bits ({len(split_bits)}): {[MLA_SPLIT_POINTS[i] for i in split_bits]}")
+  return cur_mask, cur_t
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -305,5 +473,16 @@ if __name__ == "__main__":
   parser.add_argument("--rounds", type=int, default=1, help="Repeat benchmark rounds and aggregate medians")
   parser.add_argument("--model", default=DEFAULT_BENCH_MODEL, choices=[DEFAULT_BENCH_MODEL], help="Model to benchmark")
   parser.add_argument("--max_context", type=int, default=4096, help="Context length to emulate")
+  parser.add_argument("--fusion_search", action="store_true", help="Greedy split->fuse search using decode-stack proxy")
+  parser.add_argument("--fusion_passes", type=int, default=2, help="Fusion-search passes")
+  parser.add_argument("--fusion_eps_ms", type=float, default=0.10, help="Min decode improvement (ms) to keep a fuse step")
+  parser.add_argument("--fusion_beam_search", action="store_true", help="Greedy 1-bit split/fuse search with BEAM inside each candidate")
+  parser.add_argument("--beam_amt", type=int, default=4, help="BEAM width for --fusion_beam_search")
+  parser.add_argument("--fusion_steps", type=int, default=4, help="Max greedy neighbor steps for --fusion_beam_search")
   args = parser.parse_args()
-  run_benchmark(args.model, args.max_context, args.count, args.rounds)
+  if args.fusion_beam_search:
+    run_fusion_beam_search(args.model, args.max_context, args.count, args.beam_amt, args.fusion_steps, args.fusion_eps_ms)
+  elif args.fusion_search:
+    run_fusion_search(args.model, args.max_context, args.count, args.fusion_passes, args.fusion_eps_ms)
+  else:
+    run_benchmark(args.model, args.max_context, args.count, args.rounds)

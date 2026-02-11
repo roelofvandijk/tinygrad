@@ -2,6 +2,7 @@ from __future__ import annotations
 import math, functools
 from tinygrad import Tensor, nn, UOp
 from tinygrad.dtype import dtypes
+from tinygrad.helpers import getenv
 
 @functools.lru_cache(maxsize=8)
 def _topk_consts(n: int, k: int):
@@ -22,6 +23,10 @@ def _topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
   indices = (match * i_range).sum(-2).cast(dtypes.int)
   values = scores.gather(-1, indices)
   return values, indices
+
+def _maybe_split(x: Tensor, bit: int) -> Tensor:
+  # Optional fusion boundary search: set MLA_SPLIT_MASK bit i to insert contiguous() at point i.
+  return x.contiguous() if ((getenv("MLA_SPLIT_MASK", 0) >> bit) & 1) else x
 
 class PerHeadWeights:
   def __init__(self, n_heads:int, dim1:int, dim2:int):
@@ -86,14 +91,14 @@ class MLATransformerBlock:
     return (x1*cos - x2*sin).unsqueeze(-1).cat((x2*cos + x1*sin).unsqueeze(-1), dim=-1).flatten(-2)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    x_norm = self.attn_norm(x)
+    x_norm = _maybe_split(self.attn_norm(x), 0)
     B, T, _ = x.shape
     if self.q_lora_rank > 0:
-      q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm)))
-      kv_out = self.attn_kv_a_mqa(x_norm)
+      q = _maybe_split(self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))), 1)
+      kv_out = _maybe_split(self.attn_kv_a_mqa(x_norm), 2)
     else:
-      q = self.attn_q(x_norm)
-      kv_out = self.attn_kv_a_mqa(x_norm)
+      q = _maybe_split(self.attn_q(x_norm), 1)
+      kv_out = _maybe_split(self.attn_kv_a_mqa(x_norm), 2)
     q = q.reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     # KV compression
@@ -103,7 +108,7 @@ class MLATransformerBlock:
     q_pe = self._rope_interleaved(q_pe, start_pos, T)
     k_pe = self._rope_interleaved(k_pe, start_pos, T)
     q_nope = q_nope @ self.attn_k_b.weight.transpose(-1, -2)
-    q = q_nope.cat(q_pe, dim=-1)
+    q = _maybe_split(q_nope.cat(q_pe, dim=-1), 3)
     kv_normed = self.attn_kv_a_norm(compressed_kv).unsqueeze(1)
     k_new = kv_normed.cat(k_pe, dim=-1)
     # KV cache
@@ -111,21 +116,23 @@ class MLATransformerBlock:
     if not hasattr(self, "cache_k") or start_pos == 0:
       self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
     self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new).realize()
-    k = self.cache_k[:, :, 0:start_pos+T, :]
+    k = _maybe_split(self.cache_k[:, :, 0:start_pos+T, :], 4)
     # Attention scores
-    qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
+    qk = _maybe_split(q.matmul(k.transpose(-2, -1)) * self._attn_scale, 5)
     if T > 1:
       qk = qk + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
       attn_weights = qk.softmax(-1)
     else:
       e = qk.float().exp()
       attn_weights = (e / e.sum(-1, keepdim=True)).half()
+    attn_weights = _maybe_split(attn_weights, 6)
     # Absorbed V: (attn @ kv_normed_cache) @ v_b^T
     attn = (attn_weights.matmul(k[:, :, :, :self.kv_lora_rank]) @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
-    return x + self.attn_output(attn)
+    attn = _maybe_split(attn, 7)
+    return x + _maybe_split(self.attn_output(attn), 8)
 
   def _feed_forward(self, h: Tensor) -> Tensor:
-    h_norm = self.ffn_norm(h)
+    h_norm = _maybe_split(self.ffn_norm(h), 9)
     if hasattr(self, 'ffn_gate_up_exps'):
       router_logits = h_norm.float() @ self.ffn_gate_inp_f32.T
       if self.expert_gating_func == 2: gate_scores = router_logits.sigmoid()
@@ -136,22 +143,22 @@ class MLATransformerBlock:
       probs = gate_scores.gather(-1, sel)
       if self.expert_gating_func == 3: probs = probs.softmax(-1)
       elif self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(6.103515625e-5)
-      gate_up = self.ffn_gate_up_exps(sel, h_norm)  # (B, T, K, 2*moe_hidden_dim)
+      gate_up = _maybe_split(self.ffn_gate_up_exps(sel, h_norm), 10)  # (B, T, K, 2*moe_hidden_dim)
       gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
-      gated = (gate.silu() * up).contiguous()
-      expert_out = self.ffn_down_exps(sel, gated)
-      out = (expert_out * probs.unsqueeze(-1)).sum(axis=2).contiguous() * self.expert_weights_scale
+      gated = _maybe_split(gate.silu() * up, 11)
+      expert_out = _maybe_split(self.ffn_down_exps(sel, gated), 12)
+      out = _maybe_split((expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale, 13)
       if hasattr(self, 'ffn_gate_up_shexp'):
         # Merged shared expert: single weight load instead of separate gate/up (reduces 22% bottleneck)
-        shexp_gate_up = self.ffn_gate_up_shexp(h_norm)
+        shexp_gate_up = _maybe_split(self.ffn_gate_up_shexp(h_norm), 14)
         shexp_out_dim = shexp_gate_up.shape[-1] // 2
         shexp_gate, shexp_up = shexp_gate_up[..., :shexp_out_dim], shexp_gate_up[..., shexp_out_dim:]
-        shexp = self.ffn_down_shexp(shexp_gate.silu() * shexp_up)
-        out = (out + shexp).contiguous()
+        shexp = _maybe_split(self.ffn_down_shexp(shexp_gate.silu() * shexp_up), 15)
+        out = _maybe_split(out + shexp, 16)
       elif hasattr(self, 'ffn_gate_shexp'):
         # Original separate shared expert (not merged)
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
-        out = (out + shexp).contiguous()
+        shexp = _maybe_split(self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm)), 15)
+        out = _maybe_split(out + shexp, 16)
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
