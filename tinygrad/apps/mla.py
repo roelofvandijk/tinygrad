@@ -1,11 +1,7 @@
 from __future__ import annotations
 import math, functools
-from tinygrad import Tensor, nn, UOp, getenv
+from tinygrad import Tensor, nn, UOp
 from tinygrad.dtype import dtypes
-
-def _next_pow2(x:int) -> int: return 1 if x <= 1 else 1 << (x - 1).bit_length()
-def _bucket_len(cache_len:int, max_context:int, min_bucket:int) -> int:
-  return min(max_context, max(min_bucket, _next_pow2(cache_len)))
 
 @functools.lru_cache(maxsize=8)
 def _topk_consts(n: int, k: int):
@@ -45,8 +41,6 @@ class MLATransformerBlock:
     self.max_context = max_context
     self.mscale = mscale
     self._attn_scale = mscale * mscale / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
-    self.split_moe_boundaries = bool(getenv("MLA_MOE_SPLIT_BOUNDARIES", 1))
-    self.min_attn_bucket = getenv("GLM_ATTN_MIN_BUCKET", 0)
     if q_lora_rank > 0:
       self.attn_q_a = nn.Linear(dim, q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(q_lora_rank, norm_eps)
@@ -116,21 +110,12 @@ class MLATransformerBlock:
     cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
       self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
-    valid_len = start_pos + T
-    self.cache_k[:, :, start_pos:valid_len, :].assign(k_new).realize()
-    if self.min_attn_bucket > 0 and isinstance(start_pos, int):
-      attn_len = _bucket_len(valid_len, self.max_context, self.min_attn_bucket)
-      k = self.cache_k[:, :, :attn_len, :]
-    else:
-      attn_len = valid_len
-      k = self.cache_k[:, :, :valid_len, :]
+    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new).realize()
+    k = self.cache_k[:, :, 0:start_pos+T, :]
     # Attention scores
     qk = q.matmul(k.transpose(-2, -1)) * self._attn_scale
-    if isinstance(attn_len, int) and isinstance(valid_len, int) and attn_len > valid_len:
-      valid = Tensor.arange(attn_len, requires_grad=False, device=q.device).reshape(1, 1, 1, attn_len) < valid_len
-      qk = valid.where(qk, qk.full_like(float("-inf")))
     if T > 1:
-      qk = qk + Tensor.full((1, 1, T, attn_len), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      qk = qk + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
       attn_weights = qk.softmax(-1)
     else:
       e = qk.float().exp()
@@ -153,22 +138,18 @@ class MLATransformerBlock:
       elif self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(6.103515625e-5)
       gate_up = self.ffn_gate_up_exps(sel, h_norm)  # (B, T, K, 2*moe_hidden_dim)
       gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
-      if self.split_moe_boundaries: gate, up = gate.contiguous(), up.contiguous()
-      gated = gate.silu() * up
-      expert_out = self.ffn_down_exps(sel, gated)
-      if self.split_moe_boundaries: expert_out = expert_out.contiguous()
+      gated = (gate.silu() * up).contiguous()
+      expert_out = self.ffn_down_exps(sel, gated).contiguous()
       out = (expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_up_shexp'):
         # Merged shared expert: single weight load instead of separate gate/up (reduces 22% bottleneck)
         shexp_gate_up = self.ffn_gate_up_shexp(h_norm)
         shexp_out_dim = shexp_gate_up.shape[-1] // 2
         shexp_gate, shexp_up = shexp_gate_up[..., :shexp_out_dim], shexp_gate_up[..., shexp_out_dim:]
-        if self.split_moe_boundaries: out = out.contiguous()
-        out = out + self.ffn_down_shexp((shexp_gate.silu() * shexp_up).contiguous())
+        out = out.contiguous() + self.ffn_down_shexp((shexp_gate.silu() * shexp_up).contiguous())
       elif hasattr(self, 'ffn_gate_shexp'):
         # Original separate shared expert (not merged)
-        if self.split_moe_boundaries: out = out.contiguous()
-        out = out + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
     gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
