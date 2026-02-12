@@ -2,7 +2,7 @@ import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, AMX
 from tinygrad.dtype import ImageDType
-from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
@@ -61,24 +61,77 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
-  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 16), getenv("MV_ROWS_PER_THREAD", 4)
+  mulop = k.reduceop.src[0] if k.reduceop is not None else None
+  if isinstance(mulop, UOp) and mulop.op is Ops.CAST and len(mulop.src) and mulop.src[0].op is Ops.MUL: mulop = mulop.src[0]
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
-    (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
-    idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
-    if k.ranges_of(AxisType.REDUCE):
-      first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
-      if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
-        for global_idx in k.axes_of(AxisType.GLOBAL):
-          if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
-            if DEBUG >= 3:
-              print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
+    isinstance(mulop, UOp) and mulop.op is Ops.MUL and k.ranges_of(AxisType.REDUCE):
+    first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
+    # find activation: an INDEX operand of the MUL whose idx contains first_reduce_rng
+    for act_i in range(2):
+      if mulop.src[act_i].op is not Ops.INDEX: continue
+      act_idx = mulop.src[act_i].src[1].get_idx()
+      if not any(u is first_reduce_rng for u in act_idx.split_uop(Ops.ADD)): continue
+      # weight side: if INDEX, verify range subset; if dequant chain (not INDEX), skip range check
+      wt = mulop.src[1 - act_i]
+      if wt.op is Ops.INDEX and not all(r in wt.src[1].get_idx().ranges for r in act_idx.ranges): break
+      for global_idx in k.axes_of(AxisType.GLOBAL):
+        if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
+          if DEBUG >= 3:
+            print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
+          try:
+            if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
+          except KernelOptError: pass
+          if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
+          if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
+          return k
+      break
+
+  # Q4_0 packed-dot GROUP: bitwise ops in reduce chain indicate dequant — MV can't match these, apply GROUP directly
+  reduce_rngs = k.ranges_of(AxisType.REDUCE) if k.reduceop is not None else []
+  reduce_product = prod(int(r.vmax+1) for r in reduce_rngs) if reduce_rngs else 0
+  if k.ren.has_local and k.ren.has_shared and k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and \
+    reduce_product >= 256 and len(reduce_rngs) >= 2 and \
+    any(int(r.vmax+1) == 16 for r in reduce_rngs):
+    global_axes = k.axes_of(AxisType.GLOBAL)
+    # MoE expert pattern: small global dim (n_sel ≤ 8) alongside large output dim
+    has_small_global = any(k.full_shape[i] <= 8 for i in global_axes) if len(global_axes) >= 2 else False
+    if has_small_global and global_axes:
+      # MoE: LOCAL on largest global, GROUP on inner reduce (packed dim)
+      best_global = max(global_axes, key=lambda i: k.full_shape[i])
+      gshape = k.full_shape[best_global]
+      for reduce_axis in range(len(reduce_rngs)-1, -1, -1):
+        reduce_rng = reduce_rngs[reduce_axis]
+        for lsz in [8, 4, 16, 32]:
+          if gshape % lsz != 0: continue
+          for gsz in [8, 16, 4]:
+            if reduce_rng.src[0].divides(gsz) is None: continue
             try:
-              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
+              tk = k.copy()
+              tk.apply_opt(Opt(OptOps.LOCAL, best_global, lsz))
+              tk.apply_opt(Opt(OptOps.GROUP, reduce_axis, gsz))
+              return tk
             except KernelOptError: pass
-            if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
-            if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
-            return k
+    elif global_axes:
+      # non-MoE dequant: original GROUP+LOCAL+UPCAST
+      outer_reduce_sz = int(reduce_rngs[0].vmax+1) if reduce_rngs else 0
+      axis_order = list(range(len(reduce_rngs)-1, -1, -1)) if outer_reduce_sz > 128 else list(range(len(reduce_rngs)))
+      for reduce_axis in axis_order:
+        reduce_rng = reduce_rngs[reduce_axis]
+        for global_idx in global_axes:
+          gshape = k.full_shape[global_idx]
+          for gsz in [16, 8, 4]:
+            if reduce_rng.src[0].divides(gsz) is None: continue
+            for lsz, usz in [(4,4), (4,2), (2,4), (2,2)]:
+              if gshape % (lsz * usz) != 0: continue
+              try:
+                tk = k.copy()
+                tk.apply_opt(Opt(OptOps.GROUP, reduce_axis, gsz))
+                tk.apply_opt(Opt(OptOps.LOCAL, global_idx, lsz))
+                tk.apply_opt(Opt(OptOps.UPCAST, global_idx, usz))
+                return tk
+              except KernelOptError: pass
 
   # are we grouping? (requires local shape support)
   if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
