@@ -23,6 +23,16 @@ def _topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
   values = scores.gather(-1, indices)
   return values, indices
 
+def _topk_pairwise_indices(scores: Tensor, k: int) -> Tensor:
+  """Index-only variant of pairwise topk used in MoE routing."""
+  n = scores.shape[-1]
+  j_idx, i_idx, target, i_range = _topk_consts(n, k)
+  s_col = scores.unsqueeze(-1)  # (..., n, 1)
+  s_row = scores.unsqueeze(-2)  # (..., 1, n)
+  ranks = ((s_row > s_col) | ((s_row == s_col) & (j_idx < i_idx))).sum(-1)  # (..., n), 0=largest
+  match = (ranks.unsqueeze(-1) == target.unsqueeze(-2)).float()  # (..., n, k)
+  return (match * i_range).sum(-2).cast(dtypes.int)
+
 class PerHeadWeights:
   def __init__(self, n_heads:int, dim1:int, dim2:int):
     self.weight = Tensor.zeros(n_heads, dim1, dim2)
@@ -132,7 +142,7 @@ class MLATransformerBlock:
       elif self.expert_gating_func == 3: gate_scores = router_logits
       else: gate_scores = router_logits.softmax(-1)
       selection_scores = gate_scores + self.exp_probs_b.bias if hasattr(self, 'exp_probs_b') else gate_scores
-      _, sel = _topk_pairwise(selection_scores, self.num_experts_per_tok)
+      sel = _topk_pairwise_indices(selection_scores, self.num_experts_per_tok)
       probs = gate_scores.gather(-1, sel)
       if self.expert_gating_func == 3: probs = probs.softmax(-1)
       elif self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(6.103515625e-5)

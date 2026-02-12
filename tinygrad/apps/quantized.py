@@ -1,7 +1,7 @@
 from __future__ import annotations
 from tinygrad import Tensor, UOp, nn, getenv
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.uop.ops import AxisType, KernelInfo
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.nn.state import GGML_QUANT_INFO
 
@@ -21,8 +21,6 @@ def custom_q4_0_linear(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   r = UOp.range(bpr*8, 2, axis_type=AxisType.REDUCE)
   br, jb = r//8, (r%8)*2
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o)[0].set(0.0)
   s = scale[o, br, 0].cast(dtypes.float)
   q0, q1 = packed[o, br, jb], packed[o, br, jb+1]
   q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
@@ -33,8 +31,11 @@ def custom_q4_0_linear(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
   x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
   x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3), end=r)
-  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+  # Keep this as an explicit REDUCE (instead of AFTER accumulation), so GROUP/GROUPTOP
+  # legalization can reason about reduction domains correctly.
+  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
+  acc = dot.reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=_q4_0_linear_opts(N, O, I)))
 
 def custom_q4_0_linear_split(partial:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
@@ -63,8 +64,6 @@ def custom_q4_0_linear_split(partial:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   br = g*chunk_bpr + (r//8)
   jb = (r%8)*2
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o, g)[0].set(0.0)
   s = scale[o, br, 0].cast(dtypes.float)
   q0, q1 = packed[o, br, jb], packed[o, br, jb+1]
   q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
@@ -75,8 +74,10 @@ def custom_q4_0_linear_split(partial:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
   x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
   x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3), end=r)
-  return partial[n, o, g].store(acc[0].cast(partial.dtype.base)).end(n, o, g).sink(
+  # Same explicit REDUCE form as custom_q4_0_linear for correctness-safe grouped scheduling.
+  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
+  acc = dot.reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return partial[n, o, g].store(acc.cast(partial.dtype.base)).end(n, o, g).sink(
     arg=KernelInfo(name=f"custom_q4_0_linear_split_{N}_{O}_{I}_g{G}", opts_to_apply=_q4_0_linear_split_opts(N, O, I, G)))
 
 def custom_q4_0_linear_vec2(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
@@ -129,11 +130,17 @@ def _q4_0_linear_opts(n_rows:int, out_features:int, in_features:int):
   # Fast, correctness-safe defaults for decode-hot dense Q4 shapes.
   # These are intentionally fixed (no env tuning path) so runtime behavior is deterministic.
   if n_rows == 1 and out_features == 2048 and in_features == 5120:
-    return (Opt(OptOps.LOCAL, 0, 32),)
+    # Explicit REDUCE form in custom_q4_0_linear makes grouped-reduce legal and correct here.
+    # This recovers lane-parallel reduction speed on the hottest dense Q4 decode kernel.
+    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUPTOP, 1, 4))
   if n_rows == 1 and out_features == 5120 and in_features == 768:
-    return (Opt(OptOps.LOCAL, 0, 16),)
+    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUP, 1, 8))
   if n_rows == 1 and out_features == 768 and in_features == 2048:
-    return (Opt(OptOps.LOCAL, 0, 16),)
+    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUPTOP, 1, 8))
+  if n_rows == 1 and out_features == 10240 and in_features == 2048:
+    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUP, 1, 8))
+  if n_rows == 1 and out_features == 2048 and in_features == 10240:
+    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUP, 1, 8))
   return ()
 
 def _q4_0_linear_split_opts(n_rows:int, out_features:int, in_features:int, groups:int):
@@ -142,21 +149,19 @@ def _q4_0_linear_split_opts(n_rows:int, out_features:int, in_features:int, group
   return ()
 
 def _q4_0_linear_split_groups(n_rows:int, out_features:int, in_features:int) -> int:
-  """
-  Decode-hot dense Q4 path uses split-K style reduction to expose more parallel work-items.
-  These groups are fixed winners by shape to keep runtime deterministic and avoid env tuning.
-  """
-  if n_rows == 1 and out_features == 2048 and in_features == 5120: return 8
-  if n_rows == 1 and out_features == 5120 and in_features == 768: return 4
-  if n_rows == 1 and out_features == 768 and in_features == 2048: return 4
+  # Split-K dense path stays available but is currently not default.
+  # Single-kernel grouped reduction now benchmarks better for decode-hot shapes.
   return 1
 
 def _q4_0_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
   # Decode-specialized defaults (n_sel=4) for Q4 expert matmul-id.
   if n_sel == 4 and out_features == 3072 and in_features == 2048:
-    return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUP, 1, 8))
+    # GROUPTOP gave the best kernel-level latency on this dominant gate/up shape.
+    return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUPTOP, 1, 8))
   if n_sel == 4 and out_features == 2048 and in_features == 1536:
-    return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUP, 1, 8))
+    # Explicit REDUCE form enables correctness-safe GROUPTOP here and it's significantly faster
+    # than GROUP in microbench for the down expert kernel shape.
+    return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUPTOP, 1, 8))
   return ()
 
 def _q4_0_mul_mat_id_split_opts(n_sel:int, out_features:int, in_features:int, groups:int):
@@ -165,9 +170,7 @@ def _q4_0_mul_mat_id_split_opts(n_sel:int, out_features:int, in_features:int, gr
   return ()
 
 def _q4_0_mul_mat_id_split_groups(n_sel:int, out_features:int, in_features:int) -> int:
-  # Decode-hot MoE path: split reduction into 4 chunks to increase work-item parallelism.
-  if n_sel == 4 and (out_features, in_features) in {(3072, 2048), (2048, 1536)}:
-    return 4
+  # Split-K MoE path stays available, but grouped single-kernel path currently benchmarks better.
   return 1
 
 def _fp16_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
@@ -200,8 +203,6 @@ def custom_q4_0_mul_mat_id(out:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UO
   scale_flat = scale.reshape(E * O * bpr)
   packed_flat = packed.reshape(E * O * bpr * 16)
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o)[0].set(0.0)
   s = scale_flat[base].cast(dtypes.float)
   q0, q1 = packed_flat[base * 16 + jb], packed_flat[base * 16 + jb + 1]
   q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
@@ -212,8 +213,10 @@ def custom_q4_0_mul_mat_id(out:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UO
   x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
   x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
   x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3), end=r)
-  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+  # Explicit REDUCE form keeps grouped-reduction legalization valid for expert kernels too.
+  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
+  acc = dot.reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_q4_0_mul_mat_id_opts(N, O, I)))
 
 def custom_q4_0_mul_mat_id_split(partial:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UOp:
@@ -248,8 +251,6 @@ def custom_q4_0_mul_mat_id_split(partial:UOp, x:UOp, scale:UOp, packed:UOp, sel:
   scale_flat = scale.reshape(E * O * bpr)
   packed_flat = packed.reshape(E * O * bpr * 16)
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o, g)[0].set(0.0)
   s = scale_flat[base].cast(dtypes.float)
   q0, q1 = packed_flat[base * 16 + jb], packed_flat[base * 16 + jb + 1]
   q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
@@ -260,8 +261,9 @@ def custom_q4_0_mul_mat_id_split(partial:UOp, x:UOp, scale:UOp, packed:UOp, sel:
   x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
   x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
   x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3), end=r)
-  return partial[n, o, g].store(acc[0].cast(partial.dtype.base)).end(n, o, g).sink(
+  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
+  acc = dot.reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return partial[n, o, g].store(acc.cast(partial.dtype.base)).end(n, o, g).sink(
     arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_split_{N}_{O}_{I}_g{G}",
                    opts_to_apply=_q4_0_mul_mat_id_split_opts(N, O, I, G)))
 
@@ -279,21 +281,15 @@ def custom_fp16_mul_mat_id(out:UOp, x:UOp, weights:UOp, sel:UOp) -> UOp:
   r = UOp.range(I, 2, axis_type=AxisType.REDUCE)
   e = sel[n].cast(dtypes.int).maximum(0).minimum(E-1).cast(dtypes.index)
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o)[0].set(0.0)
   w_flat = weights.reshape(E * O * I)
   w = w_flat[((e * O) + o) * I + r].cast(dtypes.float)
   xv = x[n, r].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + w * xv, end=r)
-  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+  acc = (w * xv).reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_fp16_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_fp16_mul_mat_id_opts(N, O, I)))
 
 def _fp16_linear_opts(n_rows:int, out_features:int, in_features:int):
-  # Decode-specialized schedule for shared expert fallback shapes.
-  if n_rows == 1 and out_features == 3072 and in_features == 2048:
-    return (Opt(OptOps.LOCAL, 1, 16), Opt(OptOps.GROUP, 1, 16))
-  if n_rows == 1 and out_features == 2048 and in_features == 1536:
-    return (Opt(OptOps.LOCAL, 1, 16), Opt(OptOps.GROUP, 1, 16))
+  # Keep fp16 custom-linear opts conservative until grouped schedule legality is tuned.
   return ()
 
 def custom_fp16_linear(out:UOp, x:UOp, w:UOp) -> UOp:
@@ -308,12 +304,10 @@ def custom_fp16_linear(out:UOp, x:UOp, w:UOp) -> UOp:
   o = UOp.range(O, 1)
   r = UOp.range(I, 2, axis_type=AxisType.REDUCE)
 
-  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
-  acc = acc.after(n, o)[0].set(0.0)
   xv = x[n, r].cast(dtypes.float)
   wv = w[o, r].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + xv * wv, end=r)
-  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+  acc = (xv * wv).reduce(r, arg=Ops.ADD, dtype=dtypes.float)
+  return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_fp16_linear_{N}_{O}_{I}", opts_to_apply=_fp16_linear_opts(N, O, I)))
 
 class QuantizedLinear:

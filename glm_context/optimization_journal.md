@@ -1832,3 +1832,57 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Current status
 - DSL path improved but still behind MSL path on this machine.
 - Main blocker to a bigger DSL jump remains upcast/vectorized custom-kernel codegen legality for the dense Q4 hotspot.
+
+## DSL iteration (2026-02-12, continued): reduction-shape and router cleanup
+
+### Accepted changes
+
+1) Dense Q4 hot shape schedule refinement
+- File: `tinygrad/apps/quantized.py`
+- Change: `_q4_0_linear_opts` for `(N,O,I)=(1,2048,5120)`
+  - from: `LOCAL(0,32) + GROUPTOP(1,4)`
+  - to:   `LOCAL(0,16) + GROUPTOP(1,4)`
+- Why: kernel-level DEBUG=2 median improved (`~148.5us -> ~141.5us`) for `custom_q4_0_linear_1_2048_5120`.
+- End-to-end check:
+  - `bench_block.py 3 --rounds 3` aggregate decode stack improved from ~`27.31 ms` (older baseline) to ~`27.21 ms` with dense tweak, and further with next tweak below.
+
+2) MoE gate/up schedule: use GROUPTOP
+- File: `tinygrad/apps/quantized.py`
+- Change: `_q4_0_mul_mat_id_opts` for `(N,O,I)=(4,3072,2048)`
+  - from: `LOCAL(1,8) + GROUP(1,8)`
+  - to:   `LOCAL(1,8) + GROUPTOP(1,8)`
+- Why: this is the largest DSL kernel by cumulative time; DEBUG=2 microbench median improved strongly (`~143.9us -> ~112.9us`) for `custom_q4_0_mul_mat_id_4_3072_2048`.
+- End-to-end check:
+  - `bench_block.py 3 --rounds 3` aggregate decode stack reached ~`27.05 ms` (decode proxy ~`36.95-36.99 tok/s` in rounds).
+
+3) Remove unused top-k value gather in MoE routing path
+- File: `tinygrad/apps/mla.py`
+- Added: `_topk_pairwise_indices(scores, k)`
+- Change in `_feed_forward`: use index-only topk helper, avoid computing/returning top-k values that are discarded.
+- Why: old path did extra gather work in every MoE layer even though only indices are needed.
+- A/B validation (`bench_block.py 3 --rounds 3`):
+  - with index-only topk: aggregate decode stack ~`27.08 ms`
+  - old value+index topk: aggregate decode stack ~`27.21 ms`
+  - net: ~`0.13 ms` improvement on decode stack in this controlled A/B.
+
+### Rejected changes (kept out)
+
+- Dense Q4 hot shape `GROUPTOP(2)` variants (`LOCAL=8/32/64`) looked good in isolated microbench but regressed `bench_block` decode proxy.
+- MoE down shape `(4,2048,1536)` switched to `GROUP(1,8)` looked faster in per-kernel timing but regressed aggregate decode in rounds A/B; reverted to `GROUPTOP(1,8)`.
+- Routing Q5/Q6 dequant-cache linears through `custom_fp16_linear` increased kernel count (`1700`) and regressed decode proxy; reverted.
+
+### Current retained DSL defaults after this iteration
+
+- Dense Q4 `(1,2048,5120)`: `LOCAL(0,16) + GROUPTOP(1,4)`
+- MoE gate/up `(4,3072,2048)`: `LOCAL(1,8) + GROUPTOP(1,8)`
+- MoE down `(4,2048,1536)`: `LOCAL(1,8) + GROUPTOP(1,8)`
+- MoE routing uses `_topk_pairwise_indices` in `_feed_forward`.
+
+### Full-model check after retained DSL changes
+- Command:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- Steady decode lines from latest run:
+  - `30.12, 30.54, 30.93, 30.64, 31.09 tok/s`
+- Notes:
+  - Bench-block proxy improved and stabilized in the `~36.9 tok/s` band.
+  - Full-model remains around low-31 tok/s range with expected run-to-run variance.
