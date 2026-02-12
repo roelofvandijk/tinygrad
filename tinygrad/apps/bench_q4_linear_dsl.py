@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse, statistics, time
-from tinygrad import Tensor, Device
+from tinygrad import Tensor, Device, TinyJit
 from tinygrad.dtype import dtypes
 from tinygrad.apps.quantized import custom_q4_0_linear
 
@@ -31,23 +31,27 @@ def _q4_ref(x:Tensor, scale:Tensor, packed:Tensor) -> Tensor:
 
 def _run_case(n:int, o:int, i:int, warmup:int, iters:int, compare_msl:bool):
   x, scale, packed = _make_inputs(n, o, i)
+  device = x.device
 
   out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
   out = Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
   ref = _q4_ref(x, scale, packed).realize()
   max_diff = (out.float() - ref.float()).abs().max().item()
 
+  @TinyJit
+  def dsl_run(xi:Tensor, si:Tensor, pi:Tensor):
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=device)
+    return Tensor.custom_kernel(out, xi, si, pi, fxn=custom_q4_0_linear)[0]
+
   for _ in range(warmup):
-    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
-    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
+    dsl_run(x, scale, packed).realize()
     Device.default.synchronize()
 
   times = []
   for _ in range(iters):
     Device.default.synchronize()
     st = time.perf_counter()
-    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
-    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
+    dsl_run(x, scale, packed).realize()
     Device.default.synchronize()
     times.append(time.perf_counter() - st)
 
@@ -64,16 +68,19 @@ def _run_case(n:int, o:int, i:int, warmup:int, iters:int, compare_msl:bool):
     return
 
   from tinygrad.apps.q4_linear_msl import custom_q4_0_linear_msl
+  @TinyJit
+  def msl_run(xi:Tensor, si:Tensor, pi:Tensor):
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=device)
+    return Tensor.custom_kernel(out, xi, si, pi, fxn=custom_q4_0_linear_msl)[0]
+
   for _ in range(warmup):
-    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
-    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear_msl)[0].realize()
+    msl_run(x, scale, packed).realize()
     Device.default.synchronize()
   times_msl = []
   for _ in range(iters):
     Device.default.synchronize()
     st = time.perf_counter()
-    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
-    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear_msl)[0].realize()
+    msl_run(x, scale, packed).realize()
     Device.default.synchronize()
     times_msl.append(time.perf_counter() - st)
   med_msl = statistics.median(times_msl)

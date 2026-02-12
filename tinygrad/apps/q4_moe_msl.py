@@ -7,7 +7,7 @@ from tinygrad.uop.ops import Ops, UOp
 from tinygrad.uop.ops import KernelInfo
 from tinygrad.renderer import ProgramSpec
 from tinygrad.engine.realize import CompiledRunner, ExecItem, capturing, CAPTURING
-from tinygrad.helpers import all_int, getenv
+from tinygrad.helpers import all_int
 
 MSL_TEMPLATE = r"""
 #include <metal_stdlib>
@@ -148,20 +148,10 @@ kernel void q4_moe_mul_mat_id(
 """
 
 def _threads_for_shape(n_sel:int, out_features:int, in_features:int) -> int:
-  default_threads = getenv("QL_MOE_MSL_THREADS", 32)
-  if n_sel == 4 and out_features == 2048 and in_features == 1536:
-    return getenv("QL_MOE_MSL_THREADS_2048_1536", default_threads)
-  if n_sel == 4 and out_features == 3072 and in_features == 2048:
-    return getenv("QL_MOE_MSL_THREADS_3072_2048", default_threads)
-  return default_threads
+  return 32
 
 def _nr_for_shape(n_sel:int, out_features:int, in_features:int) -> int:
-  default_nr = getenv("QL_MOE_MSL_NR", 1)
-  if n_sel == 4 and out_features == 2048 and in_features == 1536:
-    return getenv("QL_MOE_MSL_NR_2048_1536", default_nr)
-  if n_sel == 4 and out_features == 3072 and in_features == 2048:
-    return getenv("QL_MOE_MSL_NR_3072_2048", default_nr)
-  return default_nr
+  return 1
 
 class Q4MoEMSLRunner(CompiledRunner):
   pass

@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools
 from tinygrad import Device, UOp
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import all_int, getenv
+from tinygrad.helpers import all_int
 from tinygrad.uop.ops import Ops, KernelInfo
 from tinygrad.renderer import ProgramSpec
 from tinygrad.engine.realize import CompiledRunner
@@ -208,12 +208,7 @@ class QKLinearMSLRunner(CompiledRunner):
   pass
 
 def _threads_for_qk(ggml_type:int, out_features:int, in_features:int) -> int:
-  base = getenv("QL_SHEXP_MSL_THREADS", 32)
-  if ggml_type == 13 and out_features == 3072 and in_features == 2048:
-    return getenv("QL_SHEXP_MSL_THREADS_3072_2048", base)
-  if ggml_type == 14 and out_features == 2048 and in_features == 1536:
-    return getenv("QL_SHEXP_MSL_THREADS_2048_1536", base)
-  return base
+  return 32
 
 def _nr_for_qk(ggml_type:int, out_features:int, in_features:int) -> int:
   if ggml_type == 13 and out_features == 3072 and in_features == 2048: return 2

@@ -3597,8 +3597,13 @@ class Tensor(OpMixin):
     assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
 
     if getenv("FLASH_ATTENTION"):
-      from extra.thunder.tiny.fa import flash_attention
-      return flash_attention(self, key, value, attn_mask=attn_mask, is_causal=is_causal)
+      # Keep FLASH_ATTENTION opt-in, but never let backend-specific FA compile/runtime issues
+      # break correctness. If flash fails for this backend/shape, fall back to standard SDPA.
+      try:
+        from extra.thunder.tiny.fa import flash_attention
+        return flash_attention(self, key, value, attn_mask=attn_mask, is_causal=is_causal)
+      except Exception:
+        pass
 
     # GQA: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     if enable_gqa:

@@ -1,7 +1,7 @@
 # this converts a lowerer program into a vectorized program
 import functools, itertools
 from tinygrad.dtype import dtypes, PtrDType, AddrSpace
-from tinygrad.helpers import dedup, flatten, all_same, prod, partition
+from tinygrad.helpers import dedup, flatten, all_same, prod, partition, merge_dicts
 from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, GroupOp, AxisType, range_start
 from tinygrad.schedule.rangeify import BufferizeOpts
 
@@ -120,7 +120,14 @@ def fix_store_unroll(x:UOp):
   return UOp(Ops.CONTRACT, dtypes.void, (x.replace(src=x.src[:2]+tuple(store_range)),), tuple(flatten(x.arg for x in store_expand)), tag=1)
 
 def fix_group_for_reduce(x:UOp):
-  reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.arg[1] == AxisType.GROUP_REDUCE)
+  # GROUP/GROUPTOP can move grouped-reduce ranges inside the symbolic reduction-index expressions
+  # (for example, idx = g*tile + r). In that case REDUCE.src[1:] may no longer contain raw RANGE
+  # nodes, but the grouped range still exists in the reduction-axis expression graph.
+  #
+  # To legalize lane/block style reduction correctly, collect ranges from the reduction-axis
+  # expressions themselves instead of only checking direct REDUCE sources.
+  reduce_axes = sorted(merge_dicts([u.ranges for u in x.src[1:]]), key=lambda u: u.arg)
+  reduce_gfr, reduce_r = partition(reduce_axes, lambda u: u.op is Ops.RANGE and u.arg[1] == AxisType.GROUP_REDUCE)
   if len(reduce_gfr) == 0: return None
 
   # NOTE: if there's other locals here, we need them in the buffer too

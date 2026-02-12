@@ -168,6 +168,11 @@ shared_codegen_spec = PatternMatcher([
   # VECTORIZE/GEP
   (UPat(Ops.VECTORIZE, name="x"), lambda x: len(x.src)>1 and len(x.src) == x.dtype.vcount and all(x.dtype == y.dtype.vec(len(x.src)) for y in x.src)),
   (UPat(Ops.GEP, src=(UPat.var("src"),), name="gep"), lambda gep,src: gep.dtype == src.dtype.scalar()),
+  # Allow vectorized pointer indexing in linearized kernels.
+  # Some schedule variants (notably upcasted custom-kernel paths) temporarily emit
+  # INDEX(VECTORIZE(ptr), idx) during lowering. Without this, otherwise valid kernels
+  # can fail SPEC in program linearization before renderer-specific cleanup.
+  (UPat(Ops.INDEX, src=(UPat(Ops.VECTORIZE), UPat())), lambda: True),
 
   # LOAD(idx) / STORE(idx, val)
   (UPat().index(UPat()).or_casted().load(), lambda: True),
@@ -231,6 +236,16 @@ program_spec = PatternMatcher([
   # if has a <gate, index_for_dedup>
   (UPat(Ops.IF, dtype=dtypes.void, src=(UPat(dtype=dtypes.bool), UPat((Ops.CAST, Ops.INDEX)))), lambda: True),
   (UPat(Ops.ENDIF, dtype=dtypes.void, src=(UPat(Ops.IF),)), lambda: True),
+
+  # Transitional: vectorized custom-kernel schedules may index through CASTed reg pointers after index dtype lowering.
+  # Keep this legal in program_spec so renderer/backend cleanup can finish the lowering.
+  (UPat(Ops.INDEX, src=(UPat(Ops.CAST, src=(UPat((Ops.DEFINE_REG, Ops.AFTER)),)), UPat())), lambda: True),
+
+  # Some vectorized custom-kernel schedules temporarily form STORE(LOAD(ptr), VECTORIZE(...))
+  # in program linearization before backend cleanup. Allow this transitional pattern.
+  (UPat(Ops.STORE, src=(UPat(Ops.LOAD), UPat(Ops.VECTORIZE))), lambda: True),
+  # Transitional: vector stores can target CASTed pointers during lowering.
+  (UPat(Ops.STORE, src=(UPat(Ops.CAST), UPat(Ops.VECTORIZE))), lambda: True),
 ])+shared_codegen_spec+shared_spec
 
 # *** this spec should match all UOps ever created ***

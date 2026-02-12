@@ -1655,3 +1655,180 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
   - DSL Q4 dense path is scalarized/serial.
   - MSL path is SIMD-parallel with hoisted decode math and better packed-load usage.
 - If we want DSL to close this gap, it needs the same primitive boundary + parallel reduction shape generation (without handwritten MSL), not minor expression tweaks.
+
+## DSL catch-up from MSL insights: Q4 dense kernel (2026-02-12)
+
+### Objective
+- Use MSL findings to improve non-MSL DSL path on the main dense Q4 kernel (`1x2048x5120`) without handwritten backend code.
+
+### Root cause found
+- `custom_q4_0_linear` had `KernelInfo(..., opts_to_apply=())`.
+- In tinygrad postrange, any non-`None` `opts_to_apply` bypasses heuristic optimization (`apply_opts`), so this effectively hard-disabled auto scheduling.
+
+### Step 1: remove extra dequant work in DSL kernel (accepted)
+- Change DSL custom kernel to consume pre-separated tensors:
+  - `scale: (O, bpr, 1)` and `packed: (O, bpr, 16)`
+  - instead of raw `(O, bpr, 18)` blocks with per-iteration fp16 scale unpack.
+- Bench (`QL_MOE_MSL=0 QL_SHEXP_MSL=0`):
+  - before: decode proxy `12.88 tok/s`
+  - after separation: decode proxy `15.29 tok/s`
+
+### Step 2: try enabling generic heuristic path directly (rejected)
+- Removing `opts_to_apply=()` exposed optimizer/codegen issues for this kernel:
+  - crash in `gpudims.py` (`ptrdtype` assumption on non-pointer INDEX base after vectorized path).
+  - after guard fix, further SPEC failure on invalid vectorized register INDEX shape.
+- Conclusion: generic heuristic path is not yet robust for this custom-reduce kernel form.
+
+### Tinygrad core fix landed
+- `tinygrad/codegen/gpudims.py`:
+  - guarded global-store masking logic to only access `ptrdtype` when INDEX base is actually `PtrDType`.
+  - fixes one real crash class discovered by this kernel.
+
+### Step 3: explicit shape-specialized DSL opts (accepted)
+- Added `_q4_0_linear_opts` and applied via `KernelInfo.opts_to_apply` for decode shapes.
+- Tried `LOCAL+GROUP` first:
+  - huge perf win but numerically wrong on microbench (`max_diff` enormous) -> rejected.
+- Kept `LOCAL` only (safe):
+  - final default: `LOCAL axis=0 arg=16` for `(1,2048,5120)`, `(1,5120,768)`, `(1,768,2048)`.
+
+### Result
+- Representative bench (`QL_MOE_MSL=0 QL_SHEXP_MSL=0`):
+  - decode proxy improved to `31.71 tok/s` (typical range seen: ~31-32).
+  - from baseline `12.88 tok/s` -> ~`2.46x` improvement.
+- DEBUG=2 kernel metrics now show major lift for hot dense kernel:
+  - `custom_q4_0_linear_1_2048_5120`: ~`130 GFLOPS` (was ~`21 GFLOPS` before this line of work).
+
+### Production-path safety check
+- MSL path unaffected by this DSL work:
+  - `QL_MOE_MSL=1 QL_SHEXP_MSL=1` decode proxy remains ~`41.94 tok/s`.
+
+### Fast-iteration tooling added
+- Added focused microbench:
+  - `tinygrad/apps/bench_q4_linear_dsl.py`
+  - covers default GLM dense Q4 shapes, runs correctness check, and optional MSL compare.
+
+## Isolated A/B: q4_0_linear LOCAL 32 -> 16 only (2026-02-12)
+
+### Setup
+- Before: clean worktree `/tmp/tg_ab_sKEl2y` (detached `e92f28fab`)
+- After: current tree
+- Only code diff in `tinygrad/apps/quantized.py`:
+  - `_q4_0_linear_opts` for `(1,2048,5120)`, `(1,5120,768)`, `(1,768,2048)` changed `LOCAL(axis=0,arg=32)` -> `LOCAL(axis=0,arg=16)`
+- Command (both sides, sequential):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 20 --model "glm-4.7:flash-unsloth-Q4_0"`
+
+### Result
+- Before (LOCAL=32):
+  - full block median: `1.08 ms`
+  - decode stack median: `35.99 ms` (`27.78 tok/s`)
+  - feed_forward median: `16.57 ms`
+- After (LOCAL=16):
+  - full block median: `1.05 ms`
+  - decode stack median: `35.31 ms` (`28.32 tok/s`)
+  - feed_forward median: `15.35 ms`
+
+### Delta
+- decode stack: `-1.89%` latency (`+1.94%` tok/s)
+- feed_forward: `-7.36%` latency
+- full block: `-2.78%` latency
+
+### Decision
+- Keep `LOCAL=16` for these three dense Q4 shapes.
+
+## Retry pass (noise reduction): DSL schedule candidates (2026-02-12)
+
+### Retried with stronger settings
+- Command shape: `bench_block.py --model glm-4.7:flash-unsloth-Q4_0`
+- Sequential only, with `BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0`.
+
+### A/B 1 (count=20, rounds=2)
+- Default (`QL_DSL_MOE_LOCAL_3072_2048=8`):
+  - decode stack median: `32.76 ms`
+  - decode proxy: `~30.5 tok/s`
+- Candidate (`QL_DSL_MOE_LOCAL_3072_2048=4, QL_DSL_MOE_GROUP_3072_2048=16`):
+  - decode stack median: `32.61 ms`
+  - decode proxy: `~30.7 tok/s`
+- Outcome: small decode win (`~0.46%`), but FF/full medians not clearly better.
+
+### A/B 2 (count=10, rounds=2)
+- `QL_DSL_Q4_LINEAR_LOCAL=16` + candidate MoE setting above:
+  - decode stack median: `31.51 ms`
+  - decode proxy: `~31.7 tok/s`
+- This looked best in this retry batch, but still below MSL-path decode proxy.
+
+### Core feature added for fast iteration
+- `tinygrad/uop/spec.py`: allow `Ops.INDEX` with vectorized pointer source in linearized kernels.
+- Purpose: unblock upcasted schedules for this DSL custom kernel family.
+
+### Upcast trial after core feature (count=10, rounds=2)
+- `QL_DSL_Q4_LINEAR_UPCAST=2`:
+  - decode stack median: `32.53 ms`
+  - decode proxy: `~30.7 tok/s`
+- Outcome: stable and slightly better than default baseline, but not a step-change.
+
+### Current status
+- DSL improved and stabilized, but still materially behind MSL path (recent MSL decode proxy ~`36.6 tok/s` in same bench style).
+- Remaining gap is still reduction/codegen shape for dense Q4 and MoE kernels.
+
+## DSL iteration: re-test auto path + reduce-shape rewrite (2026-02-12, follow-up)
+
+### Goal
+- Continue DSL-vs-MSL work with the new spec/legalization changes.
+- Re-test the previously blocked auto-scheduled DSL path and then improve the hot Q4 dense kernel without MSL.
+
+### 1) Re-test: auto DSL schedule for `custom_q4_0_linear`
+- Baseline DSL (safe fixed opts):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 2 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - decode proxy: `30.47 tok/s` (same ballpark as recent)
+- Auto attempt:
+  - `... QL_DSL_Q4_LINEAR_AUTO=1 ...`
+  - still fails, now at Metal compile (not SPEC): invalid emitted source (`type-id cannot have a name`, pointer-indirection errors).
+- Conclusion:
+  - `Ops.INDEX(VECTORIZE(ptr), idx)` legalization in spec is not sufficient.
+  - Remaining blocker is renderer/linearizer output validity for upcasted/vectorized forms.
+
+### 2) Controlled schedule sweep (safe path)
+- `QL_DSL_Q4_LINEAR_LOCAL=16` and `=64` were both worse than local=32 for decode stack.
+- `QL_DSL_Q4_LINEAR_LOCAL_AXIS=1` is invalid for this kernel family (`KernelOptError: local is for globals`).
+
+### 3) Main DSL kernel rewrite (accepted)
+- Changed `custom_q4_0_linear` reduction body from one-byte/2-value steps to two-byte/4-value steps:
+  - reduce trip count: `bpr*16` -> `bpr*8`
+  - identical math mapping across lanes, correctness preserved (`max_diff` unchanged in microbench).
+- Representative bench:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 2 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - decode proxy improved: `30.40 -> 31.74 tok/s` (about +4.4%)
+  - full-block median improved: `2.43 ms -> 1.47 ms` in this run pair.
+
+### Notes
+- Kept GROUPTOP path opt-in only (`QL_DSL_Q4_LINEAR_GROUPTOP_2048_5120=1`) due observed numerical instability on that schedule.
+- Added inline comments in code to document why these choices exist and where instability remains.
+
+## DSL follow-up iteration: core blocker triage and safe gains (2026-02-12)
+
+### Retest: exact blocked path
+- Command:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 QL_DSL_Q4_LINEAR_AUTO=1 .venv2/bin/python bench_block.py 2 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Result:
+  - still fails in Metal codegen for upcasted/vectorized custom Q4 linear path.
+  - SPEC no longer fails first; now failing stage is renderer output/compile.
+
+### Root-cause inspection
+- Dumped pre-compile source for `custom_q4_0_linear_1_2048_5120` with `QL_DSL_Q4_LINEAR_UPCAST=2`.
+- Found malformed scalar/vector access in emitted C-style source (`(*(acc0+0)).x/.y` on scalar float and pointer-vector expressions).
+- Added cstyle cleanup rewrite to collapse `VECTORIZE(ptr, ptr, ...)` -> scalar ptr lanes (`tinygrad/renderer/cstyle.py`).
+- This moved the compile error forward but did not fully resolve upcast compile validity.
+
+### Accepted DSL change in this iteration
+- Kept two-byte reduction rewrite for `custom_q4_0_linear` only (dense Q4 path).
+- Representative DSL bench stayed improved:
+  - decode proxy around `31.3-31.7 tok/s` (vs ~30.4 baseline before this rewrite line).
+
+### Rejected in this iteration
+- Two-byte reduction rewrite for `custom_q4_0_mul_mat_id` (MoE Q4 expert):
+  - required changing group geometry, then regressed FF and did not improve decode.
+  - reverted to byte-wise original reduction + original group defaults.
+
+### Current status
+- DSL path improved but still behind MSL path on this machine.
+- Main blocker to a bigger DSL jump remains upcast/vectorized custom-kernel codegen legality for the dense Q4 hotspot.

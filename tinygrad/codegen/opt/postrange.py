@@ -154,6 +154,11 @@ class Scheduler:
       if self.reduceop is not None and (opt.op in {OptOps.GROUP, OptOps.GROUPTOP}):
         # We currently dont support a group within another rudece, TODO: fix if-contexts
         reduce = [u for u in self.ast.backward_slice if u.op is Ops.REDUCE and rng in merge_dicts([r.ranges for r in u.src[1:]])][0]
+        # GROUP/GROUPTOP currently assumes reduction axes are explicit RANGE UOps.
+        # If reduction domains are symbolic expressions (for example, after certain custom-kernel
+        # rewrites), grouping can produce numerically wrong schedules (missing/incorrect final combine).
+        # Reject these cases so auto-search keeps only correctness-safe opts.
+        check(all(r.op is Ops.RANGE for r in reduce.src[1:]), "group requires direct RANGE reduction axes")
         check(not any(u.arg[-1] in (AxisType.REDUCE, AxisType.UNROLL, AxisType.GROUP_REDUCE) for u in reduce.ranges),
           "cannot have a GROUP_REDUCE inside another reduce")
 
@@ -176,6 +181,10 @@ class Scheduler:
         check(not self.dont_use_locals, "can't use locals")
         check(rng.arg[-1] == AxisType.REDUCE, "group is for reduce")
       ret = self.shift_to(rng, amt, opt_to_at[opt.op], top=opt.op in {OptOps.GROUPTOP, OptOps.THREAD})
+      # NOTE: explicit GROUP_REDUCE structure checks are intentionally omitted here.
+      # Some valid custom-kernel rewrites legalize grouped domains in forms that don't
+      # preserve a direct REDUCE-src pattern, and a blanket check here can reject
+      # correctness-safe hand-tuned kernels.
     elif opt.op is OptOps.TC:
       check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps
       check(opt.axis is not None, "tensor core opts must have an axis")
