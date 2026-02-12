@@ -1038,3 +1038,103 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Decision
 - Keep `search2.py` and `bench_block.bench_mask` path for co-search workflow.
 - Next step: larger mask set + stronger repeats using `beam=4`, then validate top mask on full model.
+
+## Follow-up: stronger mask A/B (BEAM=4) + notes (2026-02-11)
+
+### Infrastructure notes captured
+- `search2.py` now supports general split-mask search over any module exposing:
+  - `SPLIT_POINTS` (optional names)
+  - `bench_mask(mask, iters, beam) -> ms`
+- `bench_block.py` now exports `SPLIT_POINTS` + `bench_mask(...)`.
+- Weight/block load behavior for this path:
+  - within one Python process: loaded once and reused across mask evaluations (via `_BENCH_MASK_CACHE`)
+  - across separate command invocations: each process loads once.
+
+### Stronger A/B command
+- Command run:
+  - `BEAM=4 .venv2/bin/python - <<'PY' ...`
+  - Compared masks: `0x00000` (baseline), `0x04000`, `0x10000`, `0x1c000`
+  - Each mask measured 5 times via `bench_mask(mask, iters=6, beam=4)`.
+
+### Results
+- `mask=0x00000`: vals `[25.74, 26.94, 27.41, 28.81, 27.45]`, median `27.41 ms` (`36.48 tok/s`)
+- `mask=0x04000`: vals `[27.10, 27.03, 26.90, 28.11, 27.23]`, median `27.10 ms` (`36.90 tok/s`)
+- `mask=0x10000`: vals `[26.90, 26.86, 27.33, 27.54, 27.77]`, median `27.33 ms` (`36.59 tok/s`)
+- `mask=0x1c000`: vals `[28.63, 28.86, 27.82, 32.71, 26.87]`, median `28.63 ms` (`34.92 tok/s`)
+
+### Interpretation
+- Best median in this run: `0x04000` (split only `ffn_shexp_gate_up`), small gain vs baseline:
+  - `27.41 -> 27.10 ms` (~`+1.1%` tok/s proxy)
+- `0x10000` is near-baseline.
+- `0x1c000` is unstable in this stronger test (large tail), not a keeper.
+- Conclusion: yes, we found a better mask in bench proxy, but it is a **small** win and needs full-model confirmation before keeping.
+
+## Follow-up: same stronger A/B with BEAM=2 (2026-02-11)
+
+### Setup
+- Same mask set and methodology as prior stronger run:
+  - masks: `0x00000`, `0x04000`, `0x10000`, `0x1c000`
+  - each measured 5 times via `bench_mask(mask, iters=6, beam=2)`
+
+### Results
+- `mask=0x00000`: vals `[26.62, 26.82, 28.53, 27.29, 27.78]`, median `27.29 ms` (`36.65 tok/s`)
+- `mask=0x04000`: vals `[28.13, 27.74, 28.05, 27.97, 28.37]`, median `28.05 ms` (`35.65 tok/s`)
+- `mask=0x10000`: vals `[28.02, 26.32, 28.37, 25.33, 28.32]`, median `28.02 ms` (`35.69 tok/s`)
+- `mask=0x1c000`: vals `[27.87, 27.97, 27.71, 27.91, 27.94]`, median `27.91 ms` (`35.82 tok/s`)
+
+### Interpretation
+- With `BEAM=2`, baseline fused mask `0x00000` is best among these candidates.
+- This differs from earlier `BEAM=4` run where split masks (`0x04000`/`0x10000`) looked best.
+- Reinforces coupling: split/fuse ranking depends strongly on opt search regime (`BEAM` depth and chosen opts).
+
+## Primitive-pipeline refactor pass (2026-02-11)
+
+### Goal
+- Move closer to llama.cpp-style decode structure without handwritten backend kernels:
+  - fixed MoE primitive pipeline in `mla.py`
+  - primitive `mul_mat_id` path for non-Q4 experts (Q5_K/Q6_K)
+  - minimal explicit split points, then co-search with BEAM.
+
+### Code changes
+- `tinygrad/apps/mla.py`
+  - Simplified `_attention` back to normal fused DSL (removed broad split instrumentation).
+  - `_feed_forward` now follows fixed pipeline:
+    - router -> `ffn_gate_up_exps(sel, h_norm)` -> `silu*up` -> `ffn_down_exps(sel, gated)` -> weighted combine -> + shared expert.
+  - Kept only 3 split points via `MLA_SPLIT_MASK`:
+    - bit 0: `ffn_moe_shared_boundary` (default ON via `getenv(..., 1)`)
+    - bit 1: `ffn_shexp_gate_up`
+    - bit 2: `ffn_shexp_down`
+- `tinygrad/apps/quantized.py`
+  - Extended decode-specialized opts helper to include `n_sel` in Q4 `mul_mat_id` scheduling.
+  - Added `custom_fp16_mul_mat_id` primitive (expert-id indexed gather+dot over cached expert weights).
+  - Added Q5_K/Q6_K expert path in `QuantizedExpertWeights.__call__`:
+    - build dequantized expert cache once (`_ensure_dequant_expert_cache`)
+    - run `Tensor.mul_mat_id(..., fxn=custom_fp16_mul_mat_id)` for selected experts.
+  - Keeps one primitive contract for expert paths; avoids materialized gathered intermediates in call-site DSL.
+- `bench_block.py`
+  - Updated split-point labels to the 3 focused boundaries above.
+
+### Validation
+- Syntax checks:
+  - `python3 -m py_compile tinygrad/apps/mla.py tinygrad/apps/quantized.py bench_block.py search2.py`
+- `bench_block` sanity:
+  - `BEAM=0 bench_block.py 12`:
+    - full block median `2.07 ms`
+    - decode stack median `26.01 ms` (`38.44 tok/s` proxy)
+    - feed_forward median `9.62 ms`
+  - `BEAM=2 bench_block.py 12`:
+    - full block median `1.13 ms`
+    - decode stack median `27.10 ms` (`36.90 tok/s` proxy)
+    - feed_forward median `11.04 ms`
+- Split/BEAM co-search on new 3-bit boundaries:
+  - `BEAM=2 search2.py --mode exhaustive --iters 6 --repeat 3`:
+    - best mask `0x5` median `25.624 ms`
+    - baseline `0x0` median `25.626 ms` (effectively tied)
+  - `BEAM=0 search2.py --mode exhaustive --iters 6 --repeat 3`:
+    - best mask `0x4` median `28.154 ms`
+    - baseline `0x0` median `28.440 ms`
+
+### Notes
+- Q5_K/Q6_K expert primitive path correctness smoke:
+  - zero-weight structured test matched fallback reference exactly for both types (`max_diff=0`).
+- Random-byte Q5_K/Q6_K blocks can produce NaNs in dequant reference itself; structured tests were used for reliable parity checks.

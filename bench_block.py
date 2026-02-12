@@ -22,9 +22,9 @@ from tinygrad.nn.state import GGML_QUANT_INFO
 
 DEFAULT_BENCH_MODEL = "glm-4.7:flash-unsloth-Q4_0"
 MLA_SPLIT_POINTS = [
-  "attn_norm", "attn_q_proj", "attn_kv_proj", "attn_q_cat", "attn_k_cache_view", "attn_scores", "attn_softmax",
-  "attn_ctx", "attn_out_proj", "ffn_norm", "ffn_gate_up_exps", "ffn_gated", "ffn_expert_out", "ffn_moe_combine",
-  "ffn_shexp_gate_up", "ffn_shexp_down", "ffn_moe_plus_shexp",
+  "ffn_moe_shared_boundary",
+  "ffn_shexp_gate_up",
+  "ffn_shexp_down",
 ]
 SPLIT_POINTS = MLA_SPLIT_POINTS
 
