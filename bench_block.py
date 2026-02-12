@@ -14,7 +14,7 @@ from tinygrad import Tensor, UOp, nn, Device
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import GlobalCounters, Context
 from tinygrad.engine.jit import TinyJit
-from tinygrad.apps.llm import models
+from tinygrad.apps.llm import Transformer, models
 from tinygrad.apps.mla import MLATransformerBlock, merge_gate_up_experts, merge_gate_up_shared_expert, load_mla_params_from_gguf
 from tinygrad.apps.quantized import QuantizedLinear, QuantizedExpertWeights
 from tinygrad.apps.rope import precompute_freqs_cis, load_yarn_params_from_gguf
@@ -68,6 +68,10 @@ class BenchCfg:
   num_blocks: int
   leading_dense_blocks: int
   expert_first_in_memory: bool
+  attn_q_a_type: int
+  attn_q_b_type: int
+  attn_kv_a_type: int
+  attn_out_type: int
   shexp_gate_type: int
   shexp_up_type: int
   shexp_down_type: int
@@ -100,6 +104,10 @@ def load_bench_cfg(model_name: str, max_context: int) -> BenchCfg:
 
   # Block 0 is dense in GLM; use block 1 to pick the representative MoE quantization types.
   block1_qtypes = {name: info[2] for name, info in quantized_tensors.items() if name.startswith("blk.1.")}
+  attn_q_a_type = block1_qtypes.get("blk.1.attn_q_a.weight", 2)
+  attn_q_b_type = block1_qtypes.get("blk.1.attn_q_b.weight", 2)
+  attn_kv_a_type = block1_qtypes.get("blk.1.attn_kv_a_mqa.weight", 2)
+  attn_out_type = block1_qtypes.get("blk.1.attn_output.weight", 2)
   shexp_gate_type = block1_qtypes.get("blk.1.ffn_gate_shexp.weight", 2)
   shexp_up_type = block1_qtypes.get("blk.1.ffn_up_shexp.weight", 2)
   shexp_down_type = block1_qtypes.get("blk.1.ffn_down_shexp.weight", 2)
@@ -124,6 +132,10 @@ def load_bench_cfg(model_name: str, max_context: int) -> BenchCfg:
     num_blocks=kv[f"{arch}.block_count"],
     leading_dense_blocks=mla["leading_dense_blocks"],
     expert_first_in_memory=expert_first,
+    attn_q_a_type=attn_q_a_type,
+    attn_q_b_type=attn_q_b_type,
+    attn_kv_a_type=attn_kv_a_type,
+    attn_out_type=attn_out_type,
     shexp_gate_type=shexp_gate_type,
     shexp_up_type=shexp_up_type,
     shexp_down_type=shexp_down_type,
@@ -183,11 +195,11 @@ def build_block(cfg: BenchCfg) -> MLATransformerBlock:
     mscale=cfg.mscale,
   )
 
-  # Attention linears -> Q4_0
-  block.attn_q_a = make_quantized_linear(cfg.q_lora_rank, cfg.dim, 2)
-  block.attn_q_b = make_quantized_linear(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank, 2)
-  block.attn_kv_a_mqa = make_quantized_linear(cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.dim, 2)
-  block.attn_output = make_quantized_linear(cfg.dim, cfg.n_heads * cfg.v_head_dim, 2)
+  # Attention linears -> match representative GGUF quantization types for this model family.
+  block.attn_q_a = make_quantized_linear(cfg.q_lora_rank, cfg.dim, cfg.attn_q_a_type)
+  block.attn_q_b = make_quantized_linear(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank, cfg.attn_q_b_type)
+  block.attn_kv_a_mqa = make_quantized_linear(cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.dim, cfg.attn_kv_a_type)
+  block.attn_output = make_quantized_linear(cfg.dim, cfg.n_heads * cfg.v_head_dim, cfg.attn_out_type)
 
   # Expert weights -> Q4_0
   block.ffn_gate_exps = make_q4_0_expert_weights(cfg.num_experts, cfg.moe_hidden_dim, cfg.dim, cfg.expert_first_in_memory)
@@ -224,6 +236,16 @@ def build_block(cfg: BenchCfg) -> MLATransformerBlock:
 
   return block
 
+def build_block_bank(cfg: BenchCfg, n_unique: int) -> list[MLATransformerBlock]:
+  return [build_block(cfg) for _ in range(max(1, n_unique))]
+
+def load_real_block_bank(model: str, cfg: BenchCfg, n_unique: int) -> list[MLATransformerBlock]:
+  model_src = models.get(model, model)
+  tmodel, _ = Transformer.from_gguf(Tensor.from_url(model_src), max_context=cfg.max_context, quantized=True, realize=False)
+  moe_blocks = tmodel.blk[cfg.leading_dense_blocks:]
+  if n_unique <= 0: return moe_blocks
+  return moe_blocks[:min(n_unique, len(moe_blocks))]
+
 def bench_full_block(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 20):
   x = Tensor.randn(1, 1, cfg.dim).cast(dtypes.float16).realize()
   v_sp = UOp.variable("start_pos", 0, cfg.max_context - 1)
@@ -258,20 +280,22 @@ def bench_full_block(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 20
   print(f"  → {1000/st['median']:.1f} blocks/s  (est. {est_tok_s:.1f} tok/s × {moe_blocks} MoE blocks)")
   return st["median"]
 
-def bench_decode_stack(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 8, decode_blocks: int | None = None,
+def bench_decode_stack(blocks: list[MLATransformerBlock], cfg: BenchCfg, n_iter: int = 8, decode_blocks: int | None = None,
                       quiet: bool = False, warmups: int = 2):
+  block0 = blocks[0]
   x = Tensor.randn(1, 1, cfg.dim).cast(dtypes.float16).realize()
   v_sp = UOp.variable("start_pos", 0, cfg.max_context - 1)
   moe_blocks = max(cfg.num_blocks - cfg.leading_dense_blocks, 1)
   n_blocks = moe_blocks if decode_blocks is None else decode_blocks
+  n_unique = len(blocks)
 
   @TinyJit
   def run_decode(x, start_pos):
-    for _ in range(n_blocks):
-      x = block(x, start_pos)
+    for i in range(n_blocks):
+      x = blocks[i % n_unique](x, start_pos)
     return x.contiguous()
 
-  if not quiet: print(f"\n── decode stack with JIT ({n_blocks} blocks, {n_iter} iterations) ──")
+  if not quiet: print(f"\n── decode stack with JIT ({n_blocks} blocks/{n_unique} unique, {n_iter} iterations) ──")
   out = run_decode(x, v_sp.bind(1)).realize()
   Device.default.synchronize()
   for i in range(warmups):
@@ -318,24 +342,26 @@ def bench_feed_forward(block: MLATransformerBlock, cfg: BenchCfg, n_iter: int = 
   print(f"  p10/p90: {st['p10']:.2f}/{st['p90']:.2f} ms  IQR: {st['iqr']:.2f} ms  MAD: {st['mad']:.2f} ms")
   return st["median"]
 
-def run_benchmark(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 20, rounds: int = 1) -> tuple[float, float, float]:
+def run_benchmark(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 20, rounds: int = 1,
+                 unique_blocks: int = 8, real_blocks: bool = True) -> tuple[float, float, float]:
   print(f"Loading GGUF metadata for {model}...")
   cfg = load_bench_cfg(model, max_context)
   print(
     f"Config: dim={cfg.dim} moe_hidden={cfg.moe_hidden_dim} experts={cfg.num_experts} x {cfg.num_experts_per_tok} "
     f"heads={cfg.n_heads} ctx={cfg.max_context} expert_first={cfg.expert_first_in_memory}"
   )
-  print("Building block with Q4_0 weights...")
-  # Setup kernels (rand/copy/init) are not decode hot path; skip BEAM here to keep iteration loop fast.
+  print("Building block bank...")
   with Context(BEAM=0):
-    block = build_block(cfg)
-  print(f"Block built. Device: {Device.DEFAULT}\n")
+    block_bank = load_real_block_bank(model, cfg, unique_blocks) if real_blocks else build_block_bank(cfg, unique_blocks)
+  block = block_bank[0]
+  mode = "real model blocks" if real_blocks else "synthetic blocks"
+  print(f"Block bank ready ({len(block_bank)} unique, {mode}). Device: {Device.DEFAULT}\n")
   full, decode, ff = [], [], []
   decode_iters = max(4, count // 4)
   for r in range(rounds):
     if rounds > 1: print(f"=== Round {r+1}/{rounds} ===")
     full.append(bench_full_block(block, cfg, count))
-    decode.append(bench_decode_stack(block, cfg, decode_iters))
+    decode.append(bench_decode_stack(block_bank, cfg, decode_iters))
     ff.append(bench_feed_forward(block, cfg, count))
     if rounds > 1 and r != rounds - 1: print()
   if rounds > 1:
@@ -360,7 +386,7 @@ def bench_mask(mask: int, iters: int = 8, beam: int = 0, model: str = DEFAULT_BE
   cfg, block = _get_cached_block(model, max_context)
   os.environ["MLA_SPLIT_MASK"] = str(mask)
   with Context(BEAM=beam):
-    return bench_decode_stack(block, cfg, n_iter=max(4, iters), quiet=True, warmups=1)
+    return bench_decode_stack([block], cfg, n_iter=max(4, iters), quiet=True, warmups=1)
 
 def run_fusion_search(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096, count: int = 16, passes: int = 2,
                       eps_ms: float = 0.10):
@@ -377,7 +403,7 @@ def run_fusion_search(model: str = DEFAULT_BENCH_MODEL, max_context: int = 4096,
 
   def measure(mask: int) -> float:
     os.environ["MLA_SPLIT_MASK"] = str(mask)
-    t = bench_decode_stack(block, cfg, decode_iters, quiet=True, warmups=1)
+    t = bench_decode_stack([block], cfg, decode_iters, quiet=True, warmups=1)
     print(f"  mask=0x{mask:05x} decode={t:.2f} ms ({1000/t:.2f} tok/s proxy)")
     return t
 
@@ -427,7 +453,7 @@ def run_fusion_beam_search(model: str = DEFAULT_BENCH_MODEL, max_context: int = 
   def measure(mask: int) -> float:
     os.environ["MLA_SPLIT_MASK"] = str(mask)
     with Context(BEAM=beam_amt):
-      t = bench_decode_stack(block, cfg, decode_iters, quiet=True, warmups=1)
+      t = bench_decode_stack([block], cfg, decode_iters, quiet=True, warmups=1)
     print(f"  mask=0x{mask:05x} decode={t:.2f} ms ({1000/t:.2f} tok/s proxy)")
     return t
 
@@ -479,10 +505,12 @@ if __name__ == "__main__":
   parser.add_argument("--fusion_beam_search", action="store_true", help="Greedy 1-bit split/fuse search with BEAM inside each candidate")
   parser.add_argument("--beam_amt", type=int, default=4, help="BEAM width for --fusion_beam_search")
   parser.add_argument("--fusion_steps", type=int, default=4, help="Max greedy neighbor steps for --fusion_beam_search")
+  parser.add_argument("--unique_blocks", type=int, default=8, help="Number of unique blocks in decode-stack proxy")
+  parser.add_argument("--real_blocks", type=int, choices=[0, 1], default=1, help="Use actual loaded model blocks (1) or synthetic blocks (0)")
   args = parser.parse_args()
   if args.fusion_beam_search:
     run_fusion_beam_search(args.model, args.max_context, args.count, args.beam_amt, args.fusion_steps, args.fusion_eps_ms)
   elif args.fusion_search:
     run_fusion_search(args.model, args.max_context, args.count, args.fusion_passes, args.fusion_eps_ms)
   else:
-    run_benchmark(args.model, args.max_context, args.count, args.rounds)
+    run_benchmark(args.model, args.max_context, args.count, args.rounds, args.unique_blocks, bool(args.real_blocks))

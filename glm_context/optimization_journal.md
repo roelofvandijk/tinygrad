@@ -1138,3 +1138,254 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 - Q5_K/Q6_K expert primitive path correctness smoke:
   - zero-weight structured test matched fallback reference exactly for both types (`max_diff=0`).
 - Random-byte Q5_K/Q6_K blocks can produce NaNs in dequant reference itself; structured tests were used for reliable parity checks.
+
+## Q4 MoE raw MSL prototype (llama.cpp-style) (2026-02-12)
+
+### Goal
+- Build a standalone, correct, fast Metal kernel for decode MoE Q4_0 `mul_mat_id`
+  using llama.cpp-style tricks, then compare against current hot kernels.
+
+### Kernel design
+- `ushort` packed reads (2 bytes -> 4 q4 values).
+- mask/scale unpack (`1`, `1/16`, `1/256`, `1/4096`) + `-8*scale` bias (llama-style).
+- reduction via `simd_sum` + one cross-simdgroup combine, not full tree barriers.
+- one threadgroup per `(token_slot, out_feature)` and expert-id row selection in-kernel.
+
+### Important correctness finding
+- Initial validation against `custom_q4_0_mul_mat_id` was misleading on synthetic random blocks:
+  - with decode-specialized opts active (`N=4, O=3072, I=2048`), custom path can diverge
+    heavily from pure math on random packed values.
+- Switched validation to pure tensor-math reference:
+  - `scale[sel] * ((lo-8)*x_lo + (hi-8)*x_hi)` then reduce over `I`.
+- Current MSL prototype matches math within fp16/reduction-order tolerance (`max_abs_diff ~ 0.5`).
+
+### Commands
+- MSL microbench:
+  - `BEAM=0 .venv2/bin/python tinygrad/apps/bench_q4_moe_msl.py --iters 40 --threads 64`
+- Thread sweep:
+  - `BEAM=0 .venv2/bin/python - <<'PY' ... run_msl_kernel(...) ... PY`
+- Real pipeline kernel timing snapshot:
+  - `BEAM=0 DEBUG=2 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+
+### Results (representative)
+- Raw MSL kernel (math-checked):
+  - gate/up shape (`N=4,O=3072,I=2048`): ~`99-106 us` median in repeated runs.
+  - down shape (`N=4,O=2048,I=1536`): ~`69 us` median (stable in isolated repeats).
+- Current tinygrad decode hot-kernel timings from `bench_block DEBUG=2`:
+  - `custom_q4_0_mul_mat_id_4_3072_2048`: ~`144-147 us`.
+  - `custom_q4_0_mul_mat_id_4_2048_1536`: ~`72-80 us`.
+
+### Interpretation
+- The raw MSL prototype is a real kernel-level win candidate for gate/up
+  (roughly `1.4x` faster than current hot kernel in this snapshot).
+- Down kernel is near-parity to mild win depending on launch shape.
+- Main remaining gap is integration: benchmark script speed does not automatically
+  translate to model tok/s until tinygrad can schedule/dispatch this path cleanly.
+
+## Env-var integration trial: `QL_MOE_MSL=1` with `CompiledRunner` pattern (2026-02-12)
+
+### Goal
+- Wire raw Q4 MoE MSL path into runtime behind env var, using the old `CompiledRunner`/`ExecItem`
+  capture pattern (same style as deleted `metal_q4k.py`) so it can participate in TinyJit capture.
+
+### Code
+- Added `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/q4_moe_msl.py`
+  - `Q4MoEMSLRunner(CompiledRunner)` + cached source compile/runtime.
+  - `q4_moe_mul_mat_id_msl(x, scale, packed, sel)` launches MSL via `ExecItem(..., prg=runner)`.
+- Updated `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/quantized.py`
+  - Q4 expert path now uses MSL when `QL_MOE_MSL=1` on Metal; otherwise existing `mul_mat_id` path.
+
+### Correctness check
+- Command:
+  - `BEAM=0 .venv2/bin/python - <<'PY' ... q4_moe_mul_mat_id_msl vs pure tensor math ... PY`
+- Result:
+  - `max_abs_diff 0.5` (same fp16/reduction-order tolerance as prototype).
+
+### Bench smoke A/B (`bench_block.py`, same command, sequential)
+- MSL env:
+  - `BEAM=0 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - full block median: `2.61 ms`
+  - decode stack median: `38.30 ms` (`26.11 tok/s` proxy)
+  - feed_forward median: `11.79 ms`
+- Baseline:
+  - `BEAM=0 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - full block median: `2.03 ms`
+  - decode stack median: `25.25 ms` (`39.60 tok/s` proxy)
+  - feed_forward median: `9.09 ms`
+
+### DEBUG=2 confirmation
+- Command:
+  - `BEAM=0 QL_MOE_MSL=1 DEBUG=2 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+- New kernel is active (`q4_moe_mul_mat_id_msl_4_3072_2048`, `q4_moe_mul_mat_id_msl_4_2048_1536`), but observed times are high in pipeline:
+  - gate/up: ~`209-214 us`
+  - down: ~`125-130 us`
+
+### Conclusion
+- Keep as opt-in debug path only (env-var off by default).
+- Rejected as performance path in current integration form.
+- Key insight: `CompiledRunner` wiring alone is not sufficient; the in-pipeline kernel is much slower than the isolated prototype and harms end-to-end decode.
+
+## MSL crash fix + verification pass (`PYTHONPATH=.`) (2026-02-12)
+
+### Goal
+- Fix the `QL_MOE_MSL=1` runtime crash (`AssertionError must be BUFFER Ops.CAST`) and re-verify whether MSL is faster.
+
+### Code
+- Updated `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/q4_moe_msl.py`:
+  - Added explicit buffer-identity checks for `x/scale/packed/sel` with clear `RuntimeError` messages instead of raw internal assert.
+- Updated `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/quantized.py`:
+  - In Q4 env-var branch, call MSL only when `x_fp16` and `sel_flat` already have buffer identity.
+  - Otherwise, clean fallback to existing `custom_q4_0_mul_mat_id` path.
+
+### Validation commands
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python tinygrad/apps/bench_q4_moe_msl.py --mode like-for-like --iters 6 --warmup 3 --decode-warmup 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+- `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+- `PYTHONPATH=. BEAM=0 DEBUG=2 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0" | rg "q4_moe_mul_mat_id_msl|custom_q4_0_mul_mat_id"`
+
+### Results
+- Like-for-like (real model-loaded tensors):
+  - gate/up custom: `470.60 us` median
+  - gate/up MSL: `303.37 us` median (`1.55x` faster)
+  - down custom: `313.85 us` median
+  - down MSL: `278.88 us` median (`1.13x` faster)
+- `bench_block` smoke A/B (1-iter quick pass):
+  - baseline decode proxy: `35.96 tok/s`
+  - `QL_MOE_MSL=1` decode proxy: `34.18 tok/s`
+  - no crash in either run.
+- DEBUG=2 grep confirms env-var run currently executes `custom_q4_0_mul_mat_id_*` kernels (fallback path), not `q4_moe_mul_mat_id_msl_*`.
+
+### Interpretation
+- MSL kernel itself is still faster in like-for-like A/B when inputs are already concrete buffers.
+- In current full decode graph shape, inputs often arrive as lazy non-buffer-identity UOps; the new guard correctly falls back, so the env-var path is safe but not yet a model-speedup path.
+- Next integration work should make MSL callable from lazy graphs (or introduce an intentional boundary that pays for itself), rather than forcing per-call materialization.
+
+## Forced MSL wiring in full decode + full model A/B (2026-02-12)
+
+### Goal
+- Make `QL_MOE_MSL=1` truly execute `q4_moe_mul_mat_id_msl` in full decode (not fallback), then measure full model tok/s.
+
+### Code
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/quantized.py`
+  - In Q4 env-var branch, materialize dynamic inputs needed by external runner:
+    - `x_msl = x_fp16.contiguous().realize()` when `x_fp16` is not buffer-identity.
+    - `sel_msl = sel_flat.cast(int)` if needed, then `contiguous().realize()` when not buffer-identity.
+  - Then call `q4_moe_mul_mat_id_msl(x_msl, scale, packed, sel_msl)` directly.
+
+### Wiring verification
+- Command:
+  - `PYTHONPATH=. BEAM=0 DEBUG=2 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0" | rg "q4_moe_mul_mat_id_msl|custom_q4_0_mul_mat_id"`
+- Result:
+  - `q4_moe_mul_mat_id_msl_4_3072_2048` and `q4_moe_mul_mat_id_msl_4_2048_1536` are now emitted repeatedly in decode path.
+  - This confirms env-var path is truly wired in for real decode.
+
+### Full model benchmark (sequential)
+- Baseline:
+  - `PYTHONPATH=. BEAM=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - steady decode lines: `24.98`, `24.17`, `23.96`, `24.95`, `23.41` tok/s.
+- Forced MSL:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - steady decode lines: `18.17`, `18.30`, `18.01`, `18.12`, `18.13`, `18.53` tok/s.
+
+### Conclusion
+- MSL path is now truly wired in and active in full decode.
+- End-to-end full model performance regresses materially (`~24-25 tok/s` -> `~18 tok/s`).
+- Likely reason: per-call materialization boundaries needed by the external runner are expensive enough to outweigh kernel-level wins.
+
+## MSL integration v2: remove explicit realize boundaries via CALL lowering (2026-02-12)
+
+### Goal
+- Keep MSL expert kernel in graph execution (no manual `.contiguous().realize()` in `quantized.py`) so dependencies are scheduled naturally.
+
+### Code
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/quantized.py`
+  - `QL_MOE_MSL=1` now dispatches through `Tensor.mul_mat_id(..., fxn=custom_q4_0_mul_mat_id_msl)`.
+  - Removed explicit input materialization from model path.
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/q4_moe_msl.py`
+  - Added `custom_q4_0_mul_mat_id_msl(out,x,scale,packed,sel)` that returns a SINK-tagged custom AST with shape metadata.
+  - Added `lower_q4_moe_msl_ast(...)` to return cached `Q4MoEMSLRunner` from that AST.
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/engine/realize.py`
+  - Added targeted lowerer hook for SINK+CUSTOM tag `q4_moe_mul_mat_id_msl` before generic SINK lowering.
+
+### Validation
+- Compile checks:
+  - `PYTHONPATH=. .venv2/bin/python -m py_compile tinygrad/apps/quantized.py tinygrad/apps/q4_moe_msl.py tinygrad/engine/realize.py`
+- Representative bench A/B (sequential):
+  - Baseline: `PYTHONPATH=. BEAM=0 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - MSL v2: `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Kernel presence check:
+  - `PYTHONPATH=. BEAM=0 DEBUG=2 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0" | rg "q4_moe_mul_mat_id_msl|custom_q4_0_mul_mat_id"`
+
+### Results
+- Baseline decode proxy: `36.89 tok/s`.
+- MSL v2 decode proxy: `32.88 tok/s` (still slower).
+- DEBUG=2 confirms MSL kernels are active in decode (`q4_moe_mul_mat_id_msl_4_3072_2048`, `q4_moe_mul_mat_id_msl_4_2048_1536`).
+
+### Interpretation
+- Removing explicit `.realize()` boundaries was necessary and fixed correctness/integration cleanliness.
+- But even with in-graph lowering, current MSL kernel schedule still underperforms end-to-end vs tuned DSL/custom path on this workload.
+- Next work must target kernel quality/launch strategy itself (or downstream interaction), not just integration plumbing.
+
+## Representativeness gap and improved bench_block mode (2026-02-12)
+
+### Why this was done
+- We observed cases where `bench_block` predicted big gains that did not fully appear in full model tok/s.
+- Goal: make `bench_block` more representative and quantify remaining gap.
+
+### Code changes
+- `/Users/rvd/src/rvd/tinygrad/bench_block.py`
+  - Added `--real_blocks` mode (default on): load actual model MoE blocks via `Transformer.from_gguf(..., quantized=True, realize=False)`.
+  - Added `--unique_blocks` decode-bank size (default `8`) and cycle through multiple unique blocks in decode stack.
+  - Switched attention quant types in synthetic build path to GGUF-matched types from block 1 metadata.
+
+### Measured deltas
+- Full model (latest MSL integration, same code):
+  - baseline steady decode ~`26.21 tok/s` median
+  - `QL_MOE_MSL=1` steady decode ~`25.67 tok/s` median
+  - net ~`-2%` (near parity/slight regression)
+- Old synthetic-ish bench_block (`--real_blocks 0`, 8 unique synthetic blocks):
+  - baseline `32.91 tok/s` proxy
+  - MSL `39.89 tok/s` proxy
+  - net `+21%` (too optimistic)
+- New real-block bench_block (`--real_blocks 1 --unique_blocks 8`):
+  - baseline `27.26 tok/s` proxy
+  - MSL `29.93 tok/s` proxy
+  - net `+9.8%`
+
+### Interpretation
+- `bench_block` is now much closer in absolute tok/s and less optimistic than before.
+- Remaining gap indicates decode-stack-only proxy still misses full-model effects (non-MoE kernels, token pipeline interactions, cache/ICB dynamics across full graph).
+- There is real kernel-level signal in MSL, but current end-to-end integration still leaves gains on the table in full model.
+
+## MoE combine and weighting rewrite (accepted, 2026-02-12)
+
+### Goal
+- Reduce non-custom MoE overhead in decode by replacing generic reduction and moving probability weighting earlier where math permits.
+
+### Code
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/mla.py`
+  - Replaced `sum(axis=2)` MoE combine with explicit adds when `num_experts_per_tok == 4` (decode default), fallback to sum for other K.
+  - Moved expert probability weighting before down projection:
+    - old: `expert_out = down(gated)`, then `expert_out * probs`
+    - new: `expert_out = down(gated * probs)`, then combine experts
+  - Keeps math equivalent because down projection is linear.
+
+### Bench-block validation (sequential)
+- Commands:
+  - `PYTHONPATH=. BEAM=0 .venv2/bin/python bench_block.py 3 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 .venv2/bin/python bench_block.py 3 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Results on current revision:
+  - without MSL: decode proxy `31.45 tok/s`
+  - with MSL: decode proxy `34.56 tok/s`
+
+### Full model validation (sequential)
+- Commands:
+  - `PYTHONPATH=. BEAM=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- Steady decode lines:
+  - baseline: `25.84`, `26.69`, `26.58`, `28.29`, `27.27` tok/s
+  - +MSL: `25.92`, `28.37`, `30.22`, `29.85`, `29.84` tok/s
+
+### Conclusion
+- This rewrite is a real end-to-end win.
+- Current best observed steady-state is ~`30 tok/s` with `QL_MOE_MSL=1` on this revision.
