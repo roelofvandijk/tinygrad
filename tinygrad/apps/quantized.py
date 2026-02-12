@@ -131,8 +131,10 @@ def _q4_0_linear_opts(n_rows:int, out_features:int, in_features:int):
   # These are intentionally fixed (no env tuning path) so runtime behavior is deterministic.
   if n_rows == 1 and out_features == 2048 and in_features == 5120:
     # Explicit REDUCE form in custom_q4_0_linear makes grouped-reduce legal and correct here.
-    # This recovers lane-parallel reduction speed on the hottest dense Q4 decode kernel.
-    return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUPTOP, 1, 4))
+    # For the decode-hot 1x2048x5120 shape, smaller LOCAL (8) with GROUPTOP(4) gave better
+    # end-to-end latency than LOCAL(16) in our microbench A/B, while keeping numerical parity.
+    # This is currently the fastest known DSL schedule for this kernel family.
+    return (Opt(OptOps.LOCAL, 0, 8), Opt(OptOps.GROUPTOP, 1, 4))
   if n_rows == 1 and out_features == 5120 and in_features == 768:
     return (Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUP, 1, 8))
   if n_rows == 1 and out_features == 768 and in_features == 2048:
