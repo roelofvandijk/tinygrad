@@ -1389,3 +1389,87 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Conclusion
 - This rewrite is a real end-to-end win.
 - Current best observed steady-state is ~`30 tok/s` with `QL_MOE_MSL=1` on this revision.
+
+## DSL primitive boundary A/B for MoE matmul-id (2026-02-12)
+
+### Hypothesis
+- `mul_mat_id` as a first-class primitive boundary (CALL to SINK/KernelInfo) should outperform a loose DSL composition that exposes gather+dequant+reduce tensors.
+
+### A/B setup
+- A (boundary): existing Q4 expert path in `QuantizedExpertWeights.__call__` using:
+  - `Tensor.mul_mat_id(..., fxn=custom_q4_0_mul_mat_id)` (or MSL variant under env).
+- B (loose): temporary rewrite to:
+  - `scale = _q4_0_scale[sel]`, `packed = _q4_0_packed[sel]`,
+  - unpack/dequant in Tensor DSL,
+  - reduce with `.sum(axis=-1)`.
+- Then restore A.
+
+### Commands
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python bench_block.py 3 --model "glm-4.7:flash-unsloth-Q4_0"`
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 8`
+
+### Results
+- `bench_block` decode proxy:
+  - A boundary: `33.75 tok/s`
+  - B loose: `28.92 tok/s`
+  - delta: boundary is ~`+16.7%` faster.
+- Full model (`--benchmark 8`) was consistent with boundary being at least not worse and generally slightly better in steady rows, but with much smaller delta than bench proxy.
+
+### Conclusion
+- Yes: the SINK/CALL-style primitive boundary translates directly to DSL and is materially faster for the MoE step than loose gather/dequant/reduce composition.
+- Keep the primitive boundary path as production default.
+
+## Big trial: llama-style online dequant for shared Q5_K/Q6_K linears (accepted, 2026-02-12)
+
+### Why this was selected
+- Recent profile data showed shared-expert linears are a major non-MoE hotspot:
+  - `ffn_gate_up_shexp`: Q5_K `(3072, 2048)` in 46 MoE blocks/token.
+  - `ffn_down_shexp`: Q6_K `(2048, 1536)` in 46 MoE blocks/token.
+- Existing path dequantized full weights to fp16 cache (`x.linear(w.T)`), which is bandwidth-heavy versus online dequant.
+
+### Code
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/qk_linear_msl.py`
+  - Added two Metal runners with SINK/CUSTOM lowering tags:
+    - `q5_k_linear_msl` for Q5_K shared gate/up.
+    - `q6_k_linear_msl` for Q6_K shared down.
+  - Kernels are decode-oriented matvecs with in-kernel dequant (llama-style).
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/engine/realize.py`
+  - Added lowerer dispatch for tags:
+    - `"q5_k_linear_msl"`, `"q6_k_linear_msl"`.
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/quantized.py`
+  - Added `_blocks_cache` and `_ensure_blocks_cache` to keep raw quant blocks on device.
+  - Added `QL_SHEXP_MSL=1` path in `QuantizedLinear.__call__` for:
+    - Q5_K `(3072, 2048)`.
+    - Q6_K `(2048, 1536)`.
+  - Uses `Tensor.custom_kernel(...)` with the new SINK/CUSTOM lowering.
+- `/Users/rvd/src/rvd/tinygrad/tinygrad/apps/mla.py`
+  - `merge_gate_up_shared_expert` now initializes `merged._blocks_cache = None` for `QuantizedLinear.__new__` merged modules.
+
+### Correctness checks
+- Deterministic and random finite-block A/B:
+  - `QL_SHEXP_MSL=0` vs `QL_SHEXP_MSL=1` outputs match exactly (`max_abs_diff = 0`) for both Q5_K and Q6_K target shapes.
+
+### Bench-block A/B (sequential)
+- Commands:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 3 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python bench_block.py 3 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Results:
+  - baseline decode proxy: `34.04 tok/s`
+  - +Q5/Q6 shared MSL decode proxy: `39.81 tok/s`
+  - delta: `+16.9%`
+
+### Full model A/B (sequential, expensive confirmation)
+- Commands:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- Steady decode lines (tokens 6-10):
+  - baseline: `28.24`, `28.28`, `27.96`, `28.03`, `28.82` tok/s
+  - +Q5/Q6 shared MSL: `30.99`, `31.34`, `30.43`, `30.22`, `30.95` tok/s
+- Approx steady average:
+  - baseline: `~28.27 tok/s`
+  - +Q5/Q6 shared MSL: `~30.79 tok/s`
+  - delta: `+8.9%`
+
+### Notes
+- DEBUG=2 confirms new kernels are active (`q5_k_linear_msl_*`, `q6_k_linear_msl_*`).
+- `q6_k_linear_msl` shows occasional spikes in debug traces; despite that, end-to-end tok/s still improved in both proxy and full model A/B.

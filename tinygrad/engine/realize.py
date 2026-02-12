@@ -130,6 +130,9 @@ def lower_msl_sink_ast(ctx:list[Buffer], ast:UOp):
   if len(ast.src[0].arg) > 0 and ast.src[0].arg[0] == "q4_moe_mul_mat_id_msl":
     from tinygrad.apps.q4_moe_msl import lower_q4_moe_msl_ast
     return lower_q4_moe_msl_ast(ast, ctx[0].device)
+  if len(ast.src[0].arg) > 0 and ast.src[0].arg[0] in ("q5_k_linear_msl", "q6_k_linear_msl"):
+    from tinygrad.apps.qk_linear_msl import lower_qk_linear_msl_ast
+    return lower_qk_linear_msl_ast(ast, ctx[0].device)
   return None
 
 si_lowerer = PatternMatcher([

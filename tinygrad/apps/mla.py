@@ -185,6 +185,7 @@ def merge_gate_up_shared_expert(block: MLATransformerBlock) -> None:
     merged._q4_0_blocks = None
     merged._q4_0_scale = None
     merged._q4_0_packed = None
+    merged._blocks_cache = None
     block.ffn_gate_up_shexp = merged
   else:
     # Regular Linear: concatenate weights

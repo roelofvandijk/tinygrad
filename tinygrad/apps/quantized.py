@@ -102,7 +102,7 @@ def custom_fp16_mul_mat_id(out:UOp, x:UOp, weights:UOp, sel:UOp) -> UOp:
 
 class QuantizedLinear:
   __slots__ = ('blocks', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_dequant_fn', '_dequant_cache', '_q4_0_blocks',
-               '_q4_0_scale', '_q4_0_packed')
+               '_q4_0_scale', '_q4_0_packed', '_blocks_cache')
   def __init__(self, blocks:Tensor, shape:tuple[int, int], ggml_type:int):
     self.blocks = blocks
     self.out_features, self.in_features = shape
@@ -112,6 +112,7 @@ class QuantizedLinear:
     self._q4_0_blocks = None
     self._q4_0_scale = None
     self._q4_0_packed = None
+    self._blocks_cache = None
 
   def _ensure_dequant_cache(self, device: str|tuple[str, ...]) -> None:
     if self._dequant_cache is not None and self._dequant_cache.device == device: return
@@ -125,6 +126,11 @@ class QuantizedLinear:
     blocks = self.blocks.to(device) if self.blocks.device != device else self.blocks
     bpr = self.in_features // 32
     self._q4_0_blocks = blocks.reshape(self.out_features, bpr, 18)
+
+  def _ensure_blocks_cache(self, device: str|tuple[str, ...]) -> None:
+    if self._blocks_cache is not None and self._blocks_cache.device == device: return
+    blocks = self.blocks.to(device) if self.blocks.device != device else self.blocks
+    self._blocks_cache = blocks.contiguous().realize()
 
   def _ensure_q4_0_separated(self, device: str|tuple[str, ...]) -> None:
     """Pre-separate Q4_0 scale and packed data for better memory coalescing."""
@@ -163,6 +169,23 @@ class QuantizedLinear:
       lo = packed.bitwise_and(0xF).cast(dtypes.float16) - 8.0
       hi = (packed.rshift(4)).cast(dtypes.float16) - 8.0
       return (scale * (lo * x_lo + hi * x_hi)).reshape(-1, O, bpr * 16).sum(axis=-1).reshape(*x.shape[:-1], O)
+    use_shexp_msl = getenv("QL_SHEXP_MSL", 0) == 1 and isinstance(x.device, str) and x.device.startswith("METAL")
+    if use_shexp_msl and self.ggml_type == 13 and self.out_features == 3072 and self.in_features == 2048:
+      from tinygrad.apps.qk_linear_msl import custom_q5_k_linear_msl
+      self._ensure_blocks_cache(x.device)
+      x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
+      x_flat = x_fp16.reshape(-1, self.in_features)
+      out = Tensor.empty(x_flat.shape[0], self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+      out = Tensor.custom_kernel(out, x_flat, self._blocks_cache, fxn=custom_q5_k_linear_msl)[0]
+      return out.reshape(*x.shape[:-1], self.out_features)
+    if use_shexp_msl and self.ggml_type == 14 and self.out_features == 2048 and self.in_features == 1536:
+      from tinygrad.apps.qk_linear_msl import custom_q6_k_linear_msl
+      self._ensure_blocks_cache(x.device)
+      x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
+      x_flat = x_fp16.reshape(-1, self.in_features)
+      out = Tensor.empty(x_flat.shape[0], self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+      out = Tensor.custom_kernel(out, x_flat, self._blocks_cache, fxn=custom_q6_k_linear_msl)[0]
+      return out.reshape(*x.shape[:-1], self.out_features)
     self._ensure_dequant_cache(x.device)
     return x.linear(self._dequant_cache.T, None)
 
