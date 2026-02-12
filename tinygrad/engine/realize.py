@@ -124,7 +124,16 @@ def get_runner(device:str, ast:UOp) -> CompiledRunner:
 # **************** lowering functions ****************
 
 # NOTE: ctx is the buffers
+def lower_msl_sink_ast(ctx:list[Buffer], ast:UOp):
+  if ast.op is not Ops.SINK: return None
+  if len(ast.src) != 1 or ast.src[0].op is not Ops.CUSTOM or not isinstance(ast.src[0].arg, tuple): return None
+  if len(ast.src[0].arg) > 0 and ast.src[0].arg[0] == "q4_moe_mul_mat_id_msl":
+    from tinygrad.apps.q4_moe_msl import lower_q4_moe_msl_ast
+    return lower_q4_moe_msl_ast(ast, ctx[0].device)
+  return None
+
 si_lowerer = PatternMatcher([
+  (UPat(Ops.SINK, name="ast"), lower_msl_sink_ast),
   (UPat((Ops.SINK, Ops.PROGRAM), name="sink"), lambda ctx,sink: get_runner(ctx[0].device, sink)),
   (UPat(Ops.BUFFER_VIEW), lambda ctx: ViewOp(ctx[0])),
   (UPat(Ops.COPY, name="copy"), lambda ctx,copy: (BufferXfer(ctx[0].nbytes, ctx[0].device, ctx[1].device) \

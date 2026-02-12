@@ -2,7 +2,6 @@ from __future__ import annotations
 import math, functools
 from tinygrad import Tensor, nn, UOp
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import getenv
 
 @functools.lru_cache(maxsize=8)
 def _topk_consts(n: int, k: int):
@@ -23,10 +22,6 @@ def _topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
   indices = (match * i_range).sum(-2).cast(dtypes.int)
   values = scores.gather(-1, indices)
   return values, indices
-
-def _maybe_split(x: Tensor, bit: int) -> Tensor:
-  # Decode fast path default: keep a single explicit MoE/shared boundary split (bit 0 on by default).
-  return x.contiguous() if ((getenv("MLA_SPLIT_MASK", 1) >> bit) & 1) else x
 
 class PerHeadWeights:
   def __init__(self, n_heads:int, dim1:int, dim2:int):
@@ -145,17 +140,21 @@ class MLATransformerBlock:
       gate_up = self.ffn_gate_up_exps(sel, h_norm)  # (B, T, K, 2*moe_hidden_dim)
       gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
       gated = gate.silu() * up
-      expert_out = self.ffn_down_exps(sel, gated)
-      moe_out = _maybe_split((expert_out * probs.unsqueeze(-1)).sum(axis=2) * self.expert_weights_scale, 0)
+      weighted_gated = gated * probs.unsqueeze(-1).cast(gated.dtype)
+      expert_out = self.ffn_down_exps(sel, weighted_gated)
+      if self.num_experts_per_tok == 4:
+        moe = expert_out[:, :, 0] + expert_out[:, :, 1] + expert_out[:, :, 2] + expert_out[:, :, 3]
+      else:
+        moe = expert_out.sum(axis=2)
+      moe_out = moe * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_up_shexp'):
-        # Keep shared expert branch separate from MoE branch by default.
-        shexp_gate_up = _maybe_split(self.ffn_gate_up_shexp(h_norm), 1)
+        shexp_gate_up = self.ffn_gate_up_shexp(h_norm)
         shexp_out_dim = shexp_gate_up.shape[-1] // 2
         shexp_gate, shexp_up = shexp_gate_up[..., :shexp_out_dim], shexp_gate_up[..., shexp_out_dim:]
-        shexp = _maybe_split(self.ffn_down_shexp(shexp_gate.silu() * shexp_up), 2)
+        shexp = self.ffn_down_shexp(shexp_gate.silu() * shexp_up)
         out = moe_out + shexp
       elif hasattr(self, 'ffn_gate_shexp'):
-        shexp = _maybe_split(self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm)), 2)
+        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
         out = moe_out + shexp
       else:
         out = moe_out

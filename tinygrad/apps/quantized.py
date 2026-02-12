@@ -223,7 +223,11 @@ class QuantizedExpertWeights:
       x_fp16 = x_flat.cast(dtypes.float16) if x_flat.dtype != dtypes.float16 else x_flat
       sel_flat = sel.reshape(-1)
       out = Tensor.empty(n_sel, self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
-      out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id)
+      if getenv("QL_MOE_MSL", 0) == 1 and isinstance(x_fp16.device, str) and x_fp16.device.startswith("METAL"):
+        from tinygrad.apps.q4_moe_msl import custom_q4_0_mul_mat_id_msl
+        out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id_msl)
+      else:
+        out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id)
       return out.reshape(B, T, K, self.out_features)
 
     # Q5_K/Q6_K expert path: keep primitive contract (expert-id indexed matmul) with dequantized expert cache.
