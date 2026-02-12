@@ -1886,3 +1886,38 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 - Notes:
   - Bench-block proxy improved and stabilized in the `~36.9 tok/s` band.
   - Full-model remains around low-31 tok/s range with expected run-to-run variance.
+
+## 2026-02-12: ideas2/ideas3 next-step validation
+
+- Reviewed `/glm_context/ideas2.md` and `/glm_context/ideas3.md` against current DSL path.
+- Confirmed highest remaining DSL gap is still dense Q4 shape `custom_q4_0_linear_1_2048_5120`.
+
+### Fast probes
+
+- `bench_q4_linear_dsl.py --case ffn_in --opts_mode auto`:
+  - median ~619.67us, max_diff=0.5
+- `bench_q4_linear_dsl.py --case ffn_in --opts_mode default`:
+  - median ~401.96us, max_diff=0.5
+- MoE primitive check (`bench_q4_moe_dsl.py --all --compare_msl`):
+  - gate_up: DSL faster than MSL in this sample (~328us vs ~401us)
+  - down: DSL slower than MSL (~316us vs ~282us)
+
+### Accepted change
+
+- File: `tinygrad/apps/quantized.py`
+- Shape-tuned dense Q4 schedule update for `(1,2048,5120)`:
+  - from `LOCAL(0,16)+GROUPTOP(1,4)`
+  - to   `LOCAL(0,8)+GROUPTOP(1,4)`
+- Rationale: microbench sweep found lower median on this hotspot while retaining numerical parity behavior.
+
+### End-to-end check (DSL path)
+
+- Command:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 2 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Before (recent anchor): decode proxy ~34.79 tok/s
+- After: decode proxy ~35.31 tok/s
+- Net: +0.52 tok/s on representative bench_block run.
+
+### Next high-impact idea (from ideas3 Tier 1)
+
+- Unblock fully legal auto-scheduled dense Q4 path for this kernel family by fixing vectorized reduction/legalization in core (`spec.py`, `linearizer.py`, `cstyle.py`) so we can safely beat fixed schedule defaults.

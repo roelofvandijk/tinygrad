@@ -91,6 +91,37 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # Q4_0 packed-dot GROUP: bitwise ops in reduce chain indicate dequant — MV can't match these, apply GROUP directly
   reduce_rngs = k.ranges_of(AxisType.REDUCE) if k.reduceop is not None else []
   reduce_product = prod(int(r.vmax+1) for r in reduce_rngs) if reduce_rngs else 0
+  kname = getattr(getattr(k.ast, "arg", None), "name", "")
+  is_custom_q4_linear = isinstance(kname, str) and kname.startswith("custom_q4_0_linear_")
+  has_q4_bitops = False
+  if k.reduceop is not None:
+    # Packed q4 dequant paths always carry shift/and in the reduce chain.
+    # We use this structural signal (instead of kernel name checks) to keep the heuristic generic.
+    has_q4_bitops = any(u.op in (Ops.SHR, Ops.AND) for u in k.reduceop.src[0].backward_slice)
+  # Dense q4 packed-dot custom kernel needs LOCAL+GROUPTOP together.
+  # Generic fallback below often picks GROUPTOP-only, which leaves this decode-hot kernel underutilized.
+  # custom_q4_0_linear can be factored into multiple reduce ranges in postrange, so handle len(reduce_rngs) >= 1.
+  if k.ren.has_local and is_custom_q4_linear and k.reduceop is not None and \
+    k.reduceop.arg[0] is Ops.ADD and reduce_product >= 256 and len(reduce_rngs) >= 1:
+    global_axes = k.axes_of(AxisType.GLOBAL)
+    if global_axes:
+      # Pick the widest global axis (decode-hot path: output dim) and parallelize it with LOCAL.
+      gaxis = max(global_axes, key=lambda i: k.full_shape[i])
+      gshape = k.full_shape[gaxis]
+      # Prefer larger factored reduce ranges first.
+      r_axes = sorted(range(len(reduce_rngs)), key=lambda i: int(reduce_rngs[i].vmax+1), reverse=True)
+      for lsz in [8, 16, 4, 32]:
+        if gshape % lsz != 0: continue
+        for raxis in r_axes:
+          rr = reduce_rngs[raxis]
+          for gsz in [4, 8, 16]:
+            if rr.src[0].divides(gsz) is None: continue
+            try:
+              tk = k.copy()
+              tk.apply_opt(Opt(OptOps.LOCAL, gaxis, lsz))
+              tk.apply_opt(Opt(OptOps.GROUPTOP, raxis, gsz))
+              return tk
+            except KernelOptError: pass
   if k.ren.has_local and k.ren.has_shared and k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and \
     reduce_product >= 256 and len(reduce_rngs) >= 2 and \
     any(int(r.vmax+1) == 16 for r in reduce_rngs):
