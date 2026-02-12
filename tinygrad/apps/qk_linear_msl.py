@@ -216,12 +216,9 @@ def _threads_for_qk(ggml_type:int, out_features:int, in_features:int) -> int:
   return base
 
 def _nr_for_qk(ggml_type:int, out_features:int, in_features:int) -> int:
-  base = getenv("QL_SHEXP_MSL_NR", 1)
-  if ggml_type == 13 and out_features == 3072 and in_features == 2048:
-    return getenv("QL_SHEXP_MSL_NR_3072_2048", base)
-  if ggml_type == 14 and out_features == 2048 and in_features == 1536:
-    return getenv("QL_SHEXP_MSL_NR_2048_1536", base)
-  return base
+  if ggml_type == 13 and out_features == 3072 and in_features == 2048: return 2
+  if ggml_type == 14 and out_features == 2048 and in_features == 1536: return 1
+  return 1
 
 @functools.lru_cache(maxsize=None)
 def _get_q5k_runner(device:str, n_rows:int, out_features:int, in_features:int) -> QKLinearMSLRunner:

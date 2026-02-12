@@ -258,6 +258,143 @@ Additional red flags seen in the BEAM trace:
 - Baseline path restored in `mla.py`:
   - `expert_out = ffn_down_exps(sel, gated)`
   - `out = (expert_out * probs.unsqueeze(-1)).sum(axis=2)`
+
+## Trial: `QL_SHEXP_MSL_NR_3072_2048=2` + `QL_SHEXP_MSL_NR_2048_1536=1` (Rejected)
+
+### Hypothesis
+- Per-shape `NR` override might be a better default than current shared-expert MSL `NR=1`.
+
+### A/B/A/B setup (sequential only)
+- Command A (default):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python bench_block.py 5 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Command B (override):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 QL_SHEXP_MSL_NR=1 QL_SHEXP_MSL_NR_3072_2048=2 QL_SHEXP_MSL_NR_2048_1536=1 .venv2/bin/python bench_block.py 5 --model "glm-4.7:flash-unsloth-Q4_0"`
+- Order: A -> B -> A -> B
+
+### Results
+- A1 decode proxy: `41.16 tok/s`
+- B1 decode proxy: `40.36 tok/s`
+- A2 decode proxy: `41.07 tok/s`
+- B2 decode proxy: `40.88 tok/s`
+
+### Conclusion
+- In this stronger sequential A/B/A/B, the override is consistently slower than default by about `0.2-0.8 tok/s`.
+- Keep default behavior as-is; do not promote this override to built-in default.
+
+## Full-model validation (current default)
+
+- Command:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- Result (steady decode region):
+  - `27.92, 31.66, 31.70, 32.42, 34.01, 31.38 tok/s`
+  - practical steady-state band in this run: roughly `31-34 tok/s`
+
+## Full-model A/B: default vs shared NR override
+
+- A (default):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - tok/s lines:
+    - `19.84, 30.73, 32.20, 32.91, 32.56`
+- B (shared override):
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 QL_SHEXP_MSL_NR=1 QL_SHEXP_MSL_NR_3072_2048=2 QL_SHEXP_MSL_NR_2048_1536=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - tok/s lines:
+    - `31.04, 33.89, 33.57, 33.63, 33.79, 33.74`
+
+Interpretation (single A/B pair):
+- Using the stable tail (`last 4`):
+  - default: `30.73, 32.20, 32.91, 32.56` (avg `32.10`)
+  - override: `33.57, 33.63, 33.79, 33.74` (avg `33.68`)
+- In this run, shared override is about `+1.58 tok/s` (~`+4.9%`) vs default.
+
+## Accepted: make winning shared-expert NR settings default
+
+### Change
+- File: `tinygrad/apps/qk_linear_msl.py`
+- Updated `_nr_for_qk` default behavior:
+  - Q5_K shared expert shape `(3072, 2048)`: default `NR=2`
+  - Q6_K shared expert shape `(2048, 1536)`: default `NR=1`
+- Env overrides remain available:
+  - global: `QL_SHEXP_MSL_NR`
+  - per-shape: `QL_SHEXP_MSL_NR_3072_2048`, `QL_SHEXP_MSL_NR_2048_1536`
+
+### Validation
+- Kernel-default check (`no NR env overrides`):
+  - `PYTHONPATH=. BEAM=0 DEBUG=2 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0"`
+  - Observed kernels:
+    - `q5_k_linear_msl_1_3072_2048_nr2`
+    - `q6_k_linear_msl_1_2048_1536_nr1`
+- Full-model smoke:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+  - tail decode in this run: about `29-32 tok/s` (one noisy run; use repeated full-model runs for tighter comparison).
+
+## Accepted: default NR for shared-expert MSL kernels
+
+- File: `tinygrad/apps/qk_linear_msl.py`
+- Change:
+  - `_nr_for_qk` now hardcodes:
+    - Q5_K `(3072, 2048)` -> `NR=2`
+    - Q6_K `(2048, 1536)` -> `NR=1`
+  - No env override path in this default mapping.
+
+## Big trial: dense Q4_0 MSL kernel for regular `QuantizedLinear`
+
+### Motivation from profile
+- Large non-custom Q4-related reduce kernels still consumed significant warm-up time.
+- Added dedicated MSL path to move dense Q4_0 off generic gather/dequant/reduce.
+
+### Implementation
+- New file: `tinygrad/apps/q4_linear_msl.py`
+  - custom tag + lowering runner for dense Q4_0 linear:
+    - `custom_q4_0_linear_msl`
+    - `lower_q4_linear_msl_ast`
+- Wiring:
+  - `tinygrad/engine/realize.py`: lowerer dispatch for `q4_0_linear_msl`
+  - `tinygrad/apps/quantized.py`: in Q4_0 packed-dot path, when `QL_MOE_MSL=1` on METAL:
+    - route to `Tensor.custom_kernel(..., fxn=custom_q4_0_linear_msl)`
+
+### Bench evidence
+- `bench_block.py 2` with `QL_MOE_MSL=1 QL_SHEXP_MSL=1`:
+  - observed decode proxy up to `43.51 tok/s` in one run
+  - repeated run in same state around `42.31 tok/s`
+- Kernel logs confirm usage:
+  - `q4_0_linear_msl_1_768_2048_nr1`
+  - `q4_0_linear_msl_1_5120_768_nr1`
+  - `q4_0_linear_msl_1_2048_5120_nr1`
+
+### Full model checks
+- Example run:
+  - `34.09, 34.82, 34.74, 35.07, 34.28 tok/s` (tail region)
+- Another run showed lower `~29-33 tok/s`, indicating variance/thermal/system noise remains high.
+
+## Rejected follow-up tuning
+
+- `q4_moe` NR tuning:
+  - `QL_MOE_MSL_NR_3072_2048=2` regressed decode proxy.
+  - `QL_MOE_MSL_NR_2048_1536=2` regressed decode proxy.
+- `q4_moe` threads:
+  - `QL_MOE_MSL_THREADS=64` was not better than baseline.
+- `q4_0_linear_msl` NR tuning:
+  - forcing `NR=2` for `(2048, 5120)` regressed.
+  - forcing `NR=2` globally regressed.
+
+## Post-change full-model samples (dense Q4 MSL enabled)
+
+- Command:
+  - `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+- Sample A tail:
+  - `29.72, 32.28, 33.49, 33.27, 33.05 tok/s`
+- Sample B tail:
+  - `30.71, 32.85, 34.49, 34.30, 34.79 tok/s`
+- Observation:
+  - still a noisy but roughly `33-35 tok/s` band in these samples; not near `45 tok/s` yet.
+
+## Current top blockers from latest profile (`profile_model.py`)
+
+- `q4_moe_mul_mat_id_msl_4_3072_2048_t32_nr1`: largest single kernel bucket.
+- `q4_moe_mul_mat_id_msl_4_2048_1536_t32_nr1`: second major MoE bucket.
+- `q4_0_linear_msl_1_2048_5120_nr1`: large dense Q4 bucket.
+- `q5_k_linear_msl_1_3072_2048_nr2` and `q6_k_linear_msl_1_2048_1536_nr1`: still significant.
+- Residual large reduce kernels remain (`r_9680_...`, `r_36_...`, `r_4_16_...`) and likely map to MLA/attention-side math that is still generic.
 - Latest check:
   - full block median: `1.80 ms`
   - feed_forward median: `18.88 ms`
@@ -1473,3 +1610,48 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Notes
 - DEBUG=2 confirms new kernels are active (`q5_k_linear_msl_*`, `q6_k_linear_msl_*`).
 - `q6_k_linear_msl` shows occasional spikes in debug traces; despite that, end-to-end tok/s still improved in both proxy and full model A/B.
+
+## DEBUG=6 kernel-source A/B: DSL vs MSL path (analysis, 2026-02-12)
+
+### Goal
+- Inspect generated kernels in `DEBUG=6`, compare DSL and MSL for the same representative run, and explain the performance gap.
+
+### Commands (sequential)
+- `PYTHONPATH=. BEAM=0 DEBUG=6 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0" > /tmp/bench_dsl_debug6.log 2>&1`
+- `PYTHONPATH=. BEAM=0 DEBUG=6 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python bench_block.py 1 --model "glm-4.7:flash-unsloth-Q4_0" > /tmp/bench_msl_debug6.log 2>&1`
+
+### High-level result
+- DSL (`QL_MOE_MSL=0`, `QL_SHEXP_MSL=0`): decode proxy `12.18 tok/s`.
+- MSL (`QL_MOE_MSL=1`, `QL_SHEXP_MSL=1`): decode proxy `37.78 tok/s`.
+
+### Kernel timing evidence
+- Q4 dense linear (same shape):
+  - DSL `custom_q4_0_linear_1_2048_5120`: median `~2416 us`.
+  - MSL `q4_0_linear_msl_1_2048_5120_nr1`: median `~98 us`.
+  - ~`24.7x` faster on this kernel.
+- Q4 dense linear (other shapes):
+  - `1x5120x768`: DSL `~886 us` vs MSL `~52 us` (~`17x`).
+  - `1x768x2048`: DSL `~391 us` vs MSL `~25 us` (~`15.7x`).
+- Q4 MoE expert kernel:
+  - DSL `custom_q4_0_mul_mat_id_4_3072_2048`: median `~294 us`.
+  - MSL `q4_moe_mul_mat_id_msl_4_3072_2048_t32_nr1`: median `~206 us` (~`1.43x`).
+- MSL-only shared expert kernels:
+  - `q5_k_linear_msl_1_3072_2048_nr2`: median `~92 us`.
+  - `q6_k_linear_msl_1_2048_1536_nr1`: median `~54 us`.
+
+### Source-level cause (from DEBUG=6)
+- DSL `custom_q4_0_linear_1_2048_5120` is effectively serial in-kernel over the full reduce domain:
+  - nested loops `for Ridx2_0 in 0..159` then `for Ridx2_1 in 0..15`.
+  - no `LOCAL/GROUP` opts applied (`opts_to_apply=()`).
+  - scale decode from two bytes to half appears inside the inner loop expression, so scale work is repeated many times.
+- MSL `q4_0_linear` uses explicit decode-specialized structure:
+  - `THREADS=32`, each lane processes `br = tid; br < BPR; br += THREADS`.
+  - per-block constants (`s`, `s16`, `s256`, `s4096`, `md`) are hoisted once per block.
+  - packed quant read as `ushort` (`j += 2`) to decode 4 nibbles per load.
+  - reduction uses `simd_sum(acc)`; one lane writes output.
+
+### Conclusion
+- Main gap is structural execution shape, not a small heuristic miss:
+  - DSL Q4 dense path is scalarized/serial.
+  - MSL path is SIMD-parallel with hoisted decode math and better packed-load usage.
+- If we want DSL to close this gap, it needs the same primitive boundary + parallel reduction shape generation (without handwritten MSL), not minor expression tweaks.

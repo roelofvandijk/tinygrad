@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, statistics, time
+from tinygrad import Tensor, Device
+from tinygrad.dtype import dtypes
+from tinygrad.apps.quantized import custom_q4_0_linear
+
+CASES = {
+  "ffn_in": (1, 2048, 5120),
+  "ffn_mid": (1, 5120, 768),
+  "ffn_out": (1, 768, 2048),
+}
+
+def _make_inputs(n:int, o:int, i:int):
+  assert i % 32 == 0, "Q4_0 requires input dim divisible by 32"
+  bpr = i // 32
+  x = Tensor.randn(n, i, dtype=dtypes.float16).contiguous().realize()
+  scale = Tensor.randn(o, bpr, 1, dtype=dtypes.float16).contiguous().realize()
+  packed = (Tensor.rand(o, bpr, 16) * 256).cast(dtypes.uint8).contiguous().realize()
+  return x, scale, packed
+
+def _q4_ref(x:Tensor, scale:Tensor, packed:Tensor) -> Tensor:
+  n, i = x.shape
+  o = scale.shape[0]
+  bpr = i // 32
+  x_pairs = x.reshape(n, 1, bpr, 2, 16)
+  x_lo, x_hi = x_pairs[:, :, :, 0, :], x_pairs[:, :, :, 1, :]
+  lo = packed.bitwise_and(0xF).cast(dtypes.float16) - 8.0
+  hi = packed.rshift(4).cast(dtypes.float16) - 8.0
+  return (scale * (lo * x_lo + hi * x_hi)).reshape(n, o, bpr*16).sum(axis=-1).cast(dtypes.float16)
+
+def _run_case(n:int, o:int, i:int, warmup:int, iters:int, compare_msl:bool):
+  x, scale, packed = _make_inputs(n, o, i)
+
+  out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
+  out = Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
+  ref = _q4_ref(x, scale, packed).realize()
+  max_diff = (out.float() - ref.float()).abs().max().item()
+
+  for _ in range(warmup):
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
+    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
+    Device.default.synchronize()
+
+  times = []
+  for _ in range(iters):
+    Device.default.synchronize()
+    st = time.perf_counter()
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
+    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear)[0].realize()
+    Device.default.synchronize()
+    times.append(time.perf_counter() - st)
+
+  med = statistics.median(times)
+  best = min(times)
+  avg = sum(times) / len(times)
+  gflops = (2.0 * n * o * i) / med / 1e9
+  print(f"DSL  N={n} O={o} I={i}  median={med*1e6:.2f}us best={best*1e6:.2f}us avg={avg*1e6:.2f}us gflops={gflops:.1f} max_diff={max_diff:.6f}")
+
+  if not compare_msl:
+    return
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"):
+    print("MSL compare skipped (device is not METAL)")
+    return
+
+  from tinygrad.apps.q4_linear_msl import custom_q4_0_linear_msl
+  for _ in range(warmup):
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
+    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear_msl)[0].realize()
+    Device.default.synchronize()
+  times_msl = []
+  for _ in range(iters):
+    Device.default.synchronize()
+    st = time.perf_counter()
+    out = Tensor.empty(n, o, dtype=dtypes.float16, device=x.device)
+    Tensor.custom_kernel(out, x, scale, packed, fxn=custom_q4_0_linear_msl)[0].realize()
+    Device.default.synchronize()
+    times_msl.append(time.perf_counter() - st)
+  med_msl = statistics.median(times_msl)
+  best_msl = min(times_msl)
+  avg_msl = sum(times_msl) / len(times_msl)
+  gflops_msl = (2.0 * n * o * i) / med_msl / 1e9
+  print(f"MSL  N={n} O={o} I={i}  median={med_msl*1e6:.2f}us best={best_msl*1e6:.2f}us avg={avg_msl*1e6:.2f}us gflops={gflops_msl:.1f}")
+  print(f"speedup DSL/MSL: {med/med_msl:.2f}x")
+
+def main():
+  ap = argparse.ArgumentParser(description="Fast microbench for DSL Q4_0 dense custom kernel")
+  ap.add_argument("--case", default="ffn_in", choices=sorted(CASES.keys()))
+  ap.add_argument("--all", action="store_true", help="Run all default GLM Q4_0 dense shapes")
+  ap.add_argument("--warmup", type=int, default=3)
+  ap.add_argument("--iters", type=int, default=30)
+  ap.add_argument("--compare_msl", action="store_true", help="Also run custom_q4_0_linear_msl")
+  args = ap.parse_args()
+
+  if args.all:
+    for name in ("ffn_in", "ffn_mid", "ffn_out"):
+      print(f"\n== {name} ==")
+      _run_case(*CASES[name], args.warmup, args.iters, args.compare_msl)
+  else:
+    _run_case(*CASES[args.case], args.warmup, args.iters, args.compare_msl)
+
+if __name__ == "__main__":
+  main()

@@ -5,14 +5,14 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.nn.state import GGML_QUANT_INFO
 
-def custom_q4_0_linear(out:UOp, x:UOp, blocks:UOp) -> UOp:
-  # out: (N, O), x: (N, I), blocks: (O, I//32, 18)
-  assert len(out.shape) == 2 and len(x.shape) == 2 and len(blocks.shape) == 3
-  assert all(isinstance(s, int) for s in out.shape+x.shape+blocks.shape), "custom q4_0 kernel requires static shapes"
+def custom_q4_0_linear(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
+  # out: (N, O), x: (N, I), scale: (O, I//32, 1), packed: (O, I//32, 16)
+  assert len(out.shape) == 2 and len(x.shape) == 2 and len(scale.shape) == 3 and len(packed.shape) == 3
+  assert all(isinstance(s, int) for s in out.shape+x.shape+scale.shape+packed.shape), "custom q4_0 kernel requires static shapes"
   N, O = out.shape
   I = x.shape[1]
   bpr = I // 32
-  assert x.shape[0] == N and blocks.shape[0] == O and blocks.shape[1] == bpr and blocks.shape[2] == 18
+  assert x.shape[0] == N and scale.shape == (O, bpr, 1) and packed.shape == (O, bpr, 16)
 
   n = UOp.range(N, 0)
   o = UOp.range(O, 1)
@@ -21,14 +21,24 @@ def custom_q4_0_linear(out:UOp, x:UOp, blocks:UOp) -> UOp:
 
   acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
   acc = acc.after(n, o)[0].set(0.0)
-  scale = (blocks[o, br, 0].cast(dtypes.ushort) + (blocks[o, br, 1].cast(dtypes.ushort) << 8)).bitcast(dtypes.half).cast(dtypes.float)
-  q = blocks[o, br, j+2]
+  s = scale[o, br, 0].cast(dtypes.float)
+  q = packed[o, br, j]
   q_lo = (q & 0xF).cast(dtypes.float) - 8.0
   q_hi = (q >> 4).cast(dtypes.float) - 8.0
   x_lo = x[n, br*32 + j].cast(dtypes.float)
   x_hi = x[n, br*32 + j + 16].cast(dtypes.float)
-  acc = acc[0].set(acc.after(r)[0] + scale * (q_lo * x_lo + q_hi * x_hi), end=r)
-  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=()))
+  acc = acc[0].set(acc.after(r)[0] + s * (q_lo * x_lo + q_hi * x_hi), end=r)
+  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+    arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=_q4_0_linear_opts(N, O, I)))
+
+def _q4_0_linear_opts(n_rows:int, out_features:int, in_features:int):
+  if n_rows == 1 and out_features == 2048 and in_features == 5120:
+    return (Opt(OptOps.LOCAL, 0, 32),)
+  if n_rows == 1 and out_features == 5120 and in_features == 768:
+    return (Opt(OptOps.LOCAL, 0, 32),)
+  if n_rows == 1 and out_features == 768 and in_features == 2048:
+    return (Opt(OptOps.LOCAL, 0, 32),)
+  return ()
 
 def _q4_0_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
   if n_sel == 4 and out_features == 3072 and in_features == 2048:
@@ -152,23 +162,18 @@ class QuantizedLinear:
       )
     # Q4_0 packed-dot: read quantized blocks directly (3.56x less bandwidth than fp16 cache)
     if self.ggml_type == 2 and self.in_features % 32 == 0 and not use_cache:
-      if getenv("QL_CUSTOM", 0) == 1:
-        self._ensure_q4_0_blocks(x.device)
-        x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
-        x_flat = x_fp16.reshape(-1, self.in_features)
-        out = Tensor.empty(x_flat.shape[0], self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
-        out = Tensor.custom_kernel(out, x_flat, self._q4_0_blocks, fxn=custom_q4_0_linear)[0]
+      x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
+      x_flat = x_fp16.reshape(-1, self.in_features)
+      out = Tensor.empty(x_flat.shape[0], self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+      use_q4_linear_msl = getenv("QL_MOE_MSL", 0) == 1 and isinstance(x.device, str) and x.device.startswith("METAL")
+      if use_q4_linear_msl:
+        from tinygrad.apps.q4_linear_msl import custom_q4_0_linear_msl
+        self._ensure_q4_0_separated(x.device)
+        out = Tensor.custom_kernel(out, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear_msl)[0]
         return out.reshape(*x.shape[:-1], self.out_features)
       self._ensure_q4_0_separated(x.device)
-      O, bpr = self.out_features, self.in_features // 32
-      scale = self._q4_0_scale   # (O, bpr, 1) — contiguous fp16
-      packed = self._q4_0_packed  # (O, bpr, 16) — contiguous uint8
-      x_fp16 = x.cast(dtypes.float16) if x.dtype != dtypes.float16 else x
-      x_pairs = x_fp16.reshape(-1, 1, bpr, 2, 16)
-      x_lo, x_hi = x_pairs[:, :, :, 0, :], x_pairs[:, :, :, 1, :]
-      lo = packed.bitwise_and(0xF).cast(dtypes.float16) - 8.0
-      hi = (packed.rshift(4)).cast(dtypes.float16) - 8.0
-      return (scale * (lo * x_lo + hi * x_hi)).reshape(-1, O, bpr * 16).sum(axis=-1).reshape(*x.shape[:-1], O)
+      out = Tensor.custom_kernel(out, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear)[0]
+      return out.reshape(*x.shape[:-1], self.out_features)
     use_shexp_msl = getenv("QL_SHEXP_MSL", 0) == 1 and isinstance(x.device, str) and x.device.startswith("METAL")
     if use_shexp_msl and self.ggml_type == 13 and self.out_features == 3072 and self.in_features == 2048:
       from tinygrad.apps.qk_linear_msl import custom_q5_k_linear_msl
