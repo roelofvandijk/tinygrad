@@ -30,10 +30,17 @@ def custom_q4_0_linear(out:UOp, x:UOp, blocks:UOp) -> UOp:
   acc = acc[0].set(acc.after(r)[0] + scale * (q_lo * x_lo + q_hi * x_hi), end=r)
   return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=()))
 
-def _q4_0_mul_mat_id_opts(out_features:int, in_features:int):
-  if out_features == 3072 and in_features == 2048:
+def _q4_0_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
+  if n_sel == 4 and out_features == 3072 and in_features == 2048:
     return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUP, 1, 16))
-  if out_features == 2048 and in_features == 1536:
+  if n_sel == 4 and out_features == 2048 and in_features == 1536:
+    return (Opt(OptOps.LOCAL, 1, 16), Opt(OptOps.GROUP, 1, 16))
+  return ()
+
+def _fp16_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
+  if n_sel == 4 and out_features == 3072 and in_features == 2048:
+    return (Opt(OptOps.LOCAL, 1, 8), Opt(OptOps.GROUP, 1, 16))
+  if n_sel == 4 and out_features == 2048 and in_features == 1536:
     return (Opt(OptOps.LOCAL, 1, 16), Opt(OptOps.GROUP, 1, 16))
   return ()
 
@@ -68,7 +75,30 @@ def custom_q4_0_mul_mat_id(out:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UO
   x_hi = x[n, br*32 + j + 16].cast(dtypes.float)
   acc = acc[0].set(acc.after(r)[0] + s * (q_lo * x_lo + q_hi * x_hi), end=r)
   return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
-    arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_q4_0_mul_mat_id_opts(O, I)))
+    arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_q4_0_mul_mat_id_opts(N, O, I)))
+
+def custom_fp16_mul_mat_id(out:UOp, x:UOp, weights:UOp, sel:UOp) -> UOp:
+  # out: (N, O), x: (N, I), weights: (E, O, I), sel: (N,)
+  assert len(out.shape) == 2 and len(x.shape) == 2 and len(weights.shape) == 3 and len(sel.shape) == 1
+  assert all(isinstance(s, int) for s in out.shape+x.shape+weights.shape+sel.shape), "custom fp16 mul_mat_id requires static shapes"
+  N, O = out.shape
+  I = x.shape[1]
+  E = weights.shape[0]
+  assert x.shape == (N, I) and sel.shape[0] == N and weights.shape == (E, O, I)
+
+  n = UOp.range(N, 0)
+  o = UOp.range(O, 1)
+  r = UOp.range(I, 2, axis_type=AxisType.REDUCE)
+  e = sel[n].cast(dtypes.int).maximum(0).minimum(E-1).cast(dtypes.index)
+
+  acc = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG)
+  acc = acc.after(n, o)[0].set(0.0)
+  w_flat = weights.reshape(E * O * I)
+  w = w_flat[((e * O) + o) * I + r].cast(dtypes.float)
+  xv = x[n, r].cast(dtypes.float)
+  acc = acc[0].set(acc.after(r)[0] + w * xv, end=r)
+  return out[n, o].store(acc[0].cast(out.dtype.base)).end(n, o).sink(
+    arg=KernelInfo(name=f"custom_fp16_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_fp16_mul_mat_id_opts(N, O, I)))
 
 class QuantizedLinear:
   __slots__ = ('blocks', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_dequant_fn', '_dequant_cache', '_q4_0_blocks',
@@ -138,7 +168,7 @@ class QuantizedLinear:
 
 class QuantizedExpertWeights:
   __slots__ = ('blocks', 'num_experts', 'out_features', 'in_features', 'ggml_type', '_el_per_block', '_bytes_per_block', '_dequant_fn',
-               'expert_first_in_memory', '_blocks_per_expert', '_expert_blocks', '_q4_0_scale', '_q4_0_packed')
+               'expert_first_in_memory', '_blocks_per_expert', '_expert_blocks', '_q4_0_scale', '_q4_0_packed', '_expert_dequant_cache')
   def __init__(self, blocks:Tensor, shape:tuple[int, int, int], ggml_type:int, expert_first_in_memory:bool=True):
     self.num_experts, self.out_features, self.in_features = shape
     self.ggml_type = ggml_type
@@ -149,6 +179,7 @@ class QuantizedExpertWeights:
     self._expert_blocks = None
     self._q4_0_scale = None
     self._q4_0_packed = None
+    self._expert_dequant_cache = None
     assert self.blocks.shape[0] % self.num_experts == 0, f"blocks {self.blocks.shape[0]} not divisible by num_experts {self.num_experts}"
 
   def _ensure_expert_blocks(self, device: str|tuple[str, ...]) -> None:
@@ -171,6 +202,14 @@ class QuantizedExpertWeights:
     self._q4_0_scale = eb_4d[:, :, :, :2].bitcast(dtypes.float16).contiguous().realize()   # (E, O, bpr, 1)
     self._q4_0_packed = eb_4d[:, :, :, 2:].contiguous().realize()                          # (E, O, bpr, 16)
 
+  def _ensure_dequant_expert_cache(self, device: str|tuple[str, ...]) -> None:
+    if self._expert_dequant_cache is not None and self._expert_dequant_cache.device == device: return
+    self._ensure_expert_blocks(device)
+    w = self._dequant_fn(self._expert_blocks.reshape(-1, self._bytes_per_block))
+    w = w.reshape(self.num_experts, self.out_features, self.in_features)
+    if getenv("HALF", 1): w = w.cast(dtypes.float16)
+    self._expert_dequant_cache = w.contiguous().realize()
+
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     B, T, K = sel.shape
     n_sel = B * T * K
@@ -185,6 +224,15 @@ class QuantizedExpertWeights:
       sel_flat = sel.reshape(-1)
       out = Tensor.empty(n_sel, self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
       out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id)
+      return out.reshape(B, T, K, self.out_features)
+
+    # Q5_K/Q6_K expert path: keep primitive contract (expert-id indexed matmul) with dequantized expert cache.
+    if self.ggml_type in (13, 14):
+      self._ensure_dequant_expert_cache(x.device)
+      x_fp16 = x_flat.cast(dtypes.float16) if x_flat.dtype != dtypes.float16 else x_flat
+      sel_flat = sel.reshape(-1)
+      out = Tensor.empty(n_sel, self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+      out = Tensor.mul_mat_id(out, x_fp16, self._expert_dequant_cache, sel_flat, fxn=custom_fp16_mul_mat_id)
       return out.reshape(B, T, K, self.out_features)
 
     # Fallback: gather combined blocks then dequant
