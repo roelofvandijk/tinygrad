@@ -2034,3 +2034,26 @@ Steady tail from this run:
 
 Note:
 - Full-model value remains below MSL and still volatile; bench-block continues to be the fast directional loop.
+
+## Trial: Force materialization of weighted_gated (.contiguous()) — ACCEPTED
+
+Date: 2026-02-13
+
+### Problem
+Down expert kernel fused with silu/swiglu/probs chain → `r_4_256_8_8_48_2_2` at 480us.
+Root cause: `weighted_gated` had only ONE consumer (down expert), so scheduler fused everything.
+
+### Change
+`mla.py:153`: `weighted_gated = (gated * probs.unsqueeze(-1).cast(gated.dtype)).contiguous()`
+
+### Results
+- bench_block DEBUG=2: `r_4_256_8_8_48_2_2` gone, `custom_q4_0_mul_mat_id_4_2048_1536` appears (44 occurrences)
+- bench_block: decode proxy 34→36.38 tok/s (+7%)
+- **Full model: 27-28 tok/s → 30.3-30.5 tok/s (+11%)**
+- DeepSeek non-regression: 54.5 tok/s (unchanged)
+
+### Cleanup
+Removed dead split-K code from quantized.py:
+- `custom_q4_0_linear_split`, `_q4_0_linear_split_opts`, `_q4_0_linear_split_groups`
+- `custom_q4_0_mul_mat_id_split`, `_q4_0_mul_mat_id_split_opts`, `_q4_0_mul_mat_id_split_groups`
+- Split-K routing in `QuantizedLinear.__call__` and `QuantizedExpertWeights.__call__`
