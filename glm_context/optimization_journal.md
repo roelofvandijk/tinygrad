@@ -1921,3 +1921,116 @@ Full model (`.venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unslo
 ### Next high-impact idea (from ideas3 Tier 1)
 
 - Unblock fully legal auto-scheduled dense Q4 path for this kernel family by fixing vectorized reduction/legalization in core (`spec.py`, `linearizer.py`, `cstyle.py`) so we can safely beat fixed schedule defaults.
+
+## 2026-02-13 — GLM DSL + DeepSeek generic pass
+
+### Accepted
+
+1) **Generic heuristic fallback for non-GLM Q4 shapes** in `quantized.py`:
+- `_q4_0_linear_opts`: fallback changed from `()` to `None`
+- `_q4_0_mul_mat_id_opts`: fallback changed from `()` to `None`
+
+Why: `()` disables postrange heuristics entirely; `None` allows generic LOCAL/GROUP(TOP) scheduling.
+
+DeepSeek full-model result:
+- Before (steady): ~8.5 tok/s
+- After (steady): ~50-52 tok/s
+
+Command:
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python tinygrad/apps/llm.py --model "deepseek-v2-lite-Q4_0" --benchmark 10`
+
+2) **GLM MoE shape schedule update** in `quantized.py`:
+- `custom_q4_0_mul_mat_id_4_3072_2048`: `LOCAL(8), GROUPTOP(4)`
+- `custom_q4_0_mul_mat_id_4_2048_1536`: `LOCAL(16), GROUPTOP(4)`
+
+Microbench evidence (representative):
+- `4x3072x2048`: ~338us -> ~299us
+- `4x2048x1536`: ~331us -> ~302us
+
+`bench_block.py` steady decode proxy in this window hovered around ~33.7-35.8 depending run noise; current stable sanity is ~33.8-34.1.
+
+### Rejected / Reverted
+
+1) Dense Q4 schedule change `2048x5120 -> GROUPTOP(8)`:
+- Looked good in microbench, but full-model GLM DSL steady regressed to ~28.1-28.3 tok/s.
+- Reverted to `GROUPTOP(4)`.
+
+2) `custom_q4_0_linear_vec2` SIMD primitive attempt:
+- Tried to legalize vector store path and reduce renderer address-space errors.
+- Added Metal register pointer prefix support in `cstyle.py` (`reg_prefix_for_cast = "thread "`).
+- Fixed pointer target to `out.index(..., ptr=True)` for vec2 store.
+- Kernel now compiles, but output is numerically wrong (`max_diff` huge) and slower than scalar path.
+- Not promoted into runtime path.
+
+### Current status
+
+- Active DSL path remains scalar `custom_q4_0_linear` + tuned opts.
+- GLM DSL representative sanity (`bench_block.py 3`): decode proxy ~33.8 tok/s.
+- DeepSeek major gain from generic fallback remains intact (~50 tok/s steady full model).
+
+
+## 2026-02-13: DSL Q4 dense SIMD primitive iteration (sequential)
+
+### Goal
+- Close part of the DSL vs MSL gap on the largest dense Q4 kernel (`custom_q4_0_linear_1_2048_5120`) with a structural change, not tiny tuning.
+
+### Key findings
+- `custom_q4_0_linear_vec2` had latent speed but was numerically wrong.
+- Root cause from `DEBUG=6`: grouped lanes (`GROUPTOP`) were writing partial sums because vec2 path used manual `acc.after(...)` accumulation instead of explicit `REDUCE`.
+
+### Code changes (accepted)
+- `tinygrad/apps/quantized.py`
+  - Rewrote `custom_q4_0_linear_vec2` accumulation to explicit `REDUCE` over `(r_br, r_pair)`.
+  - Added detailed in-code comment explaining why manual accumulator is wrong with grouped reductions.
+  - Added `_q4_0_linear_vec2_opts` and specialized vec2 scheduling for `(1,2048,5120)` -> `LOCAL(8), GROUPTOP(8)`.
+  - Routed dense Q4 DSL path to vec2 kernel only for exact decode-hot shape `(N=1, O=2048, I=5120)`.
+  - Kept scalar path for all other shapes.
+- `tinygrad/apps/quantized.py`
+  - Mixed scheduling policy for scalar dense Q4 remains:
+    - auto (`None`) for `(1,2048,5120)` and `(1,768,2048)`
+    - fixed `(LOCAL(16), GROUP(1,8))` for `(1,5120,768)`
+
+### Code changes (rejected / reverted)
+- `tinygrad/renderer/cstyle.py` temporary addrspace cast hook (`reg_prefix_for_cast`) was reverted.
+  - No longer needed after explicit-REDUCE vec2 fix.
+  - Avoids global renderer risk.
+
+### Microbench evidence
+Command:
+- `PYTHONPATH=. BEAM=0 .venv2/bin/python - <<'PY' ... custom_q4_0_linear vs custom_q4_0_linear_vec2 ... PY`
+
+Results on `N=1,O=2048,I=5120` (same input, 100 iters):
+- scalar-auto: median `390.13us` (`53.8 GFLOPS`)
+- vec2-l8g8: median `374.31us` (`56.0 GFLOPS`)
+- correctness: vec2 `max_diff` matched scalar tolerance (`<= 1.0` in fp16 compare runs)
+
+### bench_block evidence (DSL mode)
+Command:
+- `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python bench_block.py 5 --model "glm-4.7:flash-unsloth-Q4_0"`
+
+Before this vec2 routing (earlier in this session, same mixed scalar policy):
+- decode proxy around `33.69 - 33.73 tok/s`
+
+After vec2 routing for `(1,2048,5120)`:
+- run A: `34.15 tok/s`
+- run B: `34.13 tok/s`
+- later validation run: `33.99 tok/s`
+
+Interpretation:
+- Modest but real uplift vs pre-vec2 mixed baseline (roughly `+0.3` to `+0.4 tok/s` on repeat runs).
+- Not a step change; main DSL gap to MSL still remains in reduction/codegen shape quality.
+
+### MSL sanity (non-regression check)
+Command:
+- `PYTHONPATH=. BEAM=0 QL_MOE_MSL=1 QL_SHEXP_MSL=1 .venv2/bin/python bench_block.py 2 --model "glm-4.7:flash-unsloth-Q4_0"`
+- decode proxy observed: `41.18 tok/s` (within expected MSL band/no obvious breakage from DSL-only changes).
+
+### Full model (DSL)
+Command:
+- `PYTHONPATH=. BEAM=0 QL_MOE_MSL=0 QL_SHEXP_MSL=0 .venv2/bin/python tinygrad/apps/llm.py --model "glm-4.7:flash-unsloth-Q4_0" --benchmark 10`
+
+Steady tail from this run:
+- `27.22, 27.99, 28.01, 28.09, 28.20 tok/s`
+
+Note:
+- Full-model value remains below MSL and still volatile; bench-block continues to be the fast directional loop.

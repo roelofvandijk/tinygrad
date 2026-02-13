@@ -150,7 +150,7 @@ class MLATransformerBlock:
       gate_up = self.ffn_gate_up_exps(sel, h_norm)  # (B, T, K, 2*moe_hidden_dim)
       gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
       gated = gate.silu() * up
-      weighted_gated = gated * probs.unsqueeze(-1).cast(gated.dtype)
+      weighted_gated = (gated * probs.unsqueeze(-1).cast(gated.dtype)).contiguous()
       expert_out = self.ffn_down_exps(sel, weighted_gated)
       if self.num_experts_per_tok == 4:
         moe = expert_out[:, :, 0] + expert_out[:, :, 1] + expert_out[:, :, 2] + expert_out[:, :, 3]
