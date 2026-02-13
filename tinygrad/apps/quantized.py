@@ -39,49 +39,6 @@ def custom_q4_0_linear(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_q4_0_linear_{N}_{O}_{I}", opts_to_apply=_q4_0_linear_opts(N, O, I)))
 
-def custom_q4_0_linear_split(partial:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
-  """
-  Two-stage DSL reduction for the dense Q4_0 hotspot:
-    stage 1 (this kernel): compute chunked partial dot-products over reduction chunks
-    stage 2 (regular Tensor sum): reduce partial chunks to final output
-
-  This mirrors the MSL lane-parallel idea using pure DSL: increase parallel work-items
-  over the reduction dimension (via chunk index `g`) instead of one long serial loop/thread.
-  """
-  assert len(partial.shape) == 3 and len(x.shape) == 2 and len(scale.shape) == 3 and len(packed.shape) == 3
-  assert all(isinstance(s, int) for s in partial.shape+x.shape+scale.shape+packed.shape), "custom q4_0 split kernel requires static shapes"
-  N, O, G = partial.shape
-  I = x.shape[1]
-  bpr = I // 32
-  assert bpr % G == 0, f"bpr {bpr} must be divisible by chunk groups {G}"
-  chunk_bpr = bpr // G
-  assert x.shape[0] == N and scale.shape == (O, bpr, 1) and packed.shape == (O, bpr, 16)
-
-  n = UOp.range(N, 0)
-  o = UOp.range(O, 1)
-  g = UOp.range(G, 2)
-  # Same split reduction structure as custom_q4_0_linear, scoped to one chunk.
-  r_br = UOp.range(chunk_bpr, 3, axis_type=AxisType.REDUCE)
-  r_pair = UOp.range(8, 4, axis_type=AxisType.REDUCE)
-  br = g*chunk_bpr + r_br
-  jb = r_pair*2
-
-  s = scale[o, br, 0].cast(dtypes.float)
-  q0, q1 = packed[o, br, jb], packed[o, br, jb+1]
-  q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
-  q0_hi = (q0 >> 4).cast(dtypes.float) - 8.0
-  q1_lo = (q1 & 0xF).cast(dtypes.float) - 8.0
-  q1_hi = (q1 >> 4).cast(dtypes.float) - 8.0
-  x0 = x[n, br*32 + jb].cast(dtypes.float)
-  x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
-  x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
-  x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  # Same explicit REDUCE form as custom_q4_0_linear for correctness-safe grouped scheduling.
-  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
-  acc = dot.reduce(r_br, r_pair, arg=Ops.ADD, dtype=dtypes.float)
-  return partial[n, o, g].store(acc.cast(partial.dtype.base)).end(n, o, g).sink(
-    arg=KernelInfo(name=f"custom_q4_0_linear_split_{N}_{O}_{I}_g{G}", opts_to_apply=_q4_0_linear_split_opts(N, O, I, G)))
-
 def custom_q4_0_linear_vec2(out:UOp, x:UOp, scale:UOp, packed:UOp) -> UOp:
   # Two-output-row kernel with one vector store.
   # This is a structural DSL variant mirroring the MSL NR idea while keeping one STORE path
@@ -149,16 +106,6 @@ def _q4_0_linear_opts(n_rows:int, out_features:int, in_features:int):
   # This lets DeepSeek-like Q4 dense kernels pick LOCAL/GROUPTOP automatically.
   return None
 
-def _q4_0_linear_split_opts(n_rows:int, out_features:int, in_features:int, groups:int):
-  if n_rows == 1 and (out_features, in_features) in {(2048, 5120), (5120, 768), (768, 2048)}:
-    return (Opt(OptOps.LOCAL, 0, 16),)
-  return ()
-
-def _q4_0_linear_split_groups(n_rows:int, out_features:int, in_features:int) -> int:
-  # Split-K dense path stays available but is currently not default.
-  # Single-kernel grouped reduction now benchmarks better for decode-hot shapes.
-  return 1
-
 def _q4_0_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
   # Decode-specialized defaults (n_sel=4) for Q4 expert matmul-id.
   if n_sel == 4 and out_features == 3072 and in_features == 2048:
@@ -171,15 +118,6 @@ def _q4_0_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
   # For other MoE shapes (ex: DeepSeek n_sel=6), let heuristic scheduling apply.
   # Returning () would force a scalar-ish fallback and leave large speed on the table.
   return None
-
-def _q4_0_mul_mat_id_split_opts(n_sel:int, out_features:int, in_features:int, groups:int):
-  if n_sel == 4 and (out_features, in_features) in {(3072, 2048), (2048, 1536)}:
-    return (Opt(OptOps.LOCAL, 1, 16),)
-  return ()
-
-def _q4_0_mul_mat_id_split_groups(n_sel:int, out_features:int, in_features:int) -> int:
-  # Split-K MoE path stays available, but grouped single-kernel path currently benchmarks better.
-  return 1
 
 def _fp16_mul_mat_id_opts(n_sel:int, out_features:int, in_features:int):
   if n_sel == 4 and out_features == 3072 and in_features == 2048:
@@ -226,55 +164,6 @@ def custom_q4_0_mul_mat_id(out:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UO
   acc = dot.reduce(r_br, r_pair, arg=Ops.ADD, dtype=dtypes.float)
   return out[n, o].store(acc.cast(out.dtype.base)).end(n, o).sink(
     arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_{N}_{O}_{I}", opts_to_apply=_q4_0_mul_mat_id_opts(N, O, I)))
-
-def custom_q4_0_mul_mat_id_split(partial:UOp, x:UOp, scale:UOp, packed:UOp, sel:UOp) -> UOp:
-  """
-  Two-stage Q4 MoE reduction:
-    stage 1: chunked partials over block rows
-    stage 2: Tensor sum over chunk axis
-
-  This gives the DSL path a structural parallel-reduction analogue to MSL's lane-parallel kernel.
-  """
-  assert len(partial.shape) == 3 and len(x.shape) == 2 and len(scale.shape) == 4 and len(packed.shape) == 4 and len(sel.shape) == 1
-  assert all(isinstance(s, int) for s in partial.shape+x.shape+scale.shape+packed.shape+sel.shape), "custom q4_0 split kernel requires static shapes"
-  N, O, G = partial.shape
-  I = x.shape[1]
-  bpr = I // 32
-  E = scale.shape[0]
-  assert bpr % G == 0, f"bpr {bpr} must be divisible by chunk groups {G}"
-  chunk_bpr = bpr // G
-  assert x.shape == (N, I) and sel.shape[0] == N
-  assert scale.shape == (E, O, bpr, 1) and packed.shape == (E, O, bpr, 16)
-
-  n = UOp.range(N, 0)
-  o = UOp.range(O, 1)
-  g = UOp.range(G, 2)
-  # Same split reduction structure as custom_q4_0_mul_mat_id, scoped to one chunk.
-  r_br = UOp.range(chunk_bpr, 3, axis_type=AxisType.REDUCE)
-  r_pair = UOp.range(8, 4, axis_type=AxisType.REDUCE)
-  br = g*chunk_bpr + r_br
-  jb = r_pair * 2
-
-  e = sel[n].cast(dtypes.int).maximum(0).minimum(E-1).cast(dtypes.index)
-  base = ((e * O) + o) * bpr + br
-  scale_flat = scale.reshape(E * O * bpr)
-  packed_flat = packed.reshape(E * O * bpr * 16)
-
-  s = scale_flat[base].cast(dtypes.float)
-  q0, q1 = packed_flat[base * 16 + jb], packed_flat[base * 16 + jb + 1]
-  q0_lo = (q0 & 0xF).cast(dtypes.float) - 8.0
-  q0_hi = (q0 >> 4).cast(dtypes.float) - 8.0
-  q1_lo = (q1 & 0xF).cast(dtypes.float) - 8.0
-  q1_hi = (q1 >> 4).cast(dtypes.float) - 8.0
-  x0 = x[n, br*32 + jb].cast(dtypes.float)
-  x1 = x[n, br*32 + jb + 1].cast(dtypes.float)
-  x2 = x[n, br*32 + jb + 16].cast(dtypes.float)
-  x3 = x[n, br*32 + jb + 17].cast(dtypes.float)
-  dot = s * (q0_lo * x0 + q1_lo * x1 + q0_hi * x2 + q1_hi * x3)
-  acc = dot.reduce(r_br, r_pair, arg=Ops.ADD, dtype=dtypes.float)
-  return partial[n, o, g].store(acc.cast(partial.dtype.base)).end(n, o, g).sink(
-    arg=KernelInfo(name=f"custom_q4_0_mul_mat_id_split_{N}_{O}_{I}_g{G}",
-                   opts_to_apply=_q4_0_mul_mat_id_split_opts(N, O, I, G)))
 
 def custom_fp16_mul_mat_id(out:UOp, x:UOp, weights:UOp, sel:UOp) -> UOp:
   # out: (N, O), x: (N, I), weights: (E, O, I), sel: (N,)
@@ -381,14 +270,7 @@ class QuantizedLinear:
         out = Tensor.custom_kernel(out, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear_msl)[0]
         return out.reshape(*x.shape[:-1], self.out_features)
       self._ensure_q4_0_separated(x.device)
-      groups = _q4_0_linear_split_groups(x_flat.shape[0], self.out_features, self.in_features)
-      if groups > 1 and (self.in_features // 32) % groups == 0:
-        # Split-K stage (parallel partial sums) + final reduction.
-        partial = Tensor.empty(x_flat.shape[0], self.out_features, groups, dtype=x_fp16.dtype, device=x_fp16.device)
-        partial = Tensor.custom_kernel(partial, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear_split)[0]
-        out = partial.sum(axis=2)
-      else:
-        out = Tensor.custom_kernel(out, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear)[0]
+      out = Tensor.custom_kernel(out, x_flat, self._q4_0_scale, self._q4_0_packed, fxn=custom_q4_0_linear)[0]
       return out.reshape(*x.shape[:-1], self.out_features)
     use_shexp_msl = getenv("QL_SHEXP_MSL", 0) == 1 and isinstance(x.device, str) and x.device.startswith("METAL")
     if use_shexp_msl and self.ggml_type == 13 and self.out_features == 3072 and self.in_features == 2048:
@@ -471,14 +353,8 @@ class QuantizedExpertWeights:
         from tinygrad.apps.q4_moe_msl import custom_q4_0_mul_mat_id_msl
         out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id_msl)
       else:
-        groups = _q4_0_mul_mat_id_split_groups(n_sel, self.out_features, self.in_features)
-        if groups > 1 and (self.in_features // 32) % groups == 0:
-          partial = Tensor.empty(n_sel, self.out_features, groups, dtype=x_fp16.dtype, device=x_fp16.device)
-          partial = Tensor.mul_mat_id(partial, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id_split)
-          out = partial.sum(axis=2)
-        else:
-          out = Tensor.empty(n_sel, self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
-          out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id)
+        out = Tensor.empty(n_sel, self.out_features, dtype=x_fp16.dtype, device=x_fp16.device)
+        out = Tensor.mul_mat_id(out, x_fp16, self._q4_0_scale, self._q4_0_packed, sel_flat, fxn=custom_q4_0_mul_mat_id)
       return out.reshape(B, T, K, self.out_features)
 
     # Q5_K/Q6_K expert path: keep primitive contract (expert-id indexed matmul) with dequantized expert cache.
