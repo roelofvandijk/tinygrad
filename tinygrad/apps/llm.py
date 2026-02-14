@@ -299,16 +299,17 @@ class Transformer:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens, start_pos)
 
   @staticmethod
-  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=True, keep_quantized:bool=False) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict, quantized_tensors = nn.state.gguf_load(gguf.to(None), keep_quantized=keep_quantized)
+  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=True, quantized:bool=False) -> tuple[Transformer, dict]:
+    kv, state_dict, quantized_tensors = nn.state.gguf_load(gguf, quantized=quantized)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     all_keys = set(state_dict) | (set(quantized_tensors) if quantized_tensors else set())
-    if 'output.weight' not in all_keys: state_dict['output.weight'] = state_dict['token_embd.weight']
+    if 'output.weight' not in all_keys:
+      if 'token_embd.weight' in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+      elif quantized_tensors and 'token_embd.weight' in quantized_tensors: quantized_tensors['output.weight'] = quantized_tensors['token_embd.weight']
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
@@ -338,7 +339,7 @@ class Transformer:
       gc.collect()
 
     params = nn.state.get_parameters(model)
-    if not keep_quantized:
+    if not quantized:
       for s in params: s.replace(s.contiguous())
     if realize:
       for i in range(0, len(params), 50): Tensor.realize(*params[i:i+50])
@@ -464,12 +465,11 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
-  parser.add_argument("--quantized", action="store_true", default=None, help="Keep weights quantized (lower memory)")
+  parser.add_argument("--dequantize", action="store_true", help="Dequantize all weights at load time")
   args = parser.parse_args()
-  if args.quantized is None: args.quantized = args.model.startswith("glm-")
 
   # load the model
-  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, keep_quantized=args.quantized)
+  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, quantized=not args.dequantize)
   if DEBUG >= 1: print(f"using model {args.model}")
 
   # do benchmark

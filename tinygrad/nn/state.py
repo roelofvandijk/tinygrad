@@ -366,17 +366,15 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 @accept_filename
-def gguf_load(tensor: Tensor, keep_quantized: bool = False) -> tuple[dict, dict[str, Tensor], dict[str, tuple[Tensor, tuple, int]]|None]:
+def gguf_load(tensor: Tensor, quantized: bool = False) -> tuple[dict, dict[str, Tensor], dict[str, tuple[Tensor, tuple, int]]|None]:
   """
   Loads a .gguf file, returning the `kv_data`, `state_dict`, and optionally `quantized_tensors`.
-  If keep_quantized=True, quantized_tensors is a dict of raw quantized blocks (tensor name -> (blocks, shape, ggml_type)), otherwise None.
+  If quantized=True, quantized_tensors is a dict of raw quantized blocks (tensor name -> (blocks, shape, ggml_type)), otherwise None.
 
   ```python
-  gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict, _ = nn.state.gguf_load(gguf_tensor)
+  kv_data, state_dict, _ = nn.state.gguf_load(Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")))
+  kv_data, state_dict, quantized_tensors = nn.state.gguf_load(Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")), quantized=True)
   ```
-
-  NOTE: The provided tensor must be on a device that supports execution.
   """
   reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
@@ -398,18 +396,28 @@ def gguf_load(tensor: Tensor, keep_quantized: bool = False) -> tuple[dict, dict[
   t_infos = [ (read_str(), tuple(read_uint64() for _ in range(read_uint32())), read_int32(), read_uint64()) for _ in range(n_tensors) ]
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
+  is_disk = isinstance(tensor.device, str) and tensor.device.startswith("DISK")
+  native_dtypes = { 0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8, 17: dtypes.int16, 18: dtypes.int32 }
 
   # extract raw quantized blocks before dequantizing
   quantized_tensors: dict[str, tuple[Tensor, tuple, int]] = {}
-  if keep_quantized:
+  if quantized:
     for name, dims, typ, off in t_infos:
       if typ not in GGML_BLOCK_SIZES: continue
       el_per_block, bytes_per_block = GGML_BLOCK_SIZES[typ]
       nbytes = (prod(dims) // el_per_block) * bytes_per_block
-      quantized_tensors[name] = (tensor[data_start + off:data_start + off + nbytes].reshape(-1, bytes_per_block), tuple(reversed(dims)), typ)
+      blocks = tensor[data_start + off:data_start + off + nbytes]
+      if is_disk: blocks = blocks.to(None)
+      quantized_tensors[name] = (blocks.reshape(-1, bytes_per_block), tuple(reversed(dims)), typ)
 
   for name, dims, typ, off in t_infos:
     if name in quantized_tensors: continue
-    state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+    if is_disk:
+      if (dt := native_dtypes.get(typ)) is not None: nbytes = dt.itemsize * prod(dims)
+      elif typ in GGML_BLOCK_SIZES: nbytes = (prod(dims) // GGML_BLOCK_SIZES[typ][0]) * GGML_BLOCK_SIZES[typ][1]
+      else: raise ValueError(f"unknown GGML type {typ}")
+      data = tensor[data_start + off:data_start + off + nbytes].to(None)
+    else: data = tensor[data_start + off:]
+    state_dict[name] = ggml_data_to_tensor(data, prod(dims), typ).reshape(*reversed(dims))
 
   return kv_data, state_dict, quantized_tensors or None
