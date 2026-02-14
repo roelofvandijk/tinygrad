@@ -84,15 +84,16 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def apply_rope_interleaved(x: Tensor, freqs_cis: Tensor) -> Tensor:
+  cos, sin = freqs_cis[..., 0].reshape(1, 1, x.shape[2], -1), freqs_cis[..., 1].reshape(1, 1, x.shape[2], -1)
+  x1, x2 = x[..., 0::2], x[..., 1::2]
+  return (x1 * cos - x2 * sin).unsqueeze(-1).cat((x2 * cos + x1 * sin).unsqueeze(-1), dim=-1).flatten(-2)
+
 @functools.cache
 def _precompute_freqs(dim: int, end: int, theta: float) -> Tensor:
   freqs = Tensor.arange(end).float().unsqueeze(1) * (1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))).unsqueeze(0)
   return Tensor.stack(freqs.cos(), freqs.sin(), dim=-1).cast(dtypes.float16).contiguous()
 
-def _apply_rope_interleaved(x: Tensor, freqs_cis: Tensor) -> Tensor:
-  cos, sin = freqs_cis[..., 0].reshape(1, 1, x.shape[2], -1), freqs_cis[..., 1].reshape(1, 1, x.shape[2], -1)
-  x1, x2 = x[..., 0::2], x[..., 1::2]
-  return (x1 * cos - x2 * sin).unsqueeze(-1).cat((x2 * cos + x1 * sin).unsqueeze(-1), dim=-1).flatten(-2)
 
 class MLATransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, norm_eps:float, max_context:int,
@@ -147,7 +148,7 @@ class MLATransformerBlock:
     compressed_kv, k_pe = kv_out.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = k_pe.reshape(B, T, 1, self.qk_rope_head_dim).transpose(1, 2)
     freqs_cis = _precompute_freqs(self.qk_rope_head_dim, self.max_context, self._rope_theta)[start_pos:start_pos+T]
-    q_pe, k_pe = _apply_rope_interleaved(q_pe, freqs_cis), _apply_rope_interleaved(k_pe, freqs_cis)
+    q_pe, k_pe = apply_rope_interleaved(q_pe, freqs_cis), apply_rope_interleaved(k_pe, freqs_cis)
     q = (q_nope @ self.attn_k_b.weight.transpose(-1, -2)).cat(q_pe, dim=-1)
     kv_normed = self.attn_kv_a_norm(compressed_kv).unsqueeze(1)
     k_new = kv_normed.cat(k_pe, dim=-1)
