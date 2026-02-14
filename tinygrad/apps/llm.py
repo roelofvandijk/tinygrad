@@ -332,9 +332,9 @@ class Transformer:
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0), **mla)
 
     if quantized_tensors: replace_quantized_modules(model, quantized_tensors, state_dict)
-
-    loaded = nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=False)
-    if realize: Tensor.realize(*loaded)
+    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=False)
+    params = nn.state.get_parameters(model)
+    if realize: Tensor.realize(*params)
     return model, kv
 
   def generate(self, tokens:list[int], start_pos=0):
