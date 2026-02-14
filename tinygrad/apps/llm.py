@@ -1,12 +1,14 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, gc
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.nn.mla import MLATransformerBlock, load_mla_params_from_gguf
+from tinygrad.nn.quantized import replace_quantized_modules
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","glm4"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -53,10 +55,11 @@ class SimpleTokenizer:
 
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
-    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
+    if self.preset in ('olmo', 'glm4'): return self.encode("<|" + role + "|>\n")
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
+    if self.preset == 'glm4': return []
     if self.preset == 'olmo': return self.encode("\n")
     if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
     return [eos_id]
@@ -160,9 +163,14 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, **mla_kwargs):
+    self.blk: list[MLATransformerBlock | TransformerBlock] = []
+    if mla_kwargs.get('kv_lora_rank', 0) > 0:
+      self.blk = [MLATransformerBlock(dim, hidden_dim, n_heads, norm_eps, max_context, num_experts=0 if i < mla_kwargs.get('leading_dense_blocks', 0)
+                    else num_experts, num_experts_per_tok=num_experts_per_tok, rope_theta=rope_theta, **mla_kwargs) for i in range(num_blocks)]
+    else:
+      self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
+                                   num_experts, num_experts_per_tok) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -174,21 +182,22 @@ class Transformer:
     x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
-    return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    return self.output(self.output_norm(x))[:, -1, :].argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens, start_pos)
 
   @staticmethod
-  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=True) -> tuple[Transformer, dict]:
+  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=True, keep_quantized:bool=False) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = nn.state.gguf_load(gguf.to(None))
+    kv, state_dict, quantized_tensors = nn.state.gguf_load(gguf.to(None), keep_quantized=keep_quantized)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
-    if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+    all_keys = set(state_dict) | (set(quantized_tensors) if quantized_tensors else set())
+    if 'output.weight' not in all_keys: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
@@ -200,22 +209,32 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
+    mla = load_mla_params_from_gguf(kv, arch) if kv.get(f'{arch}.attention.kv_lora_rank', 0) > 0 else {}
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
+                        hidden_dim=kv.get(f'{arch}.feed_forward_length', kv.get(f'{arch}.expert_feed_forward_length', 0)),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
                         head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
-    for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-    if realize: Tensor.realize(*params)
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0), **mla)
+
+    if quantized_tensors: replace_quantized_modules(model, quantized_tensors, state_dict)
+
+    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=False)
+    if quantized_tensors:
+      del state_dict, quantized_tensors
+      gc.collect()
+
+    params = nn.state.get_parameters(model)
+    if not keep_quantized:
+      for s in params: s.replace(s.contiguous())
+    if realize:
+      for i in range(0, len(params), 50): Tensor.realize(*params[i:i+50])
     return model, kv
 
   def generate(self, tokens:list[int], start_pos=0):
-    v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
+    v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     t = Tensor([tokens[start_pos:]], dtype="int32")
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
@@ -235,6 +254,7 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+  "glm-4.7:flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_0.gguf",
 }
 
 # *** simple OpenAI compatible server on 11434 to match ollama ***
@@ -286,7 +306,7 @@ class Handler(HTTPRequestHandler):
     st = time.perf_counter()
     for next_id in model.generate(ids):
       if len(out) == 0: stderr_log(f"prefill:{len(ids)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-      if next_id == eos_id: break
+      if next_id in stop_tokens: break
       out.append(next_id)
       yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
@@ -301,6 +321,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # extract tokens
       ids: list[int] = [bos_id] if bos_id is not None else []
+      if tok.preset == 'glm4': ids += tok.encode("<sop>")
       for msg in body["messages"]:
         ids += tok.role(msg["role"])
         # content can be a str or a list
@@ -313,6 +334,7 @@ class Handler(HTTPRequestHandler):
         else: raise RuntimeError(f"unknown content type: {type(content)}")
         ids += tok.end_turn(eos_id)
       ids += tok.role("assistant")
+      if tok.preset == 'glm4': ids += tok.encode("<think>\n")
 
       # reply
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False))
@@ -331,10 +353,12 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--quantized", action="store_true", default=None, help="Keep weights quantized (lower memory)")
   args = parser.parse_args()
+  if args.quantized is None: args.quantized = args.model.startswith("glm-")
 
   # load the model
-  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context)
+  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, keep_quantized=args.quantized)
   if DEBUG >= 1: print(f"using model {args.model}")
 
   # do benchmark
@@ -350,18 +374,21 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
+  stop_tokens = {eos_id} | ({tok.encode("<|user|>")[0]} if tok.preset == 'glm4' else set())
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
 
   ids: list[int] = [bos_id] if bos_id is not None else []
+  if tok.preset == 'glm4': ids += tok.encode("<sop>")
   while 1:
     start_pos = max(len(ids) - 1, 0)
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
+      if tok.preset == 'glm4': ids += tok.encode("<think>\n")
     except EOFError:
       break
     for next_id in model.generate(ids, start_pos):
-      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
+      sys.stdout.write(tok.decode([next_id]) if next_id not in stop_tokens else "\n\n")
       sys.stdout.flush()
-      if next_id == eos_id: break
+      if next_id in stop_tokens: break
