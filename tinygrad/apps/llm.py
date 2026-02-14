@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, gc, math
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, math
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
@@ -333,16 +333,8 @@ class Transformer:
 
     if quantized_tensors: replace_quantized_modules(model, quantized_tensors, state_dict)
 
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=False)
-    if quantized_tensors:
-      del state_dict, quantized_tensors
-      gc.collect()
-
-    params = nn.state.get_parameters(model)
-    if not quantized:
-      for s in params: s.replace(s.contiguous())
-    if realize:
-      for i in range(0, len(params), 50): Tensor.realize(*params[i:i+50])
+    loaded = nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=False)
+    if realize: Tensor.realize(*loaded)
     return model, kv
 
   def generate(self, tokens:list[int], start_pos=0):
@@ -465,11 +457,13 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
-  parser.add_argument("--dequantize", action="store_true", help="Dequantize all weights at load time")
+  parser.add_argument("--dequantize", action="store_false", help="Dequantize all weights at load time")
   args = parser.parse_args()
 
+  quantized = not args.dequantize
+  if args.model.startswith("glm"): quantized = True
   # load the model
-  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, quantized=not args.dequantize)
+  model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, quantized=quantized)
   if DEBUG >= 1: print(f"using model {args.model}")
 
   # do benchmark

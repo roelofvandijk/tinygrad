@@ -420,4 +420,4 @@ def gguf_load(tensor: Tensor, quantized: bool = False) -> tuple[dict, dict[str, 
     else: data = tensor[data_start + off:]
     state_dict[name] = ggml_data_to_tensor(data, prod(dims), typ).reshape(*reversed(dims))
 
-  return kv_data, state_dict, quantized_tensors or None
+  return kv_data, state_dict, quantized_tensors
