@@ -1,7 +1,6 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, math
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
-from tinygrad.dtype import dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.nn.quantized import replace_quantized_modules
@@ -78,22 +77,14 @@ class ExpertWeights:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
 
-def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
+def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False) -> Tensor:
   assert x.shape[-1] % 2 == 0
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
+  if interleaved:
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return (x1 * cos - x2 * sin).unsqueeze(-1).cat((x2 * cos + x1 * sin).unsqueeze(-1), dim=-1).flatten(-2)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
-
-def apply_rope_interleaved(x: Tensor, freqs_cis: Tensor) -> Tensor:
-  cos, sin = freqs_cis[..., 0].reshape(1, 1, x.shape[2], -1), freqs_cis[..., 1].reshape(1, 1, x.shape[2], -1)
-  x1, x2 = x[..., 0::2], x[..., 1::2]
-  return (x1 * cos - x2 * sin).unsqueeze(-1).cat((x2 * cos + x1 * sin).unsqueeze(-1), dim=-1).flatten(-2)
-
-@functools.cache
-def _precompute_freqs(dim: int, end: int, theta: float) -> Tensor:
-  freqs = Tensor.arange(end).float().unsqueeze(1) * (1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))).unsqueeze(0)
-  return Tensor.stack(freqs.cos(), freqs.sin(), dim=-1).cast(dtypes.float16).contiguous()
-
 class MLATransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, norm_eps:float, max_context:int,
                q_lora_rank:int=0, kv_lora_rank:int=0, qk_nope_head_dim:int=0, qk_rope_head_dim:int=0, v_head_dim:int=0,
@@ -102,16 +93,13 @@ class MLATransformerBlock:
                rope_theta:float=10000.0, **_):
     self.n_heads, self.qk_nope_head_dim, self.qk_rope_head_dim = n_heads, qk_nope_head_dim, qk_rope_head_dim
     self.q_head_dim, self.kv_lora_rank, self.max_context = qk_nope_head_dim + qk_rope_head_dim, kv_lora_rank, max_context
-    self._attn_scale = 1.0 / math.sqrt(self.q_head_dim)
+    self._attn_scale = self.q_head_dim ** -0.5
     self._rope_theta = rope_theta
-    if q_lora_rank > 0:
-      self.attn_q_a = nn.Linear(dim, q_lora_rank, bias=False)
-      self.attn_q_a_norm = nn.RMSNorm(q_lora_rank, norm_eps)
-      self.attn_q_b = nn.Linear(q_lora_rank, n_heads * self.q_head_dim, bias=False)
-    else: self.attn_q = nn.Linear(dim, n_heads * self.q_head_dim, bias=False)
+    self.attn_q_a = nn.Linear(dim, q_lora_rank, bias=False)
+    self.attn_q_a_norm = nn.RMSNorm(q_lora_rank, norm_eps)
+    self.attn_q_b = nn.Linear(q_lora_rank, n_heads * self.q_head_dim, bias=False)
     self.attn_kv_a_mqa = nn.Linear(dim, kv_lora_rank + qk_rope_head_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(kv_lora_rank, norm_eps)
-    self.v_head_dim = v_head_dim
     class Weight:
       def __init__(self, *shape): self.weight = Tensor.empty(*shape)
     self.attn_k_b = Weight(n_heads, kv_lora_rank, qk_nope_head_dim)
@@ -139,20 +127,20 @@ class MLATransformerBlock:
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm, B, T = self.attn_norm(x), x.shape[0], x.shape[1]
-    q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))) if hasattr(self, 'attn_q_a') else self.attn_q(x_norm)
+    q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm)))
     kv_out = self.attn_kv_a_mqa(x_norm)
     q = q.reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     compressed_kv, k_pe = kv_out.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = k_pe.reshape(B, T, 1, self.qk_rope_head_dim).transpose(1, 2)
-    freqs_cis = _precompute_freqs(self.qk_rope_head_dim, self.max_context, self._rope_theta)[start_pos:start_pos+T]
-    q_pe, k_pe = apply_rope_interleaved(q_pe, freqs_cis), apply_rope_interleaved(k_pe, freqs_cis)
+    freqs_cis = precompute_freqs_cis(self.qk_rope_head_dim, self.max_context, self._rope_theta)[start_pos:start_pos+T].half()
+    q_pe, k_pe = apply_rope(q_pe, freqs_cis, interleaved=True), apply_rope(k_pe, freqs_cis, interleaved=True)
     q = (q_nope @ self.attn_k_b.weight.transpose(-1, -2)).cat(q_pe, dim=-1)
     kv_normed = self.attn_kv_a_norm(compressed_kv).unsqueeze(1)
     k_new = kv_normed.cat(k_pe, dim=-1)
-    cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
     if not hasattr(self, "cache_k") or start_pos == 0:
-      self.cache_k = Tensor.empty((B, 1, self.max_context, cache_dim), dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
+      self.cache_k = Tensor.empty((B, 1, self.max_context, self.kv_lora_rank + self.qk_rope_head_dim),
+                                  dtype=kv_normed.dtype, device=kv_normed.device).contiguous().realize()
     self.cache_k[:, :, start_pos:start_pos+T, :].assign(k_new).realize()
     k = self.cache_k[:, :, 0:start_pos+T, :]
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
@@ -167,13 +155,11 @@ class MLATransformerBlock:
       gate_scores = (h_norm.float() @ self.ffn_gate_inp.weight.float().T).sigmoid()
       _, sel = gate_scores.topk(self.num_experts_per_tok)
       probs = gate_scores.gather(-1, sel)
-      if self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(6.103515625e-5)
+      if self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(2**-14)
       x = h_norm.unsqueeze(2)
       gated = self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x)
       weighted_gated = (gated * probs.unsqueeze(-1).cast(gated.dtype)).contiguous()
-      expert_out = self.ffn_down_exps(sel, weighted_gated)
-      moe = expert_out.sum(axis=2)
-      out = moe * self.expert_weights_scale
+      out = self.ffn_down_exps(sel, weighted_gated).sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_shexp'):
         out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
