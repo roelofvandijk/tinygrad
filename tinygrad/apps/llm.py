@@ -446,11 +446,9 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
-  parser.add_argument("--dequantize", action="store_false", help="Dequantize all weights at load time")
   args = parser.parse_args()
 
-  quantized = not args.dequantize
-  if args.model.startswith("glm"): quantized = True
+  quantized = args.model.startswith("glm")
   # load the model
   model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context, quantized=quantized)
   if DEBUG >= 1: print(f"using model {args.model}")
