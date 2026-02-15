@@ -397,18 +397,14 @@ def gguf_load(tensor: Tensor, quantized: bool = False) -> tuple[dict, dict[str, 
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
+  is_disk = isinstance(tensor.device, str) and tensor.device.startswith("DISK")
   quantized_tensors: dict[str, tuple[Tensor, tuple, int]] = {}
   for name, dims, typ, off in t_infos:
-    if quantized and typ in GGML_BLOCK_SIZES:
-      el_per_block, bytes_per_block = GGML_BLOCK_SIZES[typ]
-      blocks = tensor[data_start + off:data_start + off + (prod(dims) // el_per_block) * bytes_per_block]
-      quantized_tensors[name] = (blocks.reshape(-1, bytes_per_block), tuple(reversed(dims)), typ)
-    else:
-      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
-
-  # instead of calling .to(None) on the complete input tensor
-  if isinstance(tensor.device, str) and tensor.device.startswith("DISK"):
-    state_dict = {k: v.to(None) for k, v in state_dict.items()}
-    quantized_tensors = {k: (blocks.to(None), shape, typ) for k, (blocks, shape, typ) in quantized_tensors.items()}
+    n, bs = prod(dims), GGML_BLOCK_SIZES.get(typ)
+    nbytes = (n // bs[0]) * bs[1] if bs else {0:4, 1:2, 16:1, 17:2, 18:4}[typ] * n
+    data = tensor[data_start + off:data_start + off + nbytes]
+    if is_disk: data = data.to(None)
+    if quantized and bs: quantized_tensors[name] = (data.reshape(-1, bs[1]), tuple(reversed(dims)), typ)
+    else: state_dict[name] = ggml_data_to_tensor(data, n, typ).reshape(*reversed(dims))
 
   return kv_data, state_dict, quantized_tensors
