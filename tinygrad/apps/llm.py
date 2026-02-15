@@ -77,6 +77,9 @@ class ExpertWeights:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
 
+class Bias:
+  def __init__(self, n:int): self.bias = Tensor.zeros(n)
+
 def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False) -> Tensor:
   assert x.shape[-1] % 2 == 0
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
@@ -112,6 +115,7 @@ class MLATransformerBlock:
       self.expert_weights_norm = expert_weights_norm
       self.expert_weights_scale = expert_weights_scale
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
+      self.exp_probs_b = Bias(num_experts)
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, moe_hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, moe_hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, moe_hidden_dim, dim)
@@ -153,7 +157,7 @@ class MLATransformerBlock:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       gate_scores = (h_norm.float() @ self.ffn_gate_inp.weight.float().T).sigmoid()
-      _, sel = gate_scores.topk(self.num_experts_per_tok)
+      _, sel = (gate_scores + self.exp_probs_b.bias).topk(self.num_experts_per_tok)
       probs = gate_scores.gather(-1, sel)
       if self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(2**-14)
       x = h_norm.unsqueeze(2)

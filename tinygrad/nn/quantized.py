@@ -41,7 +41,9 @@ def replace_quantized_modules(model, quantized_tensors: dict, state_dict: dict):
       attr = parts[-1]
       obj = parent[int(attr)] if isinstance(parent, list) and attr.isdigit() else getattr(parent, attr, None)
       if obj is not None and type(obj).__name__ == 'ExpertWeights':
-        setattr(parent, attr, QuantizedExpertWeights(blocks, shape, ggml_type))
+        qew = QuantizedExpertWeights(blocks, shape, ggml_type)
+        setattr(parent, attr, qew)
+        state_dict[name[:-7] + '.expert_blocks'] = qew.expert_blocks  # register so load_state_dict finds it
         continue
     # Dequantize nn.Linear and others at load time
     w = ggml_data_to_tensor(blocks.flatten(), prod(shape), ggml_type).reshape(*shape)
