@@ -11,6 +11,12 @@ class QuantizedExpertWeights:
     bpb = blocks.shape[1]
     self.expert_blocks = blocks.reshape(self.num_experts, blocks.shape[0] // self.num_experts, bpb)
 
+  @classmethod
+  def merge_gate_up(cls, gate:QuantizedExpertWeights, up:QuantizedExpertWeights) -> QuantizedExpertWeights:
+    blocks = gate.expert_blocks.cat(up.expert_blocks, dim=1).flatten(end_dim=1).contiguous()
+    blocks.realize()
+    return cls(blocks, (gate.num_experts, gate.out_features + up.out_features, gate.in_features), gate.ggml_type)
+
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     def _q4_0_dot(blocks: Tensor, x: Tensor) -> Tensor:
       scale, packed = blocks[..., :2].bitcast(dtypes.float16), blocks[..., 2:]

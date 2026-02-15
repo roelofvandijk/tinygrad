@@ -3,7 +3,8 @@ import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
-from tinygrad.nn.quantized import replace_quantized_modules
+from tinygrad.nn.quantized import replace_quantized_modules, QuantizedExpertWeights
+
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
@@ -88,6 +89,7 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False) -> Tensor:
     return (x1 * cos - x2 * sin).unsqueeze(-1).cat((x2 * cos + x1 * sin).unsqueeze(-1), dim=-1).flatten(-2)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+
 class MLATransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, norm_eps:float, max_context:int,
                q_lora_rank:int=0, kv_lora_rank:int=0, qk_nope_head_dim:int=0, qk_rope_head_dim:int=0, v_head_dim:int=0,
@@ -112,6 +114,7 @@ class MLATransformerBlock:
     self.ffn_norm = nn.RMSNorm(dim, norm_eps)
     if num_experts > 0:
       self.num_experts_per_tok = num_experts_per_tok
+      self.moe_hidden_dim = moe_hidden_dim
       self.expert_weights_norm = expert_weights_norm
       self.expert_weights_scale = expert_weights_scale
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
@@ -155,15 +158,16 @@ class MLATransformerBlock:
 
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_up_exps'):
       gate_scores = (h_norm.float() @ self.ffn_gate_inp.weight.float().T).sigmoid()
       _, sel = (gate_scores + self.exp_probs_b.bias).topk(self.num_experts_per_tok)
       probs = gate_scores.gather(-1, sel)
       if self.expert_weights_norm: probs = probs / probs.sum(axis=-1, keepdim=True).maximum(2**-14)
-      x = h_norm.unsqueeze(2)
-      gated = self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x)
-      weighted_gated = (gated * probs.unsqueeze(-1).cast(gated.dtype)).contiguous()
-      out = self.ffn_down_exps(sel, weighted_gated).sum(axis=2) * self.expert_weights_scale
+      gate_up = self.ffn_gate_up_exps(sel, h_norm)
+      gate, up = gate_up.split([self.moe_hidden_dim, self.moe_hidden_dim], dim=-1)
+      weighted_gated = gate.silu() * up * probs.unsqueeze(-1).cast(gate.dtype)
+      expert_out = self.ffn_down_exps(sel, weighted_gated)
+      out = expert_out.sum(axis=2) * self.expert_weights_scale
       if hasattr(self, 'ffn_gate_shexp'):
         out = out.contiguous() + self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
       return h + out.cast(h.dtype)
@@ -321,6 +325,11 @@ class Transformer:
     has_quantized = bool(quantized_tensors)
     if has_quantized: replace_quantized_modules(model, quantized_tensors, state_dict)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False, strict=not has_quantized)
+    # merge gate+up experts: 2 gathers → 1 gather per MoE block
+    for blk in model.blk:
+      if not hasattr(blk, 'ffn_gate_exps') or not isinstance(blk.ffn_gate_exps, QuantizedExpertWeights): continue
+      blk.ffn_gate_up_exps = QuantizedExpertWeights.merge_gate_up(blk.ffn_gate_exps, blk.ffn_up_exps)
+      del blk.ffn_gate_exps, blk.ffn_up_exps
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())  # removing this would cut 5s warmup time for glp
     if realize: Tensor.realize(*params)

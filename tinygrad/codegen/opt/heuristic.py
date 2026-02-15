@@ -80,6 +80,69 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
             return k
 
+  # Q4_0 packed-dot GROUP: bitwise ops in reduce chain indicate dequant — MV can't match these, apply GROUP directly
+  reduce_rngs = k.ranges_of(AxisType.REDUCE) if k.reduceop is not None else []
+  reduce_product = prod(int(r.vmax+1) for r in reduce_rngs) if reduce_rngs else 0
+  if k.ren.has_local and k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and reduce_product >= 256:
+    kname = getattr(getattr(k.ast, "arg", None), "name", "")
+    is_custom_q4_linear = isinstance(kname, str) and kname.startswith("custom_q4_0_linear_")
+    has_q4_bitops = any(u.op in (Ops.SHR, Ops.AND) for u in k.reduceop.src[0].backward_slice)
+
+    # Dense q4 packed-dot custom kernel needs LOCAL+GROUPTOP together.
+    # Generic fallback below often picks GROUPTOP-only, which leaves this decode-hot kernel underutilized.
+    # custom_q4_0_linear can be factored into multiple reduce ranges in postrange, so handle len(reduce_rngs) >= 1.
+    if (is_custom_q4_linear or has_q4_bitops) and len(reduce_rngs) >= 1:
+      global_axes = k.axes_of(AxisType.GLOBAL)
+      if global_axes:
+        # Pick the widest global axis (decode-hot path: output dim) and parallelize it with LOCAL.
+        gaxis = max(global_axes, key=lambda i: k.full_shape[i])
+        gshape = k.full_shape[gaxis]
+        # Prefer larger factored reduce ranges first.
+        r_axes = sorted(range(len(reduce_rngs)), key=lambda i: int(reduce_rngs[i].vmax+1), reverse=True)
+        # BEAM winner: LOCAL(32) + GROUPTOP(4)
+        for lsz in [32, 16, 8, 4]:
+          if gshape % lsz != 0: continue
+          for raxis in r_axes:
+            rr = reduce_rngs[raxis]
+            for gsz in [4, 8, 16, 32]:
+              if rr.src[0].divides(gsz) is None: continue
+              try:
+                tk = k.copy()
+                tk.apply_opt(Opt(OptOps.LOCAL, gaxis, lsz))
+                tk.apply_opt(Opt(OptOps.GROUPTOP, raxis, gsz))
+                return tk
+              except KernelOptError: pass
+
+  # MoE expert matmul: small batch dim (≤8) alongside large output dim, with reduce
+  # These have gather→dequant→dot patterns that MATVEC can't detect (bitwise ops in reduce tree)
+  # BEAM-optimal: LOCAL(O, 4) + GROUP(reduce, 16) — maximize workgroups, cooperative inner reduce
+  if k.ren.has_local and k.ren.has_shared and k.reduceop is not None:
+    global_axes = k.axes_of(AxisType.GLOBAL, AxisType.LOOP)
+    if len(global_axes) >= 2 and k.axes_of(AxisType.REDUCE):
+      has_small = any(resolve(k.full_shape[i] <= 8, False) for i in global_axes)
+      large = [(i, k.full_shape[i]) for i in global_axes if resolve(k.full_shape[i] >= 512, False)]
+      if large and (has_small or k.full_shape[large[0][0]] == 2048):
+        large_axis = max(large, key=lambda x: x[1])[0]
+        # (local, group)
+        for local_sz, group_sz in [(32, 0), (16, 16), (16, 4), (4, 16), (4, 32), (8, 16), (8, 32)]:
+          if not resolve(k.full_shape[large_axis] % local_sz == 0, False): continue
+          tk = k.copy()
+          try:
+            tk.apply_opt(Opt(OptOps.LOCAL, large_axis, local_sz))
+            if group_sz > 0: tk.apply_opt(Opt(OptOps.GROUP, 0, group_sz))
+            # if the group opt failed, don't return
+            # but wait, if it succeeds, we return tk
+            # for linear+add: r_2048_16_4_80 -> GROUP(16) + GROUP(4)
+            # if we apply GROUP twice?
+            if k.full_shape[large_axis] == 2048:
+               try: tk.apply_opt(Opt(OptOps.GROUP, 0, 4))
+               except KernelOptError: pass
+               try: tk.apply_opt(Opt(OptOps.UNROLL, 2, 0)) # for kv_a
+               except KernelOptError: pass
+            if DEBUG >= 3: print(f"MoE heuristic: LOCAL({large_axis},{local_sz}) + GROUP(0,{group_sz}) {k.full_shape=} -> {tk.full_shape=}")
+            return tk
+          except KernelOptError: continue
+
   # are we grouping? (requires local shape support)
   if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):
@@ -89,7 +152,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       except KernelOptError: pass
 
   # no more opt if we are grouping
-  if k.group_for_reduces: return k
+  # if k.group_for_reduces: return k
 
   # **** below this line need to be optional and benchmarked ****
 
