@@ -226,8 +226,7 @@ class GatedDeltaNetBlock(ResidualBlock):
     self.conv_state = Tensor.zeros(B:=x.shape[0], self.conv_kernel-1, self.conv_channels, dtype="float32", device=x.device).contiguous().realize()
     self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
 
-  def _gdn_attention(self, x:Tensor) -> Tensor:
-    # TODO: batched prefill
+  def _attention(self, x:Tensor, _start_pos:int|UOp) -> Tensor:
     # TODO: function support?
     if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self._gdn_attention_step(x)
     out = Tensor.empty(*x.shape, dtype=x.dtype, device=x.device).contiguous()
@@ -237,7 +236,6 @@ class GatedDeltaNetBlock(ResidualBlock):
     return out
 
   def _gdn_attention_step(self, x:Tensor) -> Tensor:
-    # TODO - inline in transformerblock?
     # TODO - remove realizes for @function support
     B, xn = x.shape[0], self.attn_norm(x)
     qkv, z, beta, alpha = self.attn_qkv(xn), self.attn_gate(xn), self.ssm_beta(xn).sigmoid(), self.ssm_alpha(xn)
@@ -264,10 +262,6 @@ class GatedDeltaNetBlock(ResidualBlock):
 
   def _init_block_state(self, x:Tensor, start_pos:int|UOp):
     if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self._init_state(x)
-
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    del start_pos
-    return self._gdn_attention(x)
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
