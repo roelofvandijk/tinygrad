@@ -317,20 +317,22 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
-    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length') or kv[f'{arch}.feed_forward_length'],
+    def g(k, d=0): return kv.get(f'{arch}.{k}', d)
+    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=(dim:=kv[f'{arch}.embedding_length']),
+                        hidden_dim=g('expert_feed_forward_length') or kv[f'{arch}.feed_forward_length'],
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
-                        head_dim=kv.get(f'{arch}.attention.key_length') or kv[f'{arch}.embedding_length'] // n_heads,
+                        head_dim=g('attention.key_length') or dim // n_heads,
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=next((int(state_dict[k].shape[0]) for k in state_dict if 'attn_q_norm.weight' in k), 0),
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        shared_expert_hidden_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', 0),
-                        expert_weights_norm=kv.get(f'{arch}.expert_weights_norm', bool(kv.get(f'{arch}.expert_shared_feed_forward_length', 0))),
-                        full_attn_interval=kv.get(f'{arch}.full_attention_interval', 0), rope_dim=kv.get(f'{arch}.rope.dimension_count', 0),
-                        ssm_state_size=kv.get(f'{arch}.ssm.state_size', 0), ssm_group_count=kv.get(f'{arch}.ssm.group_count', 0),
-                        ssm_time_step_rank=kv.get(f'{arch}.ssm.time_step_rank', 0), ssm_inner_size=kv.get(f'{arch}.ssm.inner_size', 0),
-                        ssm_conv_kernel=kv.get(f'{arch}.ssm.conv_kernel', 0))
+                        num_experts=g('expert_count', 0), num_experts_per_tok=g('expert_used_count', 0),
+                        shared_expert_hidden_dim=(shared_expert_hidden_dim:=g('expert_shared_feed_forward_length', 0)),
+                        # models with shared experts default to normalized expert weights
+                        expert_weights_norm=g('expert_weights_norm', shared_expert_hidden_dim > 0),
+                        full_attn_interval=g('full_attention_interval', 0), rope_dim=g('rope.dimension_count', 0),
+                        ssm_state_size=g('ssm.state_size', 0), ssm_group_count=g('ssm.group_count', 0),
+                        ssm_time_step_rank=g('ssm.time_step_rank', 0), ssm_inner_size=g('ssm.inner_size', 0),
+                        ssm_conv_kernel=g('ssm.conv_kernel', 0))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
