@@ -119,7 +119,7 @@ class TransformerBlock:
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if n_shared_experts > 0:
+      if n_shared_experts > 0 or shared_expert_hidden_dim > 0:
         shexp_hidden = shared_expert_hidden_dim or n_shared_experts * hidden_dim
         self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
         self.ffn_gate_shexp = nn.Linear(dim, shexp_hidden, bias=False)
@@ -214,7 +214,7 @@ class GatedDeltaNetBlock:
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if n_shared_experts > 0:
+      if n_shared_experts > 0 or shared_expert_hidden_dim > 0:
         shexp_hidden = shared_expert_hidden_dim or n_shared_experts * hidden_dim
         self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
         self.ffn_gate_shexp = nn.Linear(dim, shexp_hidden, bias=False)
