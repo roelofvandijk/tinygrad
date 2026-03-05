@@ -92,7 +92,7 @@ class DenseFFN:
   def __call__(self, block, h_norm:Tensor) -> Tensor: return block.ffn_down(block.ffn_gate(h_norm).silu().contiguous() * block.ffn_up(h_norm))
 
 class MoeFFN:
-  def __init__(self, block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int, expert_weights_norm:bool):
+  def __init__(self, block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int,expert_weights_norm:bool):
     self.num_experts_per_tok = num_experts_per_tok
     self.expert_weights_norm = expert_weights_norm
     self.has_shared_experts  = shared_expert_hidden_dim > 0
