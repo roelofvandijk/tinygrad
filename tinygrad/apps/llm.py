@@ -118,13 +118,13 @@ class MoeFFN:
 
 class ResidualBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
-  def feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self.norm_ffn_input(h))
+  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self.norm_ffn_input(h))
   def init_block_state(self, x:Tensor, start_pos:int|UOp): pass
   def attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
   def norm_ffn_input(self, h:Tensor) -> Tensor: raise NotImplementedError
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self.init_block_state(x, start_pos)
-    return self.feed_forward(self.attention(x, start_pos)).contiguous()
+    return self._feed_forward(self.attention(x, start_pos)).contiguous()
 
 class TransformerBlock(ResidualBlock):
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float, max_context:int=0,
