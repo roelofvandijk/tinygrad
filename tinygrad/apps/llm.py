@@ -119,7 +119,7 @@ class FFN:
 
 class ResidualBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
-  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self.ffn_norm(h))
+  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self._ffn_input_norm(h))
   def _init_block_state(self, x:Tensor, start_pos:int|UOp): pass
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
   def __call__(self, x: Tensor, start_pos: int|UOp):
@@ -149,9 +149,12 @@ class TransformerBlock(ResidualBlock):
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
-    # gated_attn models use post_attention_norm (GGUF name) as the FFN input norm
-    if gated_attn: self.ffn_norm = self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
-    else: self.ffn_norm = nn.RMSNorm(dim, norm_eps)
+    if gated_attn:
+      self.post_attention_norm, self.ffn_norm = nn.RMSNorm(dim, norm_eps), None
+      self._ffn_input_norm = self.post_attention_norm.__call__
+    else:
+      self.post_attention_norm, self.ffn_norm = None, nn.RMSNorm(dim, norm_eps)
+      self._ffn_input_norm = self.ffn_norm.__call__
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
@@ -215,7 +218,8 @@ class GatedDeltaNetBlock(ResidualBlock):
     self.ssm_norm = nn.RMSNorm(head_v_dim, norm_eps)
     self.ssm_out = nn.Linear(self.value_dim, dim, bias=False)
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm = self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
+    self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
+    self._ffn_input_norm = self.post_attention_norm.__call__
     self.ffn = FFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   def _init_state(self, x:Tensor):
