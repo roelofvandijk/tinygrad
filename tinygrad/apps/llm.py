@@ -84,6 +84,44 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def _init_shared_expert_tail(block, dim:int, shared_expert_hidden_dim:int):
+  if shared_expert_hidden_dim <= 0: return
+  block.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
+  block.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+  block.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+  block.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
+
+def _init_ffn(block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int, expert_weights_norm:bool):
+  if num_experts > 0:
+    block.num_experts_per_tok = num_experts_per_tok
+    block.expert_weights_norm = expert_weights_norm
+    block.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
+    block.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
+    block.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
+    block.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
+    _init_shared_expert_tail(block, dim, shared_expert_hidden_dim)
+    return
+  block.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
+  block.ffn_up = nn.Linear(dim, hidden_dim, bias=False)
+  block.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
+
+def _apply_shared_expert_tail(block, h_norm:Tensor, out:Tensor) -> Tensor:
+  shared = block.ffn_down_shexp(block.ffn_gate_shexp(h_norm).silu() * block.ffn_up_shexp(h_norm))
+  gate = (h_norm * block.ffn_gate_inp_shexp.weight).sum(axis=-1, keepdim=True).sigmoid()
+  return out.contiguous() + shared * gate
+
+def _feed_forward_from_norm(block, h:Tensor, h_norm:Tensor) -> Tensor:
+  if hasattr(block, 'ffn_gate_exps'):
+    x = h_norm.unsqueeze(2)
+    probs, sel = block.ffn_gate_inp(h_norm).softmax(-1).topk(block.num_experts_per_tok)
+    if block.expert_weights_norm: probs = probs / probs.sum(-1, keepdim=True).maximum(2**-14)
+    x_down = block.ffn_down_exps(sel, block.ffn_gate_exps(sel, x).silu() * block.ffn_up_exps(sel, x))
+    out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
+    if hasattr(block, 'ffn_gate_shexp'): out = _apply_shared_expert_tail(block, h_norm, out)
+    return h + out
+  gated = block.ffn_gate(h_norm).silu().contiguous() * block.ffn_up(h_norm)
+  return h + block.ffn_down(gated)
+
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, gated_attn:bool=False, rope_dim:int=0,
@@ -112,22 +150,7 @@ class TransformerBlock:
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
-    if num_experts > 0:
-      self.num_experts_per_tok = num_experts_per_tok
-      self.expert_weights_norm = expert_weights_norm
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if shared_expert_hidden_dim > 0:
-        self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
-        self.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
-    else:
-      self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
+    _init_ffn(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -167,19 +190,7 @@ class TransformerBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.post_attention_norm(h) if self.gated_attn else self.ffn_norm(h)
-    if hasattr(self, 'ffn_gate_exps'):
-      x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      if self.expert_weights_norm: probs = probs / probs.sum(-1, keepdim=True).maximum(2**-14)
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
-      if hasattr(self, 'ffn_gate_shexp'):
-        shared = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
-        out = out.contiguous() + shared * (h_norm * self.ffn_gate_inp_shexp.weight).sum(axis=-1, keepdim=True).sigmoid()
-      return h + out
-    # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    return _feed_forward_from_norm(self, h, h_norm)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if not hasattr(self, "cache_kv"):
@@ -206,22 +217,7 @@ class GatedDeltaNetBlock:
     self.ssm_out = nn.Linear(self.value_dim, dim, bias=False)
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
     self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
-    if num_experts > 0:
-      self.num_experts_per_tok = num_experts_per_tok
-      self.expert_weights_norm = expert_weights_norm
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if shared_expert_hidden_dim > 0:
-        self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
-        self.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
-    else:
-      self.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_up   = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
+    _init_ffn(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   def _init_state(self, x:Tensor):
     self.conv_state = Tensor.zeros(B:=x.shape[0], self.conv_kernel-1, self.conv_channels, dtype="float32", device=x.device).contiguous().realize()
@@ -266,18 +262,7 @@ class GatedDeltaNetBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.post_attention_norm(h)
-    if hasattr(self, 'ffn_gate_exps'):
-      x = h_norm.unsqueeze(2)
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)
-      if self.expert_weights_norm: probs = probs / probs.sum(-1, keepdim=True).maximum(2**-14)
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
-      if hasattr(self, 'ffn_gate_shexp'):
-        shared = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
-        out = out.contiguous() + shared * (h_norm * self.ffn_gate_inp_shexp.weight).sum(axis=-1, keepdim=True).sigmoid()
-      return h + out
-    gated = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    return _feed_forward_from_norm(self, h, h_norm)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self._init_state(x)
