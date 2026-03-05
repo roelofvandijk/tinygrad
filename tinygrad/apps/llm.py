@@ -354,13 +354,13 @@ class Transformer:
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
       if start_pos < prompt_len:
-        nt = 1 if v_toks is None else v_toks.bind(min(chunk_size, prompt_len - start_pos))
+        nt = v_toks.bind(min(chunk_size, prompt_len - start_pos)) if v_toks is not None else 1
         out = self(t[:, sp:sp+nt], sp).realize()
-        start_pos += nt if isinstance(nt, int) else nt.val
+        start_pos += nt.val if isinstance(nt, UOp) else nt
         # chunked prefill: keep processing until all prompt tokens are consumed
         if start_pos < prompt_len: continue
       else:
-        out = self(t[:, sp:sp+1], sp).realize() if self.has_gdn else self(out, sp).realize()
+        out = self(t[:, sp:sp+1] if self.has_gdn else out, sp).realize()
         start_pos += 1
       tokens.append(int(out.item()))
       if self.has_gdn: t[:, start_pos:start_pos+1].assign(out).realize()
