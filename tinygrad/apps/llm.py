@@ -230,15 +230,16 @@ class GatedDeltaNetBlock:
     self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
 
   def _gdn_attention(self, x:Tensor) -> Tensor:
-    if (T:=x.shape[1]) == 1: return self._gdn_attention_step(x)
+    if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self._gdn_attention_step(x)
     out = Tensor.empty(*x.shape, dtype=x.dtype, device=x.device).contiguous()
     for t in range(T):
-      assigned = out.uop.after(out[:, t:t+1, :].uop.assign(self._gdn_attention_step(x[:, t:t+1, :]).contiguous().realize().uop))
+      assigned = out.uop.after(out[:, t:t+1, :].uop.assign(self._gdn_attention_step(x[:, t:t+1, :]).contiguous().uop))
       out = Tensor(assigned, device=assigned.device)
     return out
 
   def _gdn_attention_step(self, x:Tensor) -> Tensor:
     # TODO - inline in transformerblock?
+    # TODO - remove realizes for @function support
     B, xn = x.shape[0], self.attn_norm(x)
     qkv, z, beta, alpha = self.attn_qkv(xn), self.attn_gate(xn), self.ssm_beta(xn).sigmoid(), self.ssm_alpha(xn)
     gate = self.ssm_a * (alpha + self.ssm_dt.bias).softplus()
