@@ -88,40 +88,38 @@ class FFN:
   """Generic feed-forward adapter: supports dense SwiGLU and MoE(+shared expert) paths."""
   def __init__(self, block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int, expert_weights_norm:bool):
     self.num_experts_per_tok, self.expert_weights_norm = num_experts_per_tok, expert_weights_norm
-    if num_experts > 0:
+    self.is_moe = num_experts > 0
+    self.has_shared_experts = shared_expert_hidden_dim > 0
+    if self.is_moe:
       block.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
       block.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       block.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       block.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if shared_expert_hidden_dim > 0:
+      if self.has_shared_experts:
         block.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
         block.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
         block.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
         block.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
-      self.router, self.gate_exps, self.up_exps, self.down_exps = \
-        block.ffn_gate_inp.__call__, block.ffn_gate_exps.__call__, block.ffn_up_exps.__call__, block.ffn_down_exps.__call__
-      self.shared_tail = (lambda h_norm, out: out.contiguous() + block.ffn_down_shexp(block.ffn_gate_shexp(h_norm).silu() * block.ffn_up_shexp(h_norm)) * \
-                          (h_norm * block.ffn_gate_inp_shexp.weight).sum(axis=-1, keepdim=True).sigmoid()) if hasattr(block, 'ffn_gate_shexp') else None
-      self.gate = self.up = self.down = None
       return
     block.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
     block.ffn_up = nn.Linear(dim, hidden_dim, bias=False)
     block.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
-    self.gate, self.up, self.down = block.ffn_gate.__call__, block.ffn_up.__call__, block.ffn_down.__call__
-    self.router = self.gate_exps = self.up_exps = self.down_exps = self.shared_tail = None
 
-  def __call__(self, h_norm:Tensor) -> Tensor:
-    if self.router is None: return self.down(self.gate(h_norm).silu().contiguous() * self.up(h_norm))
+  def __call__(self, block, h_norm:Tensor) -> Tensor:
+    if not self.is_moe: return block.ffn_down(block.ffn_gate(h_norm).silu().contiguous() * block.ffn_up(h_norm))
     x = h_norm.unsqueeze(2)
-    probs, sel = self.router(h_norm).softmax(-1).topk(self.num_experts_per_tok)
+    probs, sel = block.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)
     if self.expert_weights_norm: probs = probs / probs.sum(-1, keepdim=True).maximum(2**-14)
-    x_down = self.down_exps(sel, self.gate_exps(sel, x).silu() * self.up_exps(sel, x))
+    x_down = block.ffn_down_exps(sel, block.ffn_gate_exps(sel, x).silu() * block.ffn_up_exps(sel, x))
     out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
-    return self.shared_tail(h_norm, out) if self.shared_tail is not None else out
+    if not self.has_shared_experts: return out
+    shared = block.ffn_down_shexp(block.ffn_gate_shexp(h_norm).silu() * block.ffn_up_shexp(h_norm))
+    gate = (h_norm * block.ffn_gate_inp_shexp.weight).sum(axis=-1, keepdim=True).sigmoid()
+    return out.contiguous() + shared * gate
 
 class ResidualBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
-  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self._ffn_input_norm(h))
+  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self._ffn_input_norm(h))
   def _init_block_state(self, x:Tensor, start_pos:int|UOp): pass
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
   def __call__(self, x: Tensor, start_pos: int|UOp):
