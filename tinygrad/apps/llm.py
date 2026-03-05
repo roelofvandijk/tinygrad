@@ -117,6 +117,7 @@ class MoeFFN:
     return out.contiguous() + shared * gate
 
 class ResidualBlock:
+  ffn: DenseFFN|MoeFFN
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self.norm_ffn_input(h))
   def init_block_state(self, x:Tensor, start_pos:int|UOp): pass
@@ -149,8 +150,8 @@ class TransformerBlock(ResidualBlock):
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
-    if gated_attn: self.post_attention_norm, self.ffn_norm = nn.RMSNorm(dim, norm_eps), None
-    else: self.post_attention_norm, self.ffn_norm = None, nn.RMSNorm(dim, norm_eps)
+    if gated_attn: self.ffn_norm = self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
+    else: self.ffn_norm = nn.RMSNorm(dim, norm_eps)
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
@@ -198,7 +199,7 @@ class TransformerBlock(ResidualBlock):
       # NOTE: clone is used to promise the creation of a specific buffer
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
 
-  def norm_ffn_input(self, h:Tensor) -> Tensor: return self.post_attention_norm(h) if self.gated_attn else self.ffn_norm(h)
+  def norm_ffn_input(self, h:Tensor) -> Tensor: return self.ffn_norm(h)
 
 class GatedDeltaNetBlock(ResidualBlock):
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, head_k_dim:int, num_k_heads:int, num_v_heads:int, head_v_dim:int, conv_kernel:int,
@@ -355,7 +356,7 @@ class Transformer:
     # recompute start_pos from what's currently valid in the kv cache
     start_pos = self.get_start_pos(tokens)
     prompt_len = len(tokens)
-    out = None
+    out = t[:, :1]
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
       if start_pos < prompt_len:
