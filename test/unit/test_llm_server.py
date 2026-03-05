@@ -83,5 +83,31 @@ class TestTransformerGenerate(unittest.TestCase):
     self.assertEqual(cache_size_after_warmup, len(schedule_cache),
       f"third prompt added {len(schedule_cache) - cache_size_after_warmup} new schedule cache entries (expected 0)")
 
+  def test_gdn_disables_prefix_reuse(self):
+    """GDN models must always restart from start_pos=0 and prefill tokenwise."""
+    from tinygrad.apps.llm import Transformer
+    model = Transformer(num_blocks=4, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
+                        norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, max_context=64,
+                        full_attn_interval=4, ssm_state_size=16, ssm_group_count=2, ssm_time_step_rank=2,
+                        ssm_inner_size=32, ssm_conv_kernel=4)
+
+    # warm cache with one run
+    gen = model.generate([1, 2, 3, 4, 5])
+    next(gen)
+
+    captured_inputs = []
+    def mock_call(self, tokens, start_pos):
+      captured_inputs.append((tokens.shape, start_pos if isinstance(start_pos, int) else start_pos.val))
+      return Tensor([[42]])
+
+    with patch.object(Transformer, '__call__', mock_call):
+      # shared prefix would normally allow reuse, but GDN path must restart from 0
+      gen = model.generate([1, 2, 3, 4, 5, 99, 100])
+      next(gen)
+
+    toks_shape = captured_inputs[0][0][-1]
+    self.assertEqual(toks_shape.val if isinstance(toks_shape, UOp) else toks_shape, 1)
+    self.assertEqual(captured_inputs[0][1], 0)
+
 if __name__ == '__main__':
   unittest.main()
