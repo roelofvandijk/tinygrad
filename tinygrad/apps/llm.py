@@ -254,7 +254,7 @@ class GatedDeltaNetBlock(ResidualBlock):
       ssm_state = St.transpose(-1, -2).contiguous()
       yt = Tensor.einsum("bhd,bhde->bhe", q, St).reshape(B, 1, self.num_v_heads, self.head_v_dim)
       yt = (self.ssm_norm(yt) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype)
-      assigned = out.uop.after(out[:, t:t+1, :].uop.assign((xt + self.ssm_out(yt)).contiguous().uop))
+      assigned = out.uop.after(out[:, t:t+1, :].uop.assign((xt + self.ssm_out(yt)).contiguous().realize().uop))
       out = Tensor(assigned, device=assigned.device)
     self.conv_state.assign(conv_state).realize()
     self.ssm_state.assign(ssm_state).realize()
