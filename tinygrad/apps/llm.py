@@ -119,12 +119,12 @@ class FFN:
 
 class ResidualBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
-  def _feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self._ffn_input_norm(h))
-  def _init_block_state(self, x:Tensor, start_pos:int|UOp): pass
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
+  def feed_forward(self, h: Tensor) -> Tensor: return h + self.ffn(self, self.ffn_input_norm(h))
+  def init_block_state(self, x:Tensor, start_pos:int|UOp): pass
+  def attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    self._init_block_state(x, start_pos)
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    self.init_block_state(x, start_pos)
+    return self.feed_forward(self.attention(x, start_pos)).contiguous()
 
 class TransformerBlock(ResidualBlock):
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
@@ -151,17 +151,17 @@ class TransformerBlock(ResidualBlock):
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
     if gated_attn:
       self.post_attention_norm, self.ffn_norm = nn.RMSNorm(dim, norm_eps), None
-      self._ffn_input_norm = self.post_attention_norm.__call__
+      self.ffn_input_norm = self.post_attention_norm.__call__
     else:
       self.post_attention_norm, self.ffn_norm = None, nn.RMSNorm(dim, norm_eps)
-      self._ffn_input_norm = self.ffn_norm.__call__
+      self.ffn_input_norm = self.ffn_norm.__call__
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     self.ffn = FFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
     q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
     B, T, _ = x.shape
@@ -195,7 +195,7 @@ class TransformerBlock(ResidualBlock):
     attn = self.attn_output(attn)
     return x + attn
 
-  def _init_block_state(self, x:Tensor, start_pos:int|UOp):
+  def init_block_state(self, x:Tensor, start_pos:int|UOp):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       # NOTE: clone is used to promise the creation of a specific buffer
@@ -219,23 +219,23 @@ class GatedDeltaNetBlock(ResidualBlock):
     self.ssm_out = nn.Linear(self.value_dim, dim, bias=False)
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
     self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
-    self._ffn_input_norm = self.post_attention_norm.__call__
+    self.ffn_input_norm = self.post_attention_norm.__call__
     self.ffn = FFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   def _init_state(self, x:Tensor):
     self.conv_state = Tensor.zeros(B:=x.shape[0], self.conv_kernel-1, self.conv_channels, dtype="float32", device=x.device).contiguous().realize()
     self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
 
-  def _attention(self, x:Tensor, _start_pos:int|UOp) -> Tensor:
+  def attention(self, x:Tensor, _start_pos:int|UOp) -> Tensor:
     # TODO: function support?
-    if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self._gdn_attention_step(x)
+    if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self.gdn_attention_step(x)
     out = Tensor.empty(*x.shape, dtype=x.dtype, device=x.device).contiguous()
     for t in range(T):
-      assigned = out.uop.after(out[:, t:t+1, :].uop.assign(self._gdn_attention_step(x[:, t:t+1, :]).contiguous().realize().uop))
+      assigned = out.uop.after(out[:, t:t+1, :].uop.assign(self.gdn_attention_step(x[:, t:t+1, :]).contiguous().realize().uop))
       out = Tensor(assigned, device=assigned.device)
     return out
 
-  def _gdn_attention_step(self, x:Tensor) -> Tensor:
+  def gdn_attention_step(self, x:Tensor) -> Tensor:
     # TODO - remove realizes for @function support
     B, xn = x.shape[0], self.attn_norm(x)
     qkv, z, beta, alpha = self.attn_qkv(xn), self.attn_gate(xn), self.ssm_beta(xn).sigmoid(), self.ssm_alpha(xn)
@@ -260,7 +260,7 @@ class GatedDeltaNetBlock(ResidualBlock):
     out = (self.ssm_norm(out) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype)
     return x + self.ssm_out(out)
 
-  def _init_block_state(self, x:Tensor, start_pos:int|UOp):
+  def init_block_state(self, x:Tensor, start_pos:int|UOp):
     if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self._init_state(x)
 
 class Transformer:
