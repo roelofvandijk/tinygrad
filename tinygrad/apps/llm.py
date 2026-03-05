@@ -87,7 +87,7 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, gated_attn:bool=False, rope_dim:int=0,
-               n_shared_experts:int=0, shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
+               shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -119,12 +119,11 @@ class TransformerBlock:
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if n_shared_experts > 0 or shared_expert_hidden_dim > 0:
-        shexp_hidden = shared_expert_hidden_dim or n_shared_experts * hidden_dim
+      if shared_expert_hidden_dim > 0:
         self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
-        self.ffn_gate_shexp = nn.Linear(dim, shexp_hidden, bias=False)
-        self.ffn_up_shexp = nn.Linear(dim, shexp_hidden, bias=False)
-        self.ffn_down_shexp = nn.Linear(shexp_hidden, dim, bias=False)
+        self.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+        self.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+        self.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
     else:
       self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
@@ -191,7 +190,7 @@ class TransformerBlock:
 
 class GatedDeltaNetBlock:
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, head_k_dim:int, num_k_heads:int, num_v_heads:int, head_v_dim:int, conv_kernel:int,
-               num_experts:int=0, num_experts_per_tok:int=0, n_shared_experts:int=0, shared_expert_hidden_dim:int=0,
+               num_experts:int=0, num_experts_per_tok:int=0, shared_expert_hidden_dim:int=0,
                expert_weights_norm:bool=False):
     self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim = num_k_heads, num_v_heads, head_k_dim, head_v_dim
     self.conv_kernel, self.norm_eps, self.key_dim, self.value_dim = conv_kernel, norm_eps, head_k_dim * num_k_heads, head_v_dim * num_v_heads
@@ -214,12 +213,11 @@ class GatedDeltaNetBlock:
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
-      if n_shared_experts > 0 or shared_expert_hidden_dim > 0:
-        shexp_hidden = shared_expert_hidden_dim or n_shared_experts * hidden_dim
+      if shared_expert_hidden_dim > 0:
         self.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
-        self.ffn_gate_shexp = nn.Linear(dim, shexp_hidden, bias=False)
-        self.ffn_up_shexp = nn.Linear(dim, shexp_hidden, bias=False)
-        self.ffn_down_shexp = nn.Linear(shexp_hidden, dim, bias=False)
+        self.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+        self.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+        self.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
     else:
       self.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_up   = nn.Linear(dim, hidden_dim, bias=False)
@@ -289,14 +287,14 @@ class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, full_attn_interval:int=0, rope_dim:int=0,
                ssm_state_size:int=0, ssm_group_count:int=0, ssm_time_step_rank:int=0, ssm_inner_size:int=0, ssm_conv_kernel:int=0,
-               n_shared_experts:int=0, shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
+               shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
     gated_attn = bool(ssm_conv_kernel)
     head_v_dim = ssm_inner_size // ssm_time_step_rank if gated_attn else 0
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm, num_experts,
-                                 num_experts_per_tok, gated_attn, rope_dim, n_shared_experts, shared_expert_hidden_dim,
+                                 num_experts_per_tok, gated_attn, rope_dim, shared_expert_hidden_dim,
                                  expert_weights_norm) if not (gated_attn and full_attn_interval and (i+1)%full_attn_interval)
                 else GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, head_v_dim, ssm_conv_kernel,
-                                   num_experts, num_experts_per_tok, n_shared_experts, shared_expert_hidden_dim, expert_weights_norm)
+                                   num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
                 for i in range(num_blocks)]
     self.has_gdn = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self.token_embd  = nn.Embedding(vocab_size, dim)
@@ -346,7 +344,6 @@ class Transformer:
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=next((int(state_dict[k].shape[0]) for k in state_dict if 'attn_q_norm.weight' in k), 0),
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        n_shared_experts=kv.get(f'{arch}.expert_shared_count', 0),
                         shared_expert_hidden_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', 0),
                         expert_weights_norm=kv.get(f'{arch}.expert_weights_norm', bool(kv.get(f'{arch}.expert_shared_feed_forward_length', 0))),
                         full_attn_interval=kv.get(f'{arch}.full_attention_interval', 0), rope_dim=kv.get(f'{arch}.rope.dimension_count', 0),
