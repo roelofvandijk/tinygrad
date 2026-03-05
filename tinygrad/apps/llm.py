@@ -270,12 +270,13 @@ class Transformer:
                shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
     gated_attn = bool(ssm_conv_kernel)
     head_v_dim = ssm_inner_size // ssm_time_step_rank if gated_attn else 0
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm, num_experts,
-                                 num_experts_per_tok, gated_attn, rope_dim, shared_expert_hidden_dim,
-                                 expert_weights_norm) if not (gated_attn and full_attn_interval and (i+1)%full_attn_interval)
-                else GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, head_v_dim, ssm_conv_kernel,
-                                   num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
-                for i in range(num_blocks)]
+    def make_block(i):
+      if gated_attn and full_attn_interval and (i+1)%full_attn_interval:
+        return GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, head_v_dim, ssm_conv_kernel,
+                                  num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
+      return TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm, num_experts,
+                              num_experts_per_tok, gated_attn, rope_dim, shared_expert_hidden_dim, expert_weights_norm)
+    self.blk = [make_block(i) for i in range(num_blocks)]
     self.has_gdn = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
