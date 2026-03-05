@@ -272,12 +272,10 @@ class Transformer:
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, full_attn_interval:int=0, rope_dim:int=0,
                ssm_state_size:int=0, ssm_group_count:int=0, ssm_time_step_rank:int=0, ssm_inner_size:int=0, ssm_conv_kernel:int=0,
                shared_expert_hidden_dim:int=0, expert_weights_norm:bool=False):
-    gated_attn = bool(ssm_conv_kernel)
-    head_v_dim = ssm_inner_size // ssm_time_step_rank if gated_attn else 0
     def make_block(i):
-      if gated_attn and full_attn_interval and (i+1)%full_attn_interval:
-        return GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, head_v_dim, ssm_conv_kernel,
-                                  num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
+      if (gated_attn:=bool(ssm_conv_kernel)) and full_attn_interval and (i+1)%full_attn_interval:
+        return GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, ssm_inner_size//ssm_time_step_rank,
+                                   ssm_conv_kernel, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
       return TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm, num_experts,
                               num_experts_per_tok, gated_attn, rope_dim, shared_expert_hidden_dim, expert_weights_norm)
     self.blk = [make_block(i) for i in range(num_blocks)]
