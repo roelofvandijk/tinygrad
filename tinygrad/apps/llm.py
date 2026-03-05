@@ -87,24 +87,24 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 class DenseFFN:
   def __init__(self, block, dim:int, hidden_dim:int):
     block.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
-    block.ffn_up = nn.Linear(dim, hidden_dim, bias=False)
+    block.ffn_up   = nn.Linear(dim, hidden_dim, bias=False)
     block.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
   def __call__(self, block, h_norm:Tensor) -> Tensor: return block.ffn_down(block.ffn_gate(h_norm).silu().contiguous() * block.ffn_up(h_norm))
 
 class MoeFFN:
-  def __init__(self, block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int,expert_weights_norm:bool):
+  def __init__(self, block, dim:int, hidden_dim:int, num_experts:int, num_experts_per_tok:int, shared_expert_hidden_dim:int, expert_weights_norm:bool):
     self.num_experts_per_tok = num_experts_per_tok
     self.expert_weights_norm = expert_weights_norm
-    self.has_shared_experts = shared_expert_hidden_dim > 0
-    block.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
-    block.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-    block.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-    block.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
+    self.has_shared_experts  = shared_expert_hidden_dim > 0
+    block.ffn_gate_inp       = nn.Linear(dim, num_experts, bias=False)
+    block.ffn_gate_exps      = ExpertWeights(num_experts, dim, hidden_dim)
+    block.ffn_up_exps        = ExpertWeights(num_experts, dim, hidden_dim)
+    block.ffn_down_exps      = ExpertWeights(num_experts, hidden_dim, dim)
     if self.has_shared_experts:
       block.ffn_gate_inp_shexp = SimpleNamespace(weight=Tensor.empty(dim))
-      block.ffn_gate_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-      block.ffn_up_shexp = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
-      block.ffn_down_shexp = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
+      block.ffn_gate_shexp     = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+      block.ffn_up_shexp       = nn.Linear(dim, shared_expert_hidden_dim, bias=False)
+      block.ffn_down_shexp     = nn.Linear(shared_expert_hidden_dim, dim, bias=False)
   def __call__(self, block, h_norm:Tensor) -> Tensor:
     x = h_norm.unsqueeze(2)
     probs, sel = block.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)
@@ -221,9 +221,9 @@ class GatedDeltaNetBlock(ResidualBlock):
     if num_experts == 0: self.ffn = DenseFFN(self, dim, hidden_dim)
     else: self.ffn = MoeFFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
-  def _init_state(self, x:Tensor):
+  def init_state(self, x:Tensor):
     self.conv_state = Tensor.zeros(B:=x.shape[0], self.conv_kernel-1, self.conv_channels, dtype="float32", device=x.device).contiguous().realize()
-    self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
+    self.ssm_state  = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
 
   def attention(self, x:Tensor, _start_pos:int|UOp) -> Tensor:
     if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self.attention_step(x)
@@ -263,7 +263,7 @@ class GatedDeltaNetBlock(ResidualBlock):
     return x + self.ssm_out(out)
 
   def init_block_state(self, x:Tensor, start_pos:int|UOp):
-    if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self._init_state(x)
+    if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self.init_state(x)
 
   def norm_ffn_input(self, h:Tensor) -> Tensor: return self.post_attention_norm(h)
 
