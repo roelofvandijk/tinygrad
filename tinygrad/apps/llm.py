@@ -231,7 +231,6 @@ class GatedDeltaNetBlock(ResidualBlock):
     B, T = x.shape[0], x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]
     conv_state, ssm_state = self.conv_state, self.ssm_state
     out = Tensor.empty(*x.shape, dtype=x.dtype, device=x.device).contiguous()
-    # Prefill token-by-token
     for t in range(T):
       xt, xn = x[:, t:t+1, :], self.attn_norm(x[:, t:t+1, :])
       qkv, z, beta, alpha = self.attn_qkv(xn), self.attn_gate(xn), self.ssm_beta(xn).sigmoid(), self.ssm_alpha(xn)
@@ -252,10 +251,12 @@ class GatedDeltaNetBlock(ResidualBlock):
       d = (v - Tensor.einsum("bhd,bhde->bhe", k, St)) * beta
       St = St + Tensor.einsum("bhd,bhe->bhde", k, d)
       ssm_state = St.transpose(-1, -2).contiguous()
-      yt = Tensor.einsum("bhd,bhde->bhe", q, St).reshape(B, 1, self.num_v_heads, self.head_v_dim)
-      yt = (self.ssm_norm(yt) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype)
-      assigned = out.uop.after(out[:, t:t+1, :].uop.assign((xt + self.ssm_out(yt)).contiguous().realize().uop))
-      out = Tensor(assigned, device=assigned.device)
+      out_t = Tensor.einsum("bhd,bhde->bhe", q, St).reshape(B, 1, self.num_v_heads, self.head_v_dim)
+      out_t = xt + self.ssm_out((self.ssm_norm(out_t) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype))
+      if T == 1: out = out_t  # single-token decode/rollout
+      else: # prefill: write each token result into the preallocated output buffer
+        assigned = out.uop.after(out[:, t:t+1, :].uop.assign(out_t.contiguous().realize().uop))
+        out = Tensor(assigned, device=assigned.device)
     self.conv_state.assign(conv_state).realize()
     self.ssm_state.assign(ssm_state).realize()
     return out
