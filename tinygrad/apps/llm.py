@@ -370,19 +370,19 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the kv cache
     start_pos = self.get_start_pos(tokens)
-    out = None
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
       if v_toks is None:
-        out = self(t[:, sp:sp+1] if out is None else out, sp).realize()
+        out = self(t[:, sp:sp+1], sp).realize()
         start_pos += 1
       else:
         nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-        out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
+        out = self(t[:, sp:sp+nt], sp).realize()
         start_pos += nt.val
-      # chunked prefill: keep processing until all prompt tokens are consumed
+      # chunked prefill: keep processing until all currently known tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
+      t[:, start_pos:start_pos+1].assign(out).realize()
       self._cached_tokens = tokens[:]
       yield tokens[-1]
 
