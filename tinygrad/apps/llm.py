@@ -227,25 +227,41 @@ class GatedDeltaNetBlock(ResidualBlock):
     self.ssm_state  = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, dtype="float32", device=x.device).contiguous().realize()
 
   def attention(self, x:Tensor, _start_pos:int|UOp) -> Tensor:
-    if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1: return self.attention_step(x)
-    return self.attention_prefill(x, T)
-
-  def attention_prefill(self, x:Tensor, T:int) -> Tensor:
-    # TODO - remove realize for @function support
-    out = Tensor.empty(*x.shape, dtype=x.dtype, device=x.device).contiguous()
-    for t in range(T):
-      assigned = out.uop.after(out[:, t:t+1, :].uop.assign(self.attention_step(x[:, t:t+1, :]).contiguous().realize().uop))
-      out = Tensor(assigned, device=assigned.device)
+    if (T:=x.shape[1].val if isinstance(x.shape[1], UOp) else x.shape[1]) == 1:
+      out, conv_state, ssm_state = self._attention_step_state(x, self.conv_state, self.ssm_state)
+    else:
+      # TODO - remove realizes for @function support
+      def step(carry, xt):
+        out, conv_state, ssm_state = self._attention_step_state(xt, *carry)
+        return (conv_state, ssm_state), out.contiguous().realize()
+      (conv_state, ssm_state), out = self.scan(step, (self.conv_state, self.ssm_state), x, dim=1)
+    self.conv_state.assign(conv_state).realize()
+    self.ssm_state.assign(ssm_state).realize()
     return out
 
-  def attention_step(self, x:Tensor) -> Tensor:
+  @staticmethod
+  def scan(fn, init, xs:Tensor, dim:int=0, reverse:bool=False):
+    # TDOD: this is generic, to tensor.py? this is like https://docs.pytorch.org/xla/master/features/scan.html#scan-example
+    n = xs.shape[dim]
+    n = n.val if isinstance(n, UOp) else n
+    carry, ys = init, []
+    for i in (range(n-1, -1, -1) if reverse else range(n)):
+      x = xs.shrink(tuple((i, i+1) if d == dim else (0, s) for d,s in enumerate(xs.shape)))
+      carry, y = fn(carry, x)
+      ys.append(y)
+    if reverse: ys.reverse()
+    out = ys[0]
+    for y in ys[1:]: out = out.cat(y, dim=dim)
+    return carry, out
+
+  def _attention_step_state(self, x:Tensor, conv_state:Tensor, ssm_state:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     # TODO - remove realizes for @function support
     B, xn = x.shape[0], self.attn_norm(x)
     qkv, z, beta, alpha = self.attn_qkv(xn), self.attn_gate(xn), self.ssm_beta(xn).sigmoid(), self.ssm_alpha(xn)
     gate = self.ssm_a * (alpha + self.ssm_dt.bias).softplus()
-    ci = self.conv_state.cat(qkv, dim=1).contiguous()  # contiguous needed for correctness
+    ci = conv_state.cat(qkv, dim=1).contiguous()  # contiguous needed for correctness
     qkv = (ci * self.ssm_conv1d.weight.transpose(0, 1)).sum(axis=1, keepdim=True).silu()
-    self.conv_state.assign(ci[:, 1:, :]).realize()
+    conv_state = ci[:, 1:, :]
     q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
     q = q.reshape(B, 1, self.num_k_heads, self.head_k_dim).transpose(1, 2)
     k = k.reshape(B, 1, self.num_k_heads, self.head_k_dim).transpose(1, 2)
@@ -255,13 +271,13 @@ class GatedDeltaNetBlock(ResidualBlock):
     if self.num_k_heads != self.num_v_heads: q, k = q.repeat(1,r:=self.num_v_heads // self.num_k_heads, 1, 1), k.repeat(1, r, 1, 1)
     q, k, v = q.squeeze(2), k.squeeze(2), v.squeeze(2)
     beta, gate = beta.reshape(B, self.num_v_heads, 1), gate.reshape(B, self.num_v_heads, 1, 1)
-    St = (self.ssm_state * gate.exp()).transpose(-1, -2)
+    St = (ssm_state * gate.exp()).transpose(-1, -2)
     d = (v - Tensor.einsum("bhd,bhde->bhe", k, St)) * beta
     St = St + Tensor.einsum("bhd,bhe->bhde", k, d)
-    self.ssm_state.assign(St.transpose(-1, -2).contiguous()).realize()
+    ssm_state = St.transpose(-1, -2).contiguous()
     out = Tensor.einsum("bhd,bhde->bhe", q, St).reshape(B, 1, self.num_v_heads, self.head_v_dim)
     out = (self.ssm_norm(out) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype)
-    return x + self.ssm_out(out)
+    return x + self.ssm_out(out), conv_state, ssm_state
 
   def init_block_state(self, x:Tensor, start_pos:int|UOp):
     if not hasattr(self, 'conv_state') or (isinstance(start_pos, int) and start_pos == 0): self.init_state(x)
