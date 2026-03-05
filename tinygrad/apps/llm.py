@@ -256,10 +256,10 @@ class GatedDeltaNetBlock(ResidualBlock):
     q, k, v = q.squeeze(2), k.squeeze(2), v.squeeze(2)
     beta, gate = beta.reshape(B, self.num_v_heads, 1), gate.reshape(B, self.num_v_heads, 1, 1)
     St = (self.ssm_state * gate.exp()).transpose(-1, -2)
-    d = (v - (k.unsqueeze(-2) @ St).squeeze(-2)) * beta
-    St = St + k.unsqueeze(-1) * d.unsqueeze(-2)
+    d = (v - Tensor.einsum("bhd,bhde->bhe", k, St)) * beta
+    St = St + Tensor.einsum("bhd,bhe->bhde", k, d)
     self.ssm_state.assign(St.transpose(-1, -2).contiguous()).realize()
-    out = (q.unsqueeze(-2) @ St).squeeze(-2).reshape(B, 1, self.num_v_heads, self.head_v_dim)
+    out = Tensor.einsum("bhd,bhde->bhe", q, St).reshape(B, 1, self.num_v_heads, self.head_v_dim)
     out = (self.ssm_norm(out) * z.reshape(B, 1, self.num_v_heads, self.head_v_dim).silu()).reshape(B, 1, -1).cast(x.dtype)
     return x + self.ssm_out(out)
 
