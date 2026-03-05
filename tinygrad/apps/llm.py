@@ -207,19 +207,19 @@ class GatedDeltaNetBlock(ResidualBlock):
     self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim = num_k_heads, num_v_heads, head_k_dim, head_v_dim
     self.conv_kernel, self.norm_eps, self.key_dim, self.value_dim = conv_kernel, norm_eps, head_k_dim * num_k_heads, head_v_dim * num_v_heads
     self.conv_channels = self.key_dim * 2 + self.value_dim
-    self.attn_qkv = nn.Linear(dim, self.conv_channels, bias=False)
-    self.attn_gate = nn.Linear(dim, self.value_dim, bias=False)
-    self.ssm_beta = nn.Linear(dim, num_v_heads, bias=False)
-    self.ssm_alpha = nn.Linear(dim, num_v_heads, bias=False)
-    self.ssm_conv1d = SimpleNamespace(weight=Tensor.zeros(self.conv_channels, conv_kernel))
-    self.ssm_dt = SimpleNamespace(bias=Tensor.zeros(num_v_heads))
-    self.ssm_a = Tensor.zeros(num_v_heads)
-    self.ssm_norm = nn.RMSNorm(head_v_dim, norm_eps)
-    self.ssm_out = nn.Linear(self.value_dim, dim, bias=False)
-    self.attn_norm = nn.RMSNorm(dim, norm_eps)
+    self.attn_qkv            = nn.Linear(dim, self.conv_channels, bias=False)
+    self.attn_gate           = nn.Linear(dim, self.value_dim, bias=False)
+    self.ssm_beta            = nn.Linear(dim, num_v_heads, bias=False)
+    self.ssm_alpha           = nn.Linear(dim, num_v_heads, bias=False)
+    self.ssm_conv1d          = SimpleNamespace(weight=Tensor.zeros(self.conv_channels, conv_kernel))
+    self.ssm_dt              = SimpleNamespace(bias=Tensor.zeros(num_v_heads))
+    self.ssm_a               = Tensor.zeros(num_v_heads)
+    self.ssm_norm            = nn.RMSNorm(head_v_dim, norm_eps)
+    self.ssm_out             = nn.Linear(self.value_dim, dim, bias=False)
+    self.attn_norm           = nn.RMSNorm(dim, norm_eps)
     self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn = MoeFFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm) \
-      if num_experts > 0 else DenseFFN(self, dim, hidden_dim)
+    if num_experts == 0: self.ffn = DenseFFN(self, dim, hidden_dim)
+    else: self.ffn = MoeFFN(self, dim, hidden_dim, num_experts, num_experts_per_tok, shared_expert_hidden_dim, expert_weights_norm)
 
   def _init_state(self, x:Tensor):
     self.conv_state = Tensor.zeros(B:=x.shape[0], self.conv_kernel-1, self.conv_channels, dtype="float32", device=x.device).contiguous().realize()
