@@ -347,7 +347,7 @@ class Transformer:
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
                         n_shared_experts=kv.get(f'{arch}.expert_shared_count', 0),
                         shared_expert_hidden_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', 0),
-                        expert_weights_norm=kv.get(f'{arch}.expert_weights_norm', arch == "qwen35moe"),
+                        expert_weights_norm=kv.get(f'{arch}.expert_weights_norm', bool(kv.get(f'{arch}.expert_shared_feed_forward_length', 0))),
                         full_attn_interval=kv.get(f'{arch}.full_attention_interval', 0), rope_dim=kv.get(f'{arch}.rope.dimension_count', 0),
                         ssm_state_size=kv.get(f'{arch}.ssm.state_size', 0), ssm_group_count=kv.get(f'{arch}.ssm.group_count', 0),
                         ssm_time_step_rank=kv.get(f'{arch}.ssm.time_step_rank', 0), ssm_inner_size=kv.get(f'{arch}.ssm.inner_size', 0),
