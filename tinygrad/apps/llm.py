@@ -363,17 +363,23 @@ class Transformer:
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
+    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
+    v_toks = UOp.variable("toks", 1, chunk_size) if chunk_size > 1 else None
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the kv cache
     start_pos = self.get_start_pos(tokens)
     out = None
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
-      start_pos += nt.val
+      sp = v_start_pos.bind(start_pos)
+      if v_toks is None:
+        out = self(t[:, sp:sp+1] if out is None else out, sp).realize()
+        start_pos += 1
+      else:
+        nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
+        out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
+        start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
