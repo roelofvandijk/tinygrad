@@ -150,7 +150,7 @@ class TransformerBlock(ResidualBlock):
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
-    if gated_attn: self.ffn_norm = self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
+    if gated_attn: self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
     else: self.ffn_norm = nn.RMSNorm(dim, norm_eps)
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
@@ -199,7 +199,7 @@ class TransformerBlock(ResidualBlock):
       # NOTE: clone is used to promise the creation of a specific buffer
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
 
-  def norm_ffn_input(self, h:Tensor) -> Tensor: return self.ffn_norm(h)
+  def norm_ffn_input(self, h:Tensor) -> Tensor: return self.post_attention_norm(h) if self.gated_attn else self.ffn_norm(h)
 
 class GatedDeltaNetBlock(ResidualBlock):
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, head_k_dim:int, num_k_heads:int, num_v_heads:int, head_v_dim:int, conv_kernel:int,
