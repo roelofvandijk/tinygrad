@@ -298,6 +298,7 @@ class Transformer:
                 else GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_state_size, ssm_group_count, ssm_time_step_rank, head_v_dim, ssm_conv_kernel,
                                    num_experts, num_experts_per_tok, n_shared_experts, shared_expert_hidden_dim, expert_weights_norm)
                 for i in range(num_blocks)]
+    self.has_gdn = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -360,10 +361,11 @@ class Transformer:
     return model, kv
 
   def get_start_pos(self, tokens:list[int]):
+    if self.has_gdn: return 0
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
-    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1
+    if self.has_gdn: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size) if chunk_size > 1 else None
     # assign all input tokens once, then slice from start_pos for the model call
